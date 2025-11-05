@@ -299,7 +299,7 @@ Auto-Stretch → Orientation Correction → JPEG Encoding
 - ROWORDER: TOP-DOWN (flip needed) or BOTTOM-UP
 
 #### 2. Downscaling (Optional)
-
+claude
 **When**: User specifies `--downscale N`
 
 **Algorithm**: Nearest-neighbor sampling

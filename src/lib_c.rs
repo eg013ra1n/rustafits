@@ -132,6 +132,7 @@ impl FitsConverter {
 
         Ok(())
     }
+
 }
 
 impl Default for FitsConverter {
