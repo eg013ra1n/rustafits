@@ -6,6 +6,15 @@
 #include <math.h>
 #include <stdbool.h>
 
+// SIMD support detection
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #include <emmintrin.h>  // SSE2
+    #define HAS_SIMD_SSE2 1
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    #include <arm_neon.h>
+    #define HAS_SIMD_NEON 1
+#endif
+
 // Thread-local error buffer
 static __thread char error_buffer[512] = {0};
 
@@ -38,6 +47,255 @@ static int compare_float(const void* a, const void* b) {
     float fa = *(const float*)a;
     float fb = *(const float*)b;
     return (fa > fb) - (fa < fb);
+}
+
+// Quickselect algorithm for finding k-th element (faster than full sort for median)
+static float quickselect(float* arr, size_t left, size_t right, size_t k) {
+    while (left < right) {
+        // Use median-of-three for pivot selection
+        size_t mid = left + (right - left) / 2;
+
+        // Sort left, mid, right
+        if (arr[mid] < arr[left]) {
+            float tmp = arr[left]; arr[left] = arr[mid]; arr[mid] = tmp;
+        }
+        if (arr[right] < arr[left]) {
+            float tmp = arr[left]; arr[left] = arr[right]; arr[right] = tmp;
+        }
+        if (arr[right] < arr[mid]) {
+            float tmp = arr[mid]; arr[mid] = arr[right]; arr[right] = tmp;
+        }
+
+        // Use middle element as pivot
+        float pivot = arr[mid];
+
+        // Move pivot to end
+        arr[mid] = arr[right - 1];
+        arr[right - 1] = pivot;
+
+        // Partition
+        size_t i = left;
+        size_t j = right - 1;
+
+        while (1) {
+            while (arr[++i] < pivot);
+            while (arr[--j] > pivot);
+            if (i >= j) break;
+            float tmp = arr[i];
+            arr[i] = arr[j];
+            arr[j] = tmp;
+        }
+
+        // Restore pivot
+        arr[right - 1] = arr[i];
+        arr[i] = pivot;
+
+        // Recurse on appropriate partition
+        if (i == k) {
+            return arr[k];
+        } else if (i > k) {
+            right = i - 1;
+        } else {
+            left = i + 1;
+        }
+    }
+    return arr[k];
+}
+
+// Find median using quickselect (O(n) average case vs O(n log n) for qsort)
+static float find_median(float* data, size_t len) {
+    return quickselect(data, 0, len - 1, len / 2);
+}
+
+// SIMD-optimized stretch application for x86_64 (SSE2)
+#ifdef HAS_SIMD_SSE2
+static inline void apply_stretch_simd_sse2(
+    const float* channel_data,
+    uint8_t* output,
+    size_t count,
+    float native_shadows,
+    float native_highlights,
+    float k1,
+    float k2,
+    float midtones,
+    int stride  // 1 for grayscale-to-mono, 3 for RGB
+) {
+    const __m128 v_shadows = _mm_set1_ps(native_shadows);
+    const __m128 v_highlights = _mm_set1_ps(native_highlights);
+    const __m128 v_k1 = _mm_set1_ps(k1);
+    const __m128 v_k2 = _mm_set1_ps(k2);
+    const __m128 v_midtones = _mm_set1_ps(midtones);
+    const __m128 v_zero = _mm_setzero_ps();
+    const __m128 v_255 = _mm_set1_ps(255.0f);
+
+    size_t i = 0;
+    // Process 4 pixels at a time
+    for (; i + 3 < count; i += 4) {
+        __m128 input = _mm_loadu_ps(&channel_data[i]);
+
+        // Create masks for the conditions
+        __m128 mask_low = _mm_cmplt_ps(input, v_shadows);
+        __m128 mask_high = _mm_cmpge_ps(input, v_highlights);
+
+        // Compute stretch for middle range
+        __m128 input_floored = _mm_sub_ps(input, v_shadows);
+        __m128 numerator = _mm_mul_ps(input_floored, v_k1);
+        __m128 denominator = _mm_sub_ps(_mm_mul_ps(input_floored, v_k2), v_midtones);
+        __m128 output_val = _mm_div_ps(numerator, denominator);
+
+        // Apply conditions: 0 if < shadows, 255 if >= highlights, computed otherwise
+        output_val = _mm_and_ps(output_val, _mm_andnot_ps(mask_low, _mm_andnot_ps(mask_high, _mm_castsi128_ps(_mm_set1_epi32(-1)))));
+        output_val = _mm_or_ps(output_val, _mm_and_ps(v_255, mask_high));
+
+        // Clamp to [0, 255]
+        output_val = _mm_min_ps(_mm_max_ps(output_val, v_zero), v_255);
+
+        // Convert to int and store
+        __m128i output_int = _mm_cvtps_epi32(output_val);
+        output_int = _mm_packs_epi32(output_int, output_int);
+        output_int = _mm_packus_epi16(output_int, output_int);
+
+        // Extract and write
+        uint32_t packed = _mm_cvtsi128_si32(output_int);
+        for (int j = 0; j < 4; j++) {
+            output[(i + j) * stride] = (uint8_t)((packed >> (j * 8)) & 0xFF);
+        }
+    }
+
+    // Handle remaining pixels
+    for (; i < count; i++) {
+        float input = channel_data[i];
+        float out;
+
+        if (input < native_shadows) {
+            out = 0.0f;
+        } else if (input >= native_highlights) {
+            out = 255.0f;
+        } else {
+            float input_floored = input - native_shadows;
+            out = (input_floored * k1) / (input_floored * k2 - midtones);
+        }
+
+        output[i * stride] = (uint8_t)fmaxf(0.0f, fminf(255.0f, out));
+    }
+}
+#endif
+
+// SIMD-optimized stretch application for ARM (NEON)
+#ifdef HAS_SIMD_NEON
+static inline void apply_stretch_simd_neon(
+    const float* channel_data,
+    uint8_t* output,
+    size_t count,
+    float native_shadows,
+    float native_highlights,
+    float k1,
+    float k2,
+    float midtones,
+    int stride
+) {
+    const float32x4_t v_shadows = vdupq_n_f32(native_shadows);
+    const float32x4_t v_highlights = vdupq_n_f32(native_highlights);
+    const float32x4_t v_k1 = vdupq_n_f32(k1);
+    const float32x4_t v_k2 = vdupq_n_f32(k2);
+    const float32x4_t v_midtones = vdupq_n_f32(midtones);
+    const float32x4_t v_zero = vdupq_n_f32(0.0f);
+    const float32x4_t v_255 = vdupq_n_f32(255.0f);
+
+    size_t i = 0;
+    // Process 4 pixels at a time
+    for (; i + 3 < count; i += 4) {
+        float32x4_t input = vld1q_f32(&channel_data[i]);
+
+        // Create masks for the conditions
+        uint32x4_t mask_low = vcltq_f32(input, v_shadows);
+        uint32x4_t mask_high = vcgeq_f32(input, v_highlights);
+
+        // Compute stretch for middle range
+        float32x4_t input_floored = vsubq_f32(input, v_shadows);
+        float32x4_t numerator = vmulq_f32(input_floored, v_k1);
+        float32x4_t denominator = vsubq_f32(vmulq_f32(input_floored, v_k2), v_midtones);
+
+        // Division using reciprocal estimate + Newton-Raphson refinement for better accuracy
+        float32x4_t recip = vrecpeq_f32(denominator);
+        recip = vmulq_f32(vrecpsq_f32(denominator, recip), recip);  // One N-R iteration
+        float32x4_t output_val = vmulq_f32(numerator, recip);
+
+        // Apply conditions using NEON select
+        output_val = vbslq_f32(mask_low, v_zero, output_val);
+        output_val = vbslq_f32(mask_high, v_255, output_val);
+
+        // Clamp to [0, 255]
+        output_val = vminq_f32(vmaxq_f32(output_val, v_zero), v_255);
+
+        // Convert to int
+        uint32x4_t output_int = vcvtq_u32_f32(output_val);
+
+        // Narrow to 16-bit then 8-bit
+        uint16x4_t output_16 = vmovn_u32(output_int);
+        uint8x8_t output_8 = vmovn_u16(vcombine_u16(output_16, output_16));
+
+        // Extract and write
+        uint32_t packed[2];
+        vst1_u8((uint8_t*)packed, output_8);
+        for (int j = 0; j < 4; j++) {
+            output[(i + j) * stride] = ((uint8_t*)packed)[j];
+        }
+    }
+
+    // Handle remaining pixels
+    for (; i < count; i++) {
+        float input = channel_data[i];
+        float out;
+
+        if (input < native_shadows) {
+            out = 0.0f;
+        } else if (input >= native_highlights) {
+            out = 255.0f;
+        } else {
+            float input_floored = input - native_shadows;
+            out = (input_floored * k1) / (input_floored * k2 - midtones);
+        }
+
+        output[i * stride] = (uint8_t)fmaxf(0.0f, fminf(255.0f, out));
+    }
+}
+#endif
+
+// Generic wrapper that chooses the best SIMD implementation
+static inline void apply_stretch_simd(
+    const float* channel_data,
+    uint8_t* output,
+    size_t count,
+    float native_shadows,
+    float native_highlights,
+    float k1,
+    float k2,
+    float midtones,
+    int stride
+) {
+#ifdef HAS_SIMD_SSE2
+    apply_stretch_simd_sse2(channel_data, output, count, native_shadows, native_highlights, k1, k2, midtones, stride);
+#elif defined(HAS_SIMD_NEON)
+    apply_stretch_simd_neon(channel_data, output, count, native_shadows, native_highlights, k1, k2, midtones, stride);
+#else
+    // Fallback scalar implementation
+    for (size_t i = 0; i < count; i++) {
+        float input = channel_data[i];
+        float out;
+
+        if (input < native_shadows) {
+            out = 0.0f;
+        } else if (input >= native_highlights) {
+            out = 255.0f;
+        } else {
+            float input_floored = input - native_shadows;
+            out = (input_floored * k1) / (input_floored * k2 - midtones);
+        }
+
+        output[i * stride] = (uint8_t)fmaxf(0.0f, fminf(255.0f, out));
+    }
+#endif
 }
 
 int process_fits_file(const char* fits_path, const ProcessConfig* config, ProcessedImage* out_image) {
@@ -188,6 +446,7 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
     out_image->data = malloc(width * height * 3);  // Always RGB output
 
     if (config->auto_stretch) {
+        // Process each channel (sequential without OpenMP on this platform)
         for (int c = 0; c < num_channels; c++) {
             float shadows, highlights, midtones;
             size_t channel_size = width * height;
@@ -208,44 +467,20 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
             float k2 = ((2.0f * midtones) - 1.0f) * hs_range_factor / max_input;
 
             if (out_image->is_color) {
-                // Write to separate RGB channels
-                for (size_t i = 0; i < channel_size; i++) {
-                    float input = channel_data[i];
-                    float output;
-
-                    if (input < native_shadows) {
-                        output = 0.0f;
-                    } else if (input >= native_highlights) {
-                        output = 255.0f;
-                    } else {
-                        float input_floored = input - native_shadows;
-                        output = (input_floored * k1) / (input_floored * k2 - midtones);
-                    }
-
-                    uint8_t val = (uint8_t)fmaxf(0.0f, fminf(255.0f, output));
-                    out_image->data[i * 3 + c] = val;
-                }
+                // Write to separate RGB channels using SIMD
+                apply_stretch_simd(channel_data, &out_image->data[c], channel_size,
+                                  native_shadows, native_highlights, k1, k2, midtones, 3);
             } else {
-                // Grayscale - write same value to R, G, B
-                // Optimized: compute stretch once, then replicate to RGB
+                // Grayscale - use SIMD then replicate to RGB
+                uint8_t* temp = malloc(channel_size);
+                apply_stretch_simd(channel_data, temp, channel_size,
+                                  native_shadows, native_highlights, k1, k2, midtones, 1);
+                // Replicate to RGB
                 for (size_t i = 0; i < channel_size; i++) {
-                    float input = channel_data[i];
-                    float output;
-
-                    if (input < native_shadows) {
-                        output = 0.0f;
-                    } else if (input >= native_highlights) {
-                        output = 255.0f;
-                    } else {
-                        float input_floored = input - native_shadows;
-                        output = (input_floored * k1) / (input_floored * k2 - midtones);
-                    }
-
-                    uint8_t val = (uint8_t)fmaxf(0.0f, fminf(255.0f, output));
-
-                    // Optimized write: set all 3 bytes at once using memset
+                    uint8_t val = temp[i];
                     memset(&out_image->data[i * 3], val, 3);
                 }
+                free(temp);
             }
         }
     }
@@ -550,17 +785,15 @@ static void compute_stretch_params(const float* data, size_t len, float max_inpu
         }
     }
 
-    // Compute median
-    qsort(samples, num_samples, sizeof(float), compare_float);
-    float median = samples[num_samples / 2];
+    // Compute median using quickselect (faster than full sort)
+    float median = find_median(samples, num_samples);
 
     // Compute MADN (Median Absolute Deviation Normalized)
     float* deviations = malloc(num_samples * sizeof(float));
     for (size_t i = 0; i < num_samples; i++) {
         deviations[i] = fabsf(samples[i] - median);
     }
-    qsort(deviations, num_samples, sizeof(float), compare_float);
-    float madn = 1.4826f * deviations[num_samples / 2];
+    float madn = 1.4826f * find_median(deviations, num_samples);
 
     free(samples);
     free(deviations);

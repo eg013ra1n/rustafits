@@ -6,6 +6,29 @@ fn main() {
 
     // Compile C code
     let mut build = cc::Build::new();
+
+    // Try to use Homebrew LLVM on macOS for OpenMP support
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(llvm_path) = std::env::var("HOMEBREW_PREFIX") {
+            let llvm_bin = format!("{}/opt/llvm/bin/clang", llvm_path);
+            if std::path::Path::new(&llvm_bin).exists() {
+                build.compiler(&llvm_bin);
+                println!("cargo:rustc-link-search={}/opt/llvm/lib", llvm_path);
+            }
+        } else {
+            // Fallback to common Homebrew paths
+            for prefix in &["/opt/homebrew", "/usr/local"] {
+                let llvm_bin = format!("{}/opt/llvm/bin/clang", prefix);
+                if std::path::Path::new(&llvm_bin).exists() {
+                    build.compiler(&llvm_bin);
+                    println!("cargo:rustc-link-search={}/opt/llvm/lib", prefix);
+                    break;
+                }
+            }
+        }
+    }
+
     build
         .file("c_src/fits_processor.c")
         .file("c_src/jpeg_writer.c")
@@ -14,7 +37,7 @@ fn main() {
         .include("c_src")
         .include("ffi")
         .opt_level(3)  // Maximum optimization
-        .flag("-march=native")  // Use native CPU instructions
+        .flag("-march=native")  // Use native CPU instructions (enables NEON on ARM, SSE2 on x86)
         .flag("-ffast-math")  // Fast math optimizations
         .warnings(false);
 
