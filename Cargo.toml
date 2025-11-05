@@ -1,0 +1,28 @@
+[workspace]
+members = [".", "ffi"]
+
+[package]
+name = "fits-converter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fits_converter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fits-to-jpeg"
+path = "src/bin/fits-to-jpeg.rs"
+
+[dependencies]
+fitsio = "0.21"
+ndarray = { version = "0.15", features = ["rayon"] }
+rayon = "1.8"
+image = "0.24"
+anyhow = "1.0"
+thiserror = "1.0"
+num-traits = "0.2"
+
+[build-dependencies]
+pkg-config = "0.3"
+cc = "1.0"

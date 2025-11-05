@@ -1,0 +1,12 @@
+[package]
+name = "fits-converter-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fits_converter_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+fits-converter = { path = ".." }
+libc = "0.2"

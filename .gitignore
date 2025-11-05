@@ -1,0 +1,50 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Debug builds
+debug/
+target/
+
+# Release builds
+release/
+
+# Test outputs
+*.fits
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.png
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.a
+
+# Test executables
+test_fits
+test_bayer
+test_stretch
+test_pipeline
+test_real_stretch
+
+# Temporary files
+*.tmp
+*.log
