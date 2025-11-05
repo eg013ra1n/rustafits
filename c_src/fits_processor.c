@@ -23,6 +23,7 @@ static int read_fits_data_u16(fitsfile* fptr, const FitsMetadata* meta, uint16_t
 static int read_fits_data_f32(fitsfile* fptr, const FitsMetadata* meta, float** data);
 static void downscale_u16(const uint16_t* in, uint16_t* out, size_t w, size_t h, int factor);
 static void downscale_f32(const float* in, float* out, size_t w, size_t h, int factor);
+static void bin_2x2_float(const float* in, float* out, size_t w, size_t h);
 static void super_pixel_debayer_u16(const uint16_t* in, float* out_rgb,
                                     size_t w, size_t h, BayerPattern pattern);
 static void super_pixel_debayer_f32(const float* in, float* out_rgb,
@@ -114,6 +115,19 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
                 float_data[i] = (float)u16_data[i];
             }
             free(u16_data);
+
+            // Apply 2x2 binning in preview mode for mono images
+            if (config->preview_mode && meta.bayer_pattern == BAYER_NONE) {
+                size_t new_w = width / 2;
+                size_t new_h = height / 2;
+                float* binned = malloc(new_w * new_h * sizeof(float));
+                bin_2x2_float(float_data, binned, width, height);
+                free(float_data);
+                float_data = binned;
+                width = new_w;
+                height = new_h;
+            }
+
             out_image->is_color = 0;
         }
     } else {
@@ -148,6 +162,19 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
             out_image->is_color = 1;
         } else {
             float_data = f32_data;
+
+            // Apply 2x2 binning in preview mode for mono images
+            if (config->preview_mode && meta.bayer_pattern == BAYER_NONE) {
+                size_t new_w = width / 2;
+                size_t new_h = height / 2;
+                float* binned = malloc(new_w * new_h * sizeof(float));
+                bin_2x2_float(float_data, binned, width, height);
+                free(float_data);
+                float_data = binned;
+                width = new_w;
+                height = new_h;
+            }
+
             out_image->is_color = 0;
         }
     }
@@ -200,6 +227,7 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
                 }
             } else {
                 // Grayscale - write same value to R, G, B
+                // Optimized: compute stretch once, then replicate to RGB
                 for (size_t i = 0; i < channel_size; i++) {
                     float input = channel_data[i];
                     float output;
@@ -214,9 +242,9 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
                     }
 
                     uint8_t val = (uint8_t)fmaxf(0.0f, fminf(255.0f, output));
-                    out_image->data[i * 3 + 0] = val;  // R
-                    out_image->data[i * 3 + 1] = val;  // G
-                    out_image->data[i * 3 + 2] = val;  // B
+
+                    // Optimized write: set all 3 bytes at once using memset
+                    memset(&out_image->data[i * 3], val, 3);
                 }
             }
         }
@@ -377,6 +405,27 @@ static void downscale_f32(const float* in, float* out, size_t w, size_t h, int f
     for (size_t y = 0; y < new_h; y++) {
         for (size_t x = 0; x < new_w; x++) {
             out[y * new_w + x] = in[(y * factor) * w + (x * factor)];
+        }
+    }
+}
+
+// 2x2 binning (averaging) for mono images in preview mode
+static void bin_2x2_float(const float* in, float* out, size_t w, size_t h) {
+    size_t out_w = w / 2;
+    size_t out_h = h / 2;
+
+    for (size_t y = 0; y < out_h; y++) {
+        for (size_t x = 0; x < out_w; x++) {
+            size_t in_y = y * 2;
+            size_t in_x = x * 2;
+
+            // Average 2x2 block
+            float p00 = in[in_y * w + in_x];
+            float p01 = in[in_y * w + in_x + 1];
+            float p10 = in[(in_y + 1) * w + in_x];
+            float p11 = in[(in_y + 1) * w + in_x + 1];
+
+            out[y * out_w + x] = (p00 + p01 + p10 + p11) * 0.25f;
         }
     }
 }

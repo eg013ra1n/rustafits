@@ -46,6 +46,7 @@ typedef struct {
     int downscale_factor;   // 1 = no downscaling
     int jpeg_quality;       // 1-100
     int apply_debayer;      // 1 = apply debayering if Bayer pattern detected
+    int preview_mode;       // 1 = apply 2x2 binning for mono images (fast preview)
     int auto_stretch;       // 1 = auto-stretch, 0 = use manual params
     float manual_shadows;   // Manual stretch parameters (if auto_stretch=0)
     float manual_highlights;

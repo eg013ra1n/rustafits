@@ -12,6 +12,7 @@ fn print_usage(program: &str) {
     eprintln!("  --downscale <N>      Downscale factor (1 = no downscaling, default: 1)");
     eprintln!("  --quality <Q>        JPEG quality 1-100 (default: 95)");
     eprintln!("  --no-debayer         Disable Bayer pattern debayering");
+    eprintln!("  --preview            Enable preview mode (2x2 binning for mono, faster)");
     eprintln!("  --log                Show detailed conversion information");
     eprintln!();
     eprintln!("Examples:");
@@ -42,6 +43,7 @@ fn run() -> Result<()> {
     let mut downscale = 1;
     let mut quality = 95;
     let mut apply_debayer = true;
+    let mut preview_mode = false;
     let mut log_enabled = false;
 
     let mut i = 3;
@@ -72,6 +74,10 @@ fn run() -> Result<()> {
                 apply_debayer = false;
                 i += 1;
             }
+            "--preview" => {
+                preview_mode = true;
+                i += 1;
+            }
             "--log" => {
                 log_enabled = true;
                 i += 1;
@@ -93,16 +99,20 @@ fn run() -> Result<()> {
         println!("  Downscale: {}x", downscale);
         println!("  Quality: {}", quality);
         println!("  Debayer: {}", if apply_debayer { "enabled" } else { "disabled" });
+        println!("  Preview mode: {}", if preview_mode { "enabled" } else { "disabled" });
     }
 
     // Build converter with options
     let mut converter = FitsConverter::new()
         .with_downscale(downscale)
         .with_quality(quality);
-      //  .with_logging(log_enabled);
 
     if !apply_debayer {
         converter = converter.without_debayer();
+    }
+
+    if preview_mode {
+        converter = converter.with_preview_mode();
     }
 
     // Perform conversion

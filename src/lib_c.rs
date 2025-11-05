@@ -9,6 +9,7 @@ struct ProcessConfig {
     downscale_factor: c_int,
     jpeg_quality: c_int,
     apply_debayer: c_int,
+    preview_mode: c_int,
     auto_stretch: c_int,
     manual_shadows: f32,
     manual_highlights: f32,
@@ -45,6 +46,7 @@ pub struct FitsConverter {
     downscale: usize,
     quality: u8,
     apply_debayer: bool,
+    preview_mode: bool,
 }
 
 impl FitsConverter {
@@ -53,6 +55,7 @@ impl FitsConverter {
             downscale: 1,
             quality: 95,
             apply_debayer: true,
+            preview_mode: false,
         }
     }
 
@@ -71,6 +74,11 @@ impl FitsConverter {
         self
     }
 
+    pub fn with_preview_mode(mut self) -> Self {
+        self.preview_mode = true;
+        self
+    }
+
     pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
         input_path: P,
@@ -85,6 +93,7 @@ impl FitsConverter {
             downscale_factor: self.downscale as c_int,
             jpeg_quality: self.quality as c_int,
             apply_debayer: if self.apply_debayer { 1 } else { 0 },
+            preview_mode: if self.preview_mode { 1 } else { 0 },
             auto_stretch: 1,
             manual_shadows: 0.0,
             manual_highlights: 1.0,
