@@ -98,8 +98,8 @@ fn run() -> Result<()> {
     // Build converter with options
     let mut converter = FitsConverter::new()
         .with_downscale(downscale)
-        .with_quality(quality)
-        .with_logging(log_enabled);
+        .with_quality(quality);
+      //  .with_logging(log_enabled);
 
     if !apply_debayer {
         converter = converter.without_debayer();
