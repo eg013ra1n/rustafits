@@ -1,15 +1,15 @@
 [package]
 name = "rustafits"
 version = "0.1.0"
-edition = "2025"
+edition = "2021"
 
 [lib]
 name = "fits_converter"
 path = "src/lib.rs"
 
 [[bin]]
-name = "fits-to-jpeg"
-path = "src/bin/fits-to-jpeg.rs"
+name = "rustafits"
+path = "src/bin/rustafits.rs"
 
 [dependencies]
 anyhow = "1.0"
