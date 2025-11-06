@@ -1,0 +1,27 @@
+Source: rustafits
+Section: science
+Priority: optional
+Maintainer: Vilen Sharifov <vilen.sharifov@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.70),
+               libcfitsio-dev,
+               pkg-config
+Standards-Version: 4.6.0
+Homepage: https://github.com/eg013ra1n/rustafits
+Vcs-Browser: https://github.com/eg013ra1n/rustafits
+Vcs-Git: https://github.com/eg013ra1n/rustafits.git
+
+Package: rustafits
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libcfitsio9
+Description: High-performance FITS to JPEG converter
+ FITS to JPEG converter for astronomical images with QuickFits/PixInsight-
+ compatible auto-stretch and Bayer debayering.
+ .
+ Features:
+  * Auto-Stretch: Median-based statistical stretching (robust to outliers)
+  * Bayer Debayering: Super-pixel 2×2 block averaging
+  * Preview Mode: 2×2 binning for mono images (4× fewer pixels)
+  * Fast: 60-100ms for 4096×4096 images
+  * Multi-Platform SIMD: ARM NEON + x86_64 SSE2

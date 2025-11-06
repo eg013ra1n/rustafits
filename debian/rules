@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_CARGO_CRATE=rustafits_$(DEB_VERSION_UPSTREAM)
+
+%:
+	dh $@ --buildsystem=cargo
+
+override_dh_auto_build:
+	cargo build --release
+
+override_dh_auto_install:
+	install -D -m 755 target/release/rustafits $(DESTDIR)/usr/bin/rustafits
+
+override_dh_auto_test:
+	# Skip tests during package build

@@ -12,8 +12,45 @@ High-performance FITS to JPEG converter for astronomical images with QuickFits/P
 
 ## Installation
 
-### Prerequisites
+### From crates.io (Recommended - All Platforms)
 
+```bash
+cargo install rustafits
+```
+
+### Homebrew (macOS/Linux)
+
+```bash
+brew tap eg013ra1n/rustafits
+brew install rustafits
+```
+
+### Debian/Ubuntu
+
+```bash
+# Download .deb from releases
+wget https://github.com/eg013ra1n/rustafits/releases/latest/download/rustafits-VERSION-amd64.deb
+sudo dpkg -i rustafits-VERSION-amd64.deb
+```
+
+### Arch Linux (AUR)
+
+```bash
+yay -S rustafits
+# or
+paru -S rustafits
+```
+
+### Fedora/RHEL/CentOS
+
+```bash
+# Download .rpm or add COPR repository (coming soon)
+sudo dnf install rustafits-VERSION.rpm
+```
+
+### From Source
+
+**Prerequisites**:
 ```bash
 # macOS
 brew install cfitsio
@@ -21,22 +58,19 @@ brew install cfitsio
 # Debian/Ubuntu
 sudo apt-get install libcfitsio-dev pkg-config build-essential
 
+# Fedora/RHEL
+sudo dnf install cfitsio-devel pkg-config
+
 # Rust (1.70+)
 # Install from https://rustup.rs/
 ```
 
-### Build
-
+**Build**:
 ```bash
+git clone https://github.com/eg013ra1n/rustafits
+cd rustafits
 cargo build --release
-./target/release/rustafits
-```
-
-### Install Globally
-
-```bash
-cargo install --path .
-rustafits --help
+sudo cp target/release/rustafits /usr/local/bin/
 ```
 
 ## Usage

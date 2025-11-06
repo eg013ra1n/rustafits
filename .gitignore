@@ -13,11 +13,13 @@ release/
 
 # Test outputs
 *.fits
+*.fit
 *.jpg
 *.jpeg
 *.tif
 *.tiff
 *.png
+*.xisf
 
 # macOS
 .DS_Store
@@ -46,6 +48,7 @@ test_bayer
 test_stretch
 test_pipeline
 test_real_stretch
+tests/*
 
 # Temporary files
 *.tmp

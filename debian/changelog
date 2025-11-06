@@ -1,0 +1,10 @@
+rustafits (0.1.0-1) unstable; urgency=medium
+
+  * Initial release
+  * High-performance FITS to JPEG converter
+  * QuickFits/PixInsight-compatible auto-stretch
+  * Super-pixel Bayer debayering
+  * Preview mode with 2×2 binning
+  * Multi-platform SIMD optimization (NEON/SSE2)
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Wed, 06 Nov 2025 00:00:00 +0000

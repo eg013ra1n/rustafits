@@ -1,0 +1,61 @@
+name: Update Homebrew Formula
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-formula:
+    runs-on: macos-latest
+    steps:
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-rustafits
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Download source tarball
+        run: |
+          curl -L -o rustafits.tar.gz \
+            "https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz"
+          SHA256=$(sha256sum rustafits.tar.gz | awk '{print $1}')
+          echo "sha256=$SHA256" >> $GITHUB_ENV
+
+      - name: Update formula
+        run: |
+          cd tap/Formula
+          cat > rustafits.rb <<EOF
+          class Rustafits < Formula
+            desc "High-performance FITS to JPEG converter with auto-stretch"
+            homepage "https://github.com/${{ github.repository }}"
+            url "https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz"
+            sha256 "${{ env.sha256 }}"
+            license "GPL-3.0"
+
+            depends_on "rust" => :build
+            depends_on "pkg-config" => :build
+            depends_on "cfitsio"
+
+            def install
+              system "cargo", "install", *std_cargo_args
+            end
+
+            test do
+              assert_match "FITS to JPEG Converter", shell_output("#{bin}/rustafits --help", 1)
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/rustafits.rb
+          git commit -m "Update rustafits to ${{ steps.version.outputs.version }}"
+          git push
