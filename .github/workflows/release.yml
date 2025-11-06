@@ -42,10 +42,10 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset_name: rustafits-linux-aarch64
             cross: true
-          - os: macos-13
+          - os: macos-15
             target: x86_64-apple-darwin
             asset_name: rustafits-macos-x86_64
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             asset_name: rustafits-macos-aarch64
 
@@ -117,23 +117,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y debhelper devscripts libcfitsio-dev pkg-config
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build Debian package
+      - name: Build with cargo (debian uses system cargo)
         run: |
-          dpkg-buildpackage -us -uc -b
+          cargo build --release
 
-      - name: Find .deb file
-        id: find_deb
+      - name: Create .deb package manually
         run: |
-          DEB_FILE=$(ls ../rustafits_*.deb)
-          echo "deb_file=$DEB_FILE" >> $GITHUB_OUTPUT
+          mkdir -p debian-pkg/usr/bin
+          cp target/release/rustafits debian-pkg/usr/bin/
+
+          mkdir -p debian-pkg/DEBIAN
+          cat > debian-pkg/DEBIAN/control <<EOF
+          Package: rustafits
+          Version: ${{ needs.create-release.outputs.version }}
+          Section: science
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Vilen Sharifov <vilen.sharifov@gmail.com>
+          Depends: libcfitsio9
+          Description: High-performance FITS to JPEG converter
+           FITS to JPEG converter for astronomical images with QuickFits/PixInsight-
+           compatible auto-stretch and Bayer debayering.
+          EOF
+
+          dpkg-deb --build debian-pkg
+          mv debian-pkg.deb rustafits_${{ needs.create-release.outputs.version }}_amd64.deb
 
       - name: Upload .deb to release
         uses: actions/upload-release-asset@v1
@@ -141,7 +157,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ steps.find_deb.outputs.deb_file }}
+          asset_path: ./rustafits_${{ needs.create-release.outputs.version }}_amd64.deb
           asset_name: rustafits-${{ needs.create-release.outputs.version }}-amd64.deb
           asset_content_type: application/vnd.debian.binary-package
 
