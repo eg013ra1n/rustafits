@@ -42,7 +42,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset_name: rustafits-linux-aarch64
             cross: true
-          - os: macos-15
+          - os: macos-13-large
             target: x86_64-apple-darwin
             asset_name: rustafits-macos-x86_64
           - os: macos-latest
@@ -66,8 +66,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - name: Install cross (for ARM Linux)
         if: matrix.cross
@@ -77,13 +75,16 @@ jobs:
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }}
+            BINARY_PATH="target/${{ matrix.target }}/release"
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release
+            BINARY_PATH="target/release"
           fi
+          echo "BINARY_PATH=$BINARY_PATH" >> $GITHUB_ENV
 
       - name: Package binary
         run: |
-          cd target/${{ matrix.target }}/release
+          cd ${{ env.BINARY_PATH }}
           tar czf ${{ matrix.asset_name }}.tar.gz rustafits
           mv ${{ matrix.asset_name }}.tar.gz ${{ github.workspace }}/
 
