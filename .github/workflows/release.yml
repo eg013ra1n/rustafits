@@ -48,8 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install CFITSIO (Ubuntu)
-        if: runner.os == 'Linux' && !matrix.cross
+      - name: Install CFITSIO (native builds only)
+        if: ${{ !matrix.cross }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libcfitsio-dev pkg-config
@@ -57,7 +57,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cross (for ARM Linux)
+      - name: Install cross (for ARM64)
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
