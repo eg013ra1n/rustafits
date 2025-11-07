@@ -32,24 +32,12 @@ jobs:
 
   build-binaries:
     needs: create-release
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            asset_name: rustafits-linux-x86_64
-          - os: ubuntu-22.04
-            target: aarch64-unknown-linux-gnu
-            asset_name: rustafits-linux-aarch64
-            cross: true
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install CFITSIO (native builds only)
-        if: ${{ !matrix.cross }}
+      - name: Install CFITSIO
         run: |
           sudo apt-get update
           sudo apt-get install -y libcfitsio-dev pkg-config
@@ -57,30 +45,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cross (for ARM64)
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
       - name: Build release binary
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
-            BINARY_PATH="target/${{ matrix.target }}/release"
-          else
-            cargo build --release
-            BINARY_PATH="target/release"
-          fi
-          echo "BINARY_PATH=$BINARY_PATH" >> $GITHUB_ENV
+        run: cargo build --release
 
       - name: Package binary
         run: |
-          cd ${{ env.BINARY_PATH }}
-          tar czf ${{ matrix.asset_name }}.tar.gz rustafits
-          mv ${{ matrix.asset_name }}.tar.gz ${{ github.workspace }}/
+          cd target/release
+          tar czf rustafits-linux-x86_64.tar.gz rustafits
+          mv rustafits-linux-x86_64.tar.gz ${{ github.workspace }}/
 
       - name: Generate SHA256 checksum
         run: |
-          sha256sum ${{ matrix.asset_name }}.tar.gz > ${{ matrix.asset_name }}.tar.gz.sha256
+          sha256sum rustafits-linux-x86_64.tar.gz > rustafits-linux-x86_64.tar.gz.sha256
 
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
@@ -88,8 +64,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./${{ matrix.asset_name }}.tar.gz
-          asset_name: ${{ matrix.asset_name }}.tar.gz
+          asset_path: ./rustafits-linux-x86_64.tar.gz
+          asset_name: rustafits-linux-x86_64.tar.gz
           asset_content_type: application/gzip
 
       - name: Upload Checksum
@@ -98,8 +74,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./${{ matrix.asset_name }}.tar.gz.sha256
-          asset_name: ${{ matrix.asset_name }}.tar.gz.sha256
+          asset_path: ./rustafits-linux-x86_64.tar.gz.sha256
+          asset_name: rustafits-linux-x86_64.tar.gz.sha256
           asset_content_type: text/plain
 
   build-deb:

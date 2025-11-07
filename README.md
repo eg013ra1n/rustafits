@@ -25,12 +25,23 @@ brew tap eg013ra1n/rustafits
 brew install rustafits
 ```
 
-### Debian/Ubuntu
+### Debian/Ubuntu (x86_64)
 
 ```bash
 # Download .deb from releases
 wget https://github.com/eg013ra1n/rustafits/releases/latest/download/rustafits-VERSION-amd64.deb
 sudo dpkg -i rustafits-VERSION-amd64.deb
+```
+
+### Raspberry Pi / ARM64 Linux
+
+```bash
+# Install dependencies
+sudo apt-get update
+sudo apt-get install -y libcfitsio-dev pkg-config build-essential
+
+# Build from source
+cargo install rustafits
 ```
 
 ### Arch Linux (AUR)
