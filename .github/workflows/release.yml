@@ -42,12 +42,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset_name: rustafits-linux-aarch64
             cross: true
-          - os: macos-13-large
-            target: x86_64-apple-darwin
-            asset_name: rustafits-macos-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset_name: rustafits-macos-aarch64
 
     runs-on: ${{ matrix.os }}
 
@@ -59,10 +53,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libcfitsio-dev pkg-config
-
-      - name: Install CFITSIO (macOS)
-        if: runner.os == 'macOS'
-        run: brew install cfitsio
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
