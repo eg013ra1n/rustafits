@@ -1,6 +1,6 @@
 #include "fits_processor.h"
 #include "xisf_reader.h"
-#include "fitsio.h"
+#include "fits_reader.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,9 +28,6 @@ static void set_error(const char* msg) {
 }
 
 // Forward declarations
-static int read_fits_metadata(fitsfile* fptr, FitsMetadata* meta);
-static int read_fits_data_u16(fitsfile* fptr, const FitsMetadata* meta, uint16_t** data);
-static int read_fits_data_f32(fitsfile* fptr, const FitsMetadata* meta, float** data);
 static void downscale_u16(const uint16_t* in, uint16_t* out, size_t w, size_t h, int factor);
 static void downscale_f32(const float* in, float* out, size_t w, size_t h, int factor);
 static void bin_2x2_float(const float* in, float* out, size_t w, size_t h);
@@ -300,49 +297,30 @@ static inline void apply_stretch_simd(
 }
 
 int process_fits_file(const char* fits_path, const ProcessConfig* config, ProcessedImage* out_image) {
-    fitsfile* fptr = NULL;
-    int status = 0;
+    FitsMetadata meta;
+    uint16_t* u16_data = NULL;
+    float* f32_data = NULL;
 
     memset(out_image, 0, sizeof(ProcessedImage));
 
-    // Open FITS file
-    fits_open_file(&fptr, fits_path, READONLY, &status);
-    if (status) {
-        char fits_err[512];
-        fits_get_errstatus(status, fits_err);
-        snprintf(error_buffer, sizeof(error_buffer), "Failed to open FITS file: %s (status=%d)", fits_err, status);
+    // Read FITS image using custom reader
+    if (read_fits_image(fits_path, &meta, &u16_data, &f32_data) != 0) {
         return -1;
     }
 
-    // Read metadata
-    FitsMetadata meta;
-    if (read_fits_metadata(fptr, &meta) != 0) {
-        fits_close_file(fptr, &status);
-        return -1;
-    }
-
-    // For now, only handle mono 16-bit images (we'll expand this)
+    // For now, only handle mono images
     if (meta.channels != 1) {
         set_error("Only mono images supported for now");
-        fits_close_file(fptr, &status);
+        if (u16_data) free(u16_data);
+        if (f32_data) free(f32_data);
         return -1;
     }
 
     size_t width = meta.width;
     size_t height = meta.height;
-
-    // Read pixel data
-    void* pixel_data = NULL;
     float* float_data = NULL;
 
-    if (meta.dtype == DTYPE_UINT16) {
-        uint16_t* u16_data = NULL;
-        if (read_fits_data_u16(fptr, &meta, &u16_data) != 0) {
-            fits_close_file(fptr, &status);
-            return -1;
-        }
-        pixel_data = u16_data;
-
+    if (u16_data) {
         // Apply downscaling if needed
         if (config->downscale_factor > 1) {
             size_t new_w = width / config->downscale_factor;
@@ -351,14 +329,12 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
             downscale_u16(u16_data, downscaled, width, height, config->downscale_factor);
             free(u16_data);
             u16_data = downscaled;
-            pixel_data = u16_data;
             width = new_w;
             height = new_h;
         }
 
         // Check for Bayer pattern and debayer
         if (config->apply_debayer && meta.bayer_pattern != BAYER_NONE) {
-            // Debayering reduces resolution by 2
             size_t out_w = width / 2;
             size_t out_h = height / 2;
             float_data = malloc(out_w * out_h * 3 * sizeof(float));
@@ -389,14 +365,7 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
 
             out_image->is_color = 0;
         }
-    } else {
-        // Float data
-        float* f32_data = NULL;
-        if (read_fits_data_f32(fptr, &meta, &f32_data) != 0) {
-            fits_close_file(fptr, &status);
-            return -1;
-        }
-
+    } else if (f32_data) {
         // Apply downscaling if needed
         if (config->downscale_factor > 1) {
             size_t new_w = width / config->downscale_factor;
@@ -436,9 +405,10 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
 
             out_image->is_color = 0;
         }
+    } else {
+        set_error("No pixel data read from FITS");
+        return -1;
     }
-
-    fits_close_file(fptr, &status);
 
     // Apply stretch and convert to 8-bit
     int num_channels = out_image->is_color ? 3 : 1;
@@ -498,126 +468,6 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
         }
         free(out_image->data);
         out_image->data = flipped;
-    }
-
-    return 0;
-}
-
-static int read_fits_metadata(fitsfile* fptr, FitsMetadata* meta) {
-    int status = 0;
-    int naxis = 0;
-    long naxes[3] = {0};
-    int bitpix = 0;
-
-    // Get image dimensions
-    fits_get_img_dim(fptr, &naxis, &status);
-    fits_get_img_size(fptr, 3, naxes, &status);
-    fits_get_img_type(fptr, &bitpix, &status);
-
-    if (status) {
-        set_error("Failed to read FITS header");
-        return -1;
-    }
-
-    if (naxis == 2) {
-        meta->width = naxes[0];
-        meta->height = naxes[1];
-        meta->channels = 1;
-    } else if (naxis == 3) {
-        meta->width = naxes[0];
-        meta->height = naxes[1];
-        meta->channels = naxes[2];
-    } else {
-        set_error("Unsupported FITS dimensions");
-        return -1;
-    }
-
-    // Determine data type
-    if (bitpix == USHORT_IMG || bitpix == SHORT_IMG) {
-        meta->dtype = DTYPE_UINT16;
-    } else if (bitpix == FLOAT_IMG) {
-        meta->dtype = DTYPE_FLOAT32;
-    } else {
-        char err_msg[256];
-        snprintf(err_msg, sizeof(err_msg), "Unsupported BITPIX value: %d", bitpix);
-        set_error(err_msg);
-        return -1;
-    }
-
-    // Check for Bayer pattern
-    char bayerpat[64] = {0};
-    status = 0;
-    fits_read_key(fptr, TSTRING, "BAYERPAT", bayerpat, NULL, &status);
-    if (status == 0) {
-        if (strcmp(bayerpat, "RGGB") == 0) meta->bayer_pattern = BAYER_RGGB;
-        else if (strcmp(bayerpat, "BGGR") == 0) meta->bayer_pattern = BAYER_BGGR;
-        else if (strcmp(bayerpat, "GBRG") == 0) meta->bayer_pattern = BAYER_GBRG;
-        else if (strcmp(bayerpat, "GRBG") == 0) meta->bayer_pattern = BAYER_GRBG;
-        else meta->bayer_pattern = BAYER_NONE;
-    } else {
-        meta->bayer_pattern = BAYER_NONE;
-    }
-
-    // Check row order
-    char roworder[64] = {0};
-    status = 0;
-    fits_read_key(fptr, TSTRING, "ROWORDER", roworder, NULL, &status);
-    meta->flip_vertical = (status == 0 && strcmp(roworder, "TOP-DOWN") == 0) ? 1 : 0;
-
-    return 0;
-}
-
-static int read_fits_data_u16(fitsfile* fptr, const FitsMetadata* meta, uint16_t** data) {
-    int status = 0;
-    size_t npixels = meta->width * meta->height * meta->channels;
-    int bitpix = 0;
-
-    *data = malloc(npixels * sizeof(uint16_t));
-    if (!*data) {
-        set_error("Out of memory");
-        return -1;
-    }
-
-    // Get bitpix to determine signed vs unsigned
-    fits_get_img_type(fptr, &bitpix, &status);
-
-    long fpixel[3] = {1, 1, 1};
-
-    // Read image data - use fits_read_img which handles BZERO/BSCALE automatically
-    int anynul = 0;
-    fits_read_img(fptr, TUSHORT, 1, npixels, NULL, *data, &anynul, &status);
-
-    if (status) {
-        char fits_err[512];
-        fits_get_errstatus(status, fits_err);
-        snprintf(error_buffer, sizeof(error_buffer), "Failed to read FITS pixel data (u16): %s (status=%d, bitpix=%d, npixels=%zu)",
-                 fits_err, status, bitpix, npixels);
-        free(*data);
-        *data = NULL;
-        return -1;
-    }
-
-    return 0;
-}
-
-static int read_fits_data_f32(fitsfile* fptr, const FitsMetadata* meta, float** data) {
-    int status = 0;
-    size_t npixels = meta->width * meta->height * meta->channels;
-
-    *data = malloc(npixels * sizeof(float));
-    if (!*data) {
-        set_error("Out of memory");
-        return -1;
-    }
-
-    long fpixel[3] = {1, 1, 1};
-    fits_read_pix(fptr, TFLOAT, fpixel, npixels, NULL, *data, NULL, &status);
-
-    if (status) {
-        set_error("Failed to read FITS pixel data");
-        free(*data);
-        *data = NULL;
-        return -1;
     }
 
     return 0;
@@ -843,11 +693,6 @@ static void compute_stretch_params(const float* data, size_t len, float max_inpu
         *midtones = ((M - 1.0f) * X) / ((2.0f * M - 1.0f) * X - M);
     }
 
-    // Debug output
-    fprintf(stderr, "STRETCH DEBUG: median=%.1f, max_input=%.1f, norm_median=%.6f, norm_madn=%.6f\n",
-            median, max_input, norm_median, norm_madn);
-    fprintf(stderr, "STRETCH DEBUG: shadows=%.6f, highlights=%.6f, midtones=%.6f\n",
-            *shadows, *highlights, *midtones);
 }
 
 void free_processed_image(ProcessedImage* image) {
