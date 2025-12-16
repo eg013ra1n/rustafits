@@ -35,10 +35,7 @@ fn main() {
         .file("c_src/jpeg_writer.c")
         .file("c_src/xisf_reader.c")
         .file("c_src/base64.c")
-        .file("ffi/debayer.c")
-        .file("ffi/stretch.c")
         .include("c_src")
-        .include("ffi")
         .opt_level(3)  // Maximum optimization
         .flag("-march=native")  // Use native CPU instructions (enables NEON on ARM, SSE2 on x86)
         .flag("-ffast-math")  // Fast math optimizations
@@ -80,8 +77,4 @@ fn main() {
     println!("cargo:rerun-if-changed=c_src/xisf_reader.c");
     println!("cargo:rerun-if-changed=c_src/xisf_reader.h");
     println!("cargo:rerun-if-changed=c_src/base64.c");
-    println!("cargo:rerun-if-changed=ffi/debayer.c");
-    println!("cargo:rerun-if-changed=ffi/debayer.h");
-    println!("cargo:rerun-if-changed=ffi/stretch.c");
-    println!("cargo:rerun-if-changed=ffi/stretch.h");
 }

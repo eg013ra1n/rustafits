@@ -37,15 +37,6 @@ static void super_pixel_debayer_f32(const float* in, float* out_rgb,
                                     size_t w, size_t h, BayerPattern pattern);
 static void compute_stretch_params(const float* data, size_t len, float max_input,
                                    float* shadows, float* highlights, float* midtones);
-static void apply_stretch(const float* in, uint8_t* out, size_t len,
-                         float shadows, float highlights, float midtones, float max_input);
-
-// Comparison function for qsort
-static int compare_float(const void* a, const void* b) {
-    float fa = *(const float*)a;
-    float fb = *(const float*)b;
-    return (fa > fb) - (fa < fb);
-}
 
 // Quickselect algorithm for finding k-th element (faster than full sort for median)
 static float quickselect(float* arr, size_t left, size_t right, size_t k) {
