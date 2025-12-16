@@ -38,7 +38,11 @@ fn main() {
         .include("c_src")
         .opt_level(3)  // Maximum optimization
         .flag("-march=native")  // Use native CPU instructions (enables NEON on ARM, SSE2 on x86)
+        .flag("-mtune=native")  // Tune for native CPU
         .flag("-ffast-math")  // Fast math optimizations
+        .flag("-ftree-vectorize")  // Enable auto-vectorization
+        .flag("-funroll-loops")  // Unroll loops for better performance
+        .flag("-fomit-frame-pointer")  // Free up a register
         .warnings(false);
 
     // Add compression library include paths

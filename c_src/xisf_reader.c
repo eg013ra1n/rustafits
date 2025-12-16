@@ -7,6 +7,15 @@
 #include <lz4.h>
 #include <zstd.h>
 
+// SIMD support detection
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #include <emmintrin.h>  // SSE2
+    #define HAS_SIMD_SSE2 1
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    #include <arm_neon.h>
+    #define HAS_SIMD_NEON 1
+#endif
+
 // Thread-local error buffer (shared with fits_processor.c via extern)
 extern __thread char error_buffer[512];
 
@@ -390,7 +399,7 @@ static int read_attachment_data(FILE* f, uint64_t pos, uint64_t size, uint8_t** 
     return 0;
 }
 
-// Convert pixel data to float32 for processing
+// Convert pixel data to float32 for processing (SIMD optimized)
 static float* convert_to_float32(const uint8_t* raw_data, const XisfImageInfo* info) {
     size_t num_samples = info->width * info->height * info->channels;
     float* float_data = malloc(num_samples * sizeof(float));
@@ -403,14 +412,32 @@ static float* convert_to_float32(const uint8_t* raw_data, const XisfImageInfo* i
         case XISF_SAMPLE_UINT8: {
             const uint8_t* src = raw_data;
             for (size_t i = 0; i < num_samples; i++) {
-                float_data[i] = (float)src[i] * 256.0f;  // Scale to 16-bit range
+                float_data[i] = (float)src[i] * 256.0f;
             }
             break;
         }
 
         case XISF_SAMPLE_UINT16: {
             const uint16_t* src = (const uint16_t*)raw_data;
-            for (size_t i = 0; i < num_samples; i++) {
+            size_t i = 0;
+#ifdef HAS_SIMD_SSE2
+            // Process 4 uint16 values at a time
+            for (; i + 3 < num_samples; i += 4) {
+                __m128i v16 = _mm_loadl_epi64((__m128i*)&src[i]);  // Load 4 uint16
+                __m128i v32 = _mm_unpacklo_epi16(v16, _mm_setzero_si128());  // Zero-extend to 32-bit
+                __m128 vf = _mm_cvtepi32_ps(v32);  // Convert to float
+                _mm_storeu_ps(&float_data[i], vf);
+            }
+#elif defined(HAS_SIMD_NEON)
+            for (; i + 3 < num_samples; i += 4) {
+                uint16x4_t v16 = vld1_u16(&src[i]);
+                uint32x4_t v32 = vmovl_u16(v16);
+                float32x4_t vf = vcvtq_f32_u32(v32);
+                vst1q_f32(&float_data[i], vf);
+            }
+#endif
+            // Scalar remainder
+            for (; i < num_samples; i++) {
                 float_data[i] = (float)src[i];
             }
             break;
@@ -419,15 +446,30 @@ static float* convert_to_float32(const uint8_t* raw_data, const XisfImageInfo* i
         case XISF_SAMPLE_UINT32: {
             const uint32_t* src = (const uint32_t*)raw_data;
             for (size_t i = 0; i < num_samples; i++) {
-                float_data[i] = (float)(src[i] >> 16);  // Scale down to 16-bit range
+                float_data[i] = (float)(src[i] >> 16);
             }
             break;
         }
 
         case XISF_SAMPLE_FLOAT32: {
             const float* src = (const float*)raw_data;
-            // XISF float is normalized [0,1], convert to 16-bit range
-            for (size_t i = 0; i < num_samples; i++) {
+            size_t i = 0;
+#ifdef HAS_SIMD_SSE2
+            __m128 scale = _mm_set1_ps(65535.0f);
+            for (; i + 3 < num_samples; i += 4) {
+                __m128 v = _mm_loadu_ps(&src[i]);
+                v = _mm_mul_ps(v, scale);
+                _mm_storeu_ps(&float_data[i], v);
+            }
+#elif defined(HAS_SIMD_NEON)
+            float32x4_t scale = vdupq_n_f32(65535.0f);
+            for (; i + 3 < num_samples; i += 4) {
+                float32x4_t v = vld1q_f32(&src[i]);
+                v = vmulq_f32(v, scale);
+                vst1q_f32(&float_data[i], v);
+            }
+#endif
+            for (; i < num_samples; i++) {
                 float_data[i] = src[i] * 65535.0f;
             }
             break;
@@ -435,7 +477,6 @@ static float* convert_to_float32(const uint8_t* raw_data, const XisfImageInfo* i
 
         case XISF_SAMPLE_FLOAT64: {
             const double* src = (const double*)raw_data;
-            // XISF float is normalized [0,1], convert to 16-bit range
             for (size_t i = 0; i < num_samples; i++) {
                 float_data[i] = (float)(src[i] * 65535.0);
             }

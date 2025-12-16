@@ -96,6 +96,37 @@ static float find_median(float* data, size_t len) {
     return quickselect(data, 0, len - 1, len / 2);
 }
 
+// SIMD-optimized grayscale to RGB replication
+static void replicate_gray_to_rgb(const uint8_t* gray, uint8_t* rgb, size_t count) {
+    size_t i = 0;
+#ifdef HAS_SIMD_SSE2
+    // Process 4 pixels at a time: 4 gray bytes -> 12 RGB bytes
+    for (; i + 3 < count; i += 4) {
+        uint8_t g0 = gray[i], g1 = gray[i+1], g2 = gray[i+2], g3 = gray[i+3];
+        uint8_t* dst = &rgb[i * 3];
+        // Write 12 bytes: R0G0B0 R1G1B1 R2G2B2 R3G3B3
+        dst[0] = g0; dst[1] = g0; dst[2] = g0;
+        dst[3] = g1; dst[4] = g1; dst[5] = g1;
+        dst[6] = g2; dst[7] = g2; dst[8] = g2;
+        dst[9] = g3; dst[10] = g3; dst[11] = g3;
+    }
+#elif defined(HAS_SIMD_NEON)
+    // Process 8 pixels at a time using NEON
+    for (; i + 7 < count; i += 8) {
+        uint8x8_t g = vld1_u8(&gray[i]);
+        uint8x8x3_t rgb_vec = {{g, g, g}};
+        vst3_u8(&rgb[i * 3], rgb_vec);
+    }
+#endif
+    // Scalar remainder
+    for (; i < count; i++) {
+        uint8_t val = gray[i];
+        rgb[i * 3] = val;
+        rgb[i * 3 + 1] = val;
+        rgb[i * 3 + 2] = val;
+    }
+}
+
 // SIMD-optimized stretch application for x86_64 (SSE2)
 #ifdef HAS_SIMD_SSE2
 static inline void apply_stretch_simd_sse2(
@@ -437,11 +468,8 @@ int process_fits_file(const char* fits_path, const ProcessConfig* config, Proces
                 uint8_t* temp = malloc(channel_size);
                 apply_stretch_simd(channel_data, temp, channel_size,
                                   native_shadows, native_highlights, k1, k2, midtones, 1);
-                // Replicate to RGB
-                for (size_t i = 0; i < channel_size; i++) {
-                    uint8_t val = temp[i];
-                    memset(&out_image->data[i * 3], val, 3);
-                }
+                // Replicate to RGB using optimized function
+                replicate_gray_to_rgb(temp, out_image->data, channel_size);
                 free(temp);
             }
         }
@@ -486,23 +514,61 @@ static void downscale_f32(const float* in, float* out, size_t w, size_t h, int f
     }
 }
 
-// 2x2 binning (averaging) for mono images in preview mode
+// 2x2 binning (averaging) for mono images in preview mode (SIMD optimized)
 static void bin_2x2_float(const float* in, float* out, size_t w, size_t h) {
     size_t out_w = w / 2;
     size_t out_h = h / 2;
 
     for (size_t y = 0; y < out_h; y++) {
-        for (size_t x = 0; x < out_w; x++) {
-            size_t in_y = y * 2;
+        size_t in_y = y * 2;
+        const float* row0 = &in[in_y * w];
+        const float* row1 = &in[(in_y + 1) * w];
+        float* out_row = &out[y * out_w];
+        size_t x = 0;
+
+#ifdef HAS_SIMD_SSE2
+        // Process 4 output pixels at a time (8 input pixels per row)
+        __m128 quarter = _mm_set1_ps(0.25f);
+        for (; x + 3 < out_w; x += 4) {
             size_t in_x = x * 2;
+            // Load 8 floats from each row
+            __m128 r0_a = _mm_loadu_ps(&row0[in_x]);     // p00,p01,p02,p03
+            __m128 r0_b = _mm_loadu_ps(&row0[in_x + 4]); // p04,p05,p06,p07
+            __m128 r1_a = _mm_loadu_ps(&row1[in_x]);
+            __m128 r1_b = _mm_loadu_ps(&row1[in_x + 4]);
 
-            // Average 2x2 block
-            float p00 = in[in_y * w + in_x];
-            float p01 = in[in_y * w + in_x + 1];
-            float p10 = in[(in_y + 1) * w + in_x];
-            float p11 = in[(in_y + 1) * w + in_x + 1];
+            // Horizontal pairwise add: (a+b, c+d, e+f, g+h)
+            __m128 sum0 = _mm_add_ps(_mm_shuffle_ps(r0_a, r0_b, _MM_SHUFFLE(2,0,2,0)),
+                                     _mm_shuffle_ps(r0_a, r0_b, _MM_SHUFFLE(3,1,3,1)));
+            __m128 sum1 = _mm_add_ps(_mm_shuffle_ps(r1_a, r1_b, _MM_SHUFFLE(2,0,2,0)),
+                                     _mm_shuffle_ps(r1_a, r1_b, _MM_SHUFFLE(3,1,3,1)));
 
-            out[y * out_w + x] = (p00 + p01 + p10 + p11) * 0.25f;
+            // Add rows and multiply by 0.25
+            __m128 result = _mm_mul_ps(_mm_add_ps(sum0, sum1), quarter);
+            _mm_storeu_ps(&out_row[x], result);
+        }
+#elif defined(HAS_SIMD_NEON)
+        float32x4_t quarter = vdupq_n_f32(0.25f);
+        for (; x + 3 < out_w; x += 4) {
+            size_t in_x = x * 2;
+            float32x4x2_t r0 = vld2q_f32(&row0[in_x]);  // Deinterleave pairs
+            float32x4x2_t r1 = vld2q_f32(&row1[in_x]);
+
+            float32x4_t sum0 = vaddq_f32(r0.val[0], r0.val[1]);  // p00+p01, p02+p03, ...
+            float32x4_t sum1 = vaddq_f32(r1.val[0], r1.val[1]);
+
+            float32x4_t result = vmulq_f32(vaddq_f32(sum0, sum1), quarter);
+            vst1q_f32(&out_row[x], result);
+        }
+#endif
+        // Scalar remainder
+        for (; x < out_w; x++) {
+            size_t in_x = x * 2;
+            float p00 = row0[in_x];
+            float p01 = row0[in_x + 1];
+            float p10 = row1[in_x];
+            float p11 = row1[in_x + 1];
+            out_row[x] = (p00 + p01 + p10 + p11) * 0.25f;
         }
     }
 }
@@ -799,10 +865,7 @@ static int process_xisf_internal(const char* xisf_path, const ProcessConfig* con
                 uint8_t* temp = malloc(channel_size);
                 apply_stretch_simd(channel_data, temp, channel_size,
                                   native_shadows, native_highlights, k1, k2, midtones, 1);
-                for (size_t i = 0; i < channel_size; i++) {
-                    uint8_t val = temp[i];
-                    memset(&out_image->data[i * 3], val, 3);
-                }
+                replicate_gray_to_rgb(temp, out_image->data, channel_size);
                 free(temp);
             }
         }

@@ -12,27 +12,27 @@ static void set_fits_error(const char* msg) {
     snprintf(error_buffer, sizeof(error_buffer), "%s", msg);
 }
 
-// FITS uses big-endian byte order
+// FITS uses big-endian byte order - use compiler builtins for single-instruction swaps
 static inline uint16_t swap16(uint16_t val) {
-    return (val >> 8) | (val << 8);
+    return __builtin_bswap16(val);
 }
 
 static inline int16_t swap16s(int16_t val) {
-    uint16_t u = (uint16_t)val;
-    return (int16_t)((u >> 8) | (u << 8));
+    return (int16_t)__builtin_bswap16((uint16_t)val);
 }
 
 static inline uint32_t swap32(uint32_t val) {
-    return ((val >> 24) & 0xFF) |
-           ((val >> 8) & 0xFF00) |
-           ((val << 8) & 0xFF0000) |
-           ((val << 24) & 0xFF000000);
+    return __builtin_bswap32(val);
+}
+
+static inline uint64_t swap64(uint64_t val) {
+    return __builtin_bswap64(val);
 }
 
 static inline float swap_float(float val) {
     uint32_t tmp;
     memcpy(&tmp, &val, 4);
-    tmp = swap32(tmp);
+    tmp = __builtin_bswap32(tmp);
     float result;
     memcpy(&result, &tmp, 4);
     return result;
@@ -276,15 +276,29 @@ int read_fits_image(const char* fits_path, FitsMetadata* meta,
             return -1;
         }
 
-        int16_t* src = (int16_t*)raw_data;
-        for (size_t i = 0; i < num_pixels; i++) {
-            // Swap bytes (big-endian to native) and apply BZERO/BSCALE
-            int16_t val = swap16s(src[i]);
-            double scaled = hdr.bzero + hdr.bscale * val;
-            // Clamp to uint16 range
-            if (scaled < 0) scaled = 0;
-            if (scaled > 65535) scaled = 65535;
-            u16_data[i] = (uint16_t)scaled;
+        uint16_t* src = (uint16_t*)raw_data;
+
+        // Fast path: BZERO=32768, BSCALE=1 (common for unsigned 16-bit)
+        // This converts signed to unsigned by adding 32768, which is just XOR with 0x8000
+        if (hdr.bzero == 32768.0 && hdr.bscale == 1.0) {
+            for (size_t i = 0; i < num_pixels; i++) {
+                u16_data[i] = swap16(src[i]) ^ 0x8000;
+            }
+        } else if (hdr.bzero == 0.0 && hdr.bscale == 1.0) {
+            // Simple swap only - no scaling needed
+            for (size_t i = 0; i < num_pixels; i++) {
+                u16_data[i] = swap16(src[i]);
+            }
+        } else {
+            // General case with BZERO/BSCALE
+            int16_t* src_s = (int16_t*)raw_data;
+            for (size_t i = 0; i < num_pixels; i++) {
+                int16_t val = swap16s(src_s[i]);
+                double scaled = hdr.bzero + hdr.bscale * val;
+                if (scaled < 0) scaled = 0;
+                if (scaled > 65535) scaled = 65535;
+                u16_data[i] = (uint16_t)scaled;
+            }
         }
 
         free(raw_data);
@@ -359,16 +373,7 @@ int read_fits_image(const char* fits_path, FitsMetadata* meta,
 
         uint64_t* src = (uint64_t*)raw_data;
         for (size_t i = 0; i < num_pixels; i++) {
-            // Swap 8 bytes
-            uint64_t val = src[i];
-            val = ((val >> 56) & 0xFF) |
-                  ((val >> 40) & 0xFF00) |
-                  ((val >> 24) & 0xFF0000) |
-                  ((val >> 8) & 0xFF000000) |
-                  ((val << 8) & 0xFF00000000ULL) |
-                  ((val << 24) & 0xFF0000000000ULL) |
-                  ((val << 40) & 0xFF000000000000ULL) |
-                  ((val << 56) & 0xFF00000000000000ULL);
+            uint64_t val = swap64(src[i]);
             double dval;
             memcpy(&dval, &val, 8);
             f32_data[i] = (float)(hdr.bzero + hdr.bscale * dval);
