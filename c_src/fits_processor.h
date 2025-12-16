@@ -68,6 +68,21 @@ int process_fits_file(
 );
 
 /**
+ * Process image file (FITS or XISF) and return RGB image data
+ * Auto-detects format based on file extension or magic bytes
+ *
+ * @param path Path to image file (.fits, .fit, or .xisf)
+ * @param config Processing configuration
+ * @param out_image Output image (caller must free with free_processed_image)
+ * @return 0 on success, -1 on error
+ */
+int process_image_file(
+    const char* path,
+    const ProcessConfig* config,
+    ProcessedImage* out_image
+);
+
+/**
  * Save processed image as JPEG
  *
  * @param image Processed image

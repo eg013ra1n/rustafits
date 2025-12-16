@@ -4,9 +4,13 @@ use std::env;
 use std::process;
 
 fn print_usage(program: &str) {
-    eprintln!("FITS to JPEG Converter");
+    eprintln!("FITS/XISF to JPEG Converter");
     eprintln!();
-    eprintln!("Usage: {} <input.fits> <output.jpg> [OPTIONS]", program);
+    eprintln!("Usage: {} <input> <output.jpg> [OPTIONS]", program);
+    eprintln!();
+    eprintln!("Supported input formats:");
+    eprintln!("  .fits, .fit   - FITS (Flexible Image Transport System)");
+    eprintln!("  .xisf         - XISF (PixInsight native format)");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --downscale <N>      Downscale factor (1 = no downscaling, default: 1)");
@@ -17,6 +21,7 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} image.fits image.jpg", program);
+    eprintln!("  {} image.xisf image.jpg", program);
     eprintln!("  {} image.fits image.jpg --downscale 2 --quality 90", program);
     eprintln!("  {} raw.fits output.jpg --no-debayer --log", program);
 }
@@ -93,7 +98,7 @@ fn run() -> Result<()> {
     }
 
     if log_enabled {
-        println!("Converting FITS to JPEG...");
+        println!("Converting to JPEG...");
         println!("  Input:  {}", input_path);
         println!("  Output: {}", output_path);
         println!("  Downscale: {}x", downscale);
@@ -117,7 +122,7 @@ fn run() -> Result<()> {
 
     // Perform conversion
     converter.convert(input_path, output_path)
-        .context("Failed to convert FITS to JPEG")?;
+        .context("Conversion failed")?;
 
     if log_enabled {
         println!("Conversion successful!");
