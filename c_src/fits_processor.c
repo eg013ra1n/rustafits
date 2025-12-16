@@ -1,4 +1,5 @@
 #include "fits_processor.h"
+#include "xisf_reader.h"
 #include "fitsio.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,8 +16,8 @@
     #define HAS_SIMD_NEON 1
 #endif
 
-// Thread-local error buffer
-static __thread char error_buffer[512] = {0};
+// Thread-local error buffer (also used by xisf_reader.c)
+__thread char error_buffer[512] = {0};
 
 const char* get_last_error(void) {
     return error_buffer;
@@ -853,5 +854,146 @@ void free_processed_image(ProcessedImage* image) {
     if (image && image->data) {
         free(image->data);
         image->data = NULL;
+    }
+}
+
+// Process XISF file using the same pipeline as FITS
+static int process_xisf_internal(const char* xisf_path, const ProcessConfig* config, ProcessedImage* out_image) {
+    FitsMetadata meta;
+    uint16_t* u16_data = NULL;
+    float* float_data = NULL;
+
+    memset(out_image, 0, sizeof(ProcessedImage));
+
+    // Read XISF image (returns float32 data)
+    if (read_xisf_image(xisf_path, &meta, &u16_data, &float_data) != 0) {
+        return -1;
+    }
+
+    // XISF reader always returns float data
+    if (!float_data) {
+        set_error("XISF reader returned no data");
+        return -1;
+    }
+
+    size_t width = meta.width;
+    size_t height = meta.height;
+
+    // Apply downscaling if needed
+    if (config->downscale_factor > 1) {
+        size_t new_w = width / config->downscale_factor;
+        size_t new_h = height / config->downscale_factor;
+        size_t num_channels = meta.channels;
+        float* downscaled = malloc(new_w * new_h * num_channels * sizeof(float));
+
+        // Downscale each channel
+        for (size_t c = 0; c < num_channels; c++) {
+            float* src_plane = float_data + c * width * height;
+            float* dst_plane = downscaled + c * new_w * new_h;
+            for (size_t y = 0; y < new_h; y++) {
+                for (size_t x = 0; x < new_w; x++) {
+                    dst_plane[y * new_w + x] = src_plane[(y * config->downscale_factor) * width + (x * config->downscale_factor)];
+                }
+            }
+        }
+
+        free(float_data);
+        float_data = downscaled;
+        width = new_w;
+        height = new_h;
+    }
+
+    // Handle mono images with Bayer pattern
+    if (meta.channels == 1 && config->apply_debayer && meta.bayer_pattern != BAYER_NONE) {
+        size_t out_w = width / 2;
+        size_t out_h = height / 2;
+        float* rgb_data = malloc(out_w * out_h * 3 * sizeof(float));
+        super_pixel_debayer_f32(float_data, rgb_data, width, height, meta.bayer_pattern);
+        free(float_data);
+        float_data = rgb_data;
+        width = out_w;
+        height = out_h;
+        out_image->is_color = 1;
+        meta.channels = 3;
+    } else if (meta.channels == 3) {
+        // Already RGB
+        out_image->is_color = 1;
+    } else {
+        // Apply 2x2 binning in preview mode for mono images
+        if (config->preview_mode && meta.channels == 1 && meta.bayer_pattern == BAYER_NONE) {
+            size_t new_w = width / 2;
+            size_t new_h = height / 2;
+            float* binned = malloc(new_w * new_h * sizeof(float));
+            bin_2x2_float(float_data, binned, width, height);
+            free(float_data);
+            float_data = binned;
+            width = new_w;
+            height = new_h;
+        }
+        out_image->is_color = 0;
+    }
+
+    // Apply stretch and convert to 8-bit
+    int num_channels = out_image->is_color ? 3 : 1;
+    out_image->width = width;
+    out_image->height = height;
+    out_image->data = malloc(width * height * 3);  // Always RGB output
+
+    if (config->auto_stretch) {
+        for (int c = 0; c < num_channels; c++) {
+            float shadows, highlights, midtones;
+            size_t channel_size = width * height;
+            float* channel_data = float_data + (c * channel_size);
+
+            float max_input = 65536.0f;  // Standard 16-bit range
+
+            compute_stretch_params(channel_data, channel_size, max_input,
+                                 &shadows, &highlights, &midtones);
+
+            float hs_range_factor = (highlights == shadows) ? 1.0f : 1.0f / (highlights - shadows);
+            float native_shadows = shadows * max_input;
+            float native_highlights = highlights * max_input;
+            float k1 = (midtones - 1.0f) * hs_range_factor * 255.0f / max_input;
+            float k2 = ((2.0f * midtones) - 1.0f) * hs_range_factor / max_input;
+
+            if (out_image->is_color) {
+                apply_stretch_simd(channel_data, &out_image->data[c], channel_size,
+                                  native_shadows, native_highlights, k1, k2, midtones, 3);
+            } else {
+                uint8_t* temp = malloc(channel_size);
+                apply_stretch_simd(channel_data, temp, channel_size,
+                                  native_shadows, native_highlights, k1, k2, midtones, 1);
+                for (size_t i = 0; i < channel_size; i++) {
+                    uint8_t val = temp[i];
+                    memset(&out_image->data[i * 3], val, 3);
+                }
+                free(temp);
+            }
+        }
+    }
+
+    free(float_data);
+
+    // Handle vertical flip
+    if (meta.flip_vertical) {
+        uint8_t* flipped = malloc(width * height * 3);
+        for (size_t y = 0; y < height; y++) {
+            memcpy(flipped + y * width * 3,
+                   out_image->data + (height - 1 - y) * width * 3,
+                   width * 3);
+        }
+        free(out_image->data);
+        out_image->data = flipped;
+    }
+
+    return 0;
+}
+
+// Main entry point - handles both FITS and XISF files
+int process_image_file(const char* path, const ProcessConfig* config, ProcessedImage* out_image) {
+    if (is_xisf_file(path)) {
+        return process_xisf_internal(path, config, out_image);
+    } else {
+        return process_fits_file(path, config, out_image);
     }
 }

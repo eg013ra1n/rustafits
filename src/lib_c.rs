@@ -25,8 +25,8 @@ struct ProcessedImage {
 }
 
 extern "C" {
-    fn process_fits_file(
-        fits_path: *const c_char,
+    fn process_image_file(
+        path: *const c_char,
         config: *const ProcessConfig,
         out_image: *mut ProcessedImage,
     ) -> c_int;
@@ -108,7 +108,7 @@ impl FitsConverter {
         };
 
         unsafe {
-            let result = process_fits_file(
+            let result = process_image_file(
                 input_cstr.as_ptr(),
                 &config as *const ProcessConfig,
                 &mut image as *mut ProcessedImage,
@@ -123,7 +123,7 @@ impl FitsConverter {
                 } else {
                     "Unknown error".to_string()
                 };
-                anyhow::bail!("FITS processing failed: {}", err_msg);
+                anyhow::bail!("Image processing failed: {}", err_msg);
             }
 
             let result = save_jpeg(

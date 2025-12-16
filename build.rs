@@ -29,9 +29,16 @@ fn main() {
         }
     }
 
+    // Get compression library paths from pkg-config
+    let zlib = pkg_config::Config::new().probe("zlib").ok();
+    let lz4 = pkg_config::Config::new().probe("liblz4").ok();
+    let zstd = pkg_config::Config::new().probe("libzstd").ok();
+
     build
         .file("c_src/fits_processor.c")
         .file("c_src/jpeg_writer.c")
+        .file("c_src/xisf_reader.c")
+        .file("c_src/base64.c")
         .file("ffi/debayer.c")
         .file("ffi/stretch.c")
         .include("c_src")
@@ -40,6 +47,23 @@ fn main() {
         .flag("-march=native")  // Use native CPU instructions (enables NEON on ARM, SSE2 on x86)
         .flag("-ffast-math")  // Fast math optimizations
         .warnings(false);
+
+    // Add compression library include paths
+    if let Some(ref z) = zlib {
+        for path in &z.include_paths {
+            build.include(path);
+        }
+    }
+    if let Some(ref l) = lz4 {
+        for path in &l.include_paths {
+            build.include(path);
+        }
+    }
+    if let Some(ref z) = zstd {
+        for path in &z.include_paths {
+            build.include(path);
+        }
+    }
 
     // Add cfitsio include paths
     for path in &cfitsio.include_paths {
@@ -52,10 +76,18 @@ fn main() {
     println!("cargo:rustc-link-lib=cfitsio");
     println!("cargo:rustc-link-lib=m");  // Math library
 
+    // Link compression libraries for XISF support
+    println!("cargo:rustc-link-lib=z");      // zlib
+    println!("cargo:rustc-link-lib=lz4");    // LZ4
+    println!("cargo:rustc-link-lib=zstd");   // Zstandard
+
     // Tell cargo to rerun if C sources change
     println!("cargo:rerun-if-changed=c_src/fits_processor.c");
     println!("cargo:rerun-if-changed=c_src/fits_processor.h");
     println!("cargo:rerun-if-changed=c_src/jpeg_writer.c");
+    println!("cargo:rerun-if-changed=c_src/xisf_reader.c");
+    println!("cargo:rerun-if-changed=c_src/xisf_reader.h");
+    println!("cargo:rerun-if-changed=c_src/base64.c");
     println!("cargo:rerun-if-changed=ffi/debayer.c");
     println!("cargo:rerun-if-changed=ffi/debayer.h");
     println!("cargo:rerun-if-changed=ffi/stretch.c");
