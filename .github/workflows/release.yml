@@ -37,10 +37,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install CFITSIO
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcfitsio-dev pkg-config
+          sudo apt-get install -y liblz4-dev libzstd-dev zlib1g-dev pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -90,7 +90,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y debhelper devscripts libcfitsio-dev pkg-config
+          sudo apt-get install -y debhelper devscripts liblz4-dev libzstd-dev zlib1g-dev pkg-config
 
       - name: Build with cargo (debian uses system cargo)
         run: |
@@ -109,9 +109,9 @@ jobs:
           Priority: optional
           Architecture: amd64
           Maintainer: Vilen Sharifov <vilen.sharifov@gmail.com>
-          Depends: libcfitsio9
-          Description: High-performance FITS to JPEG converter
-           FITS to JPEG converter for astronomical images with QuickFits/PixInsight-
+          Depends: liblz4-1, libzstd1, zlib1g
+          Description: High-performance FITS/XISF to JPEG converter
+           FITS/XISF to JPEG converter for astronomical images with QuickFits/PixInsight-
            compatible auto-stretch and Bayer debayering.
           EOF
 
@@ -134,10 +134,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install CFITSIO
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcfitsio-dev pkg-config
+          sudo apt-get install -y liblz4-dev libzstd-dev zlib1g-dev pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
