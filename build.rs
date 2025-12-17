@@ -37,13 +37,19 @@ fn main() {
         .file("c_src/base64.c")
         .include("c_src")
         .opt_level(3)  // Maximum optimization
-        .flag("-march=native")  // Use native CPU instructions (enables NEON on ARM, SSE2 on x86)
-        .flag("-mtune=native")  // Tune for native CPU
         .flag("-ffast-math")  // Fast math optimizations
         .flag("-ftree-vectorize")  // Enable auto-vectorization
         .flag("-funroll-loops")  // Unroll loops for better performance
-        .flag("-fomit-frame-pointer")  // Free up a register
-        .warnings(false);
+        .flag("-fomit-frame-pointer");  // Free up a register
+
+    // Use native CPU optimizations only for local builds (not package managers)
+    // Set RUSTAFITS_PORTABLE=1 to build portable binaries (e.g., for Homebrew bottles)
+    if std::env::var("RUSTAFITS_PORTABLE").is_err() {
+        build.flag("-march=native");  // Use native CPU instructions
+        build.flag("-mtune=native");  // Tune for native CPU
+    }
+
+    build.warnings(false);
 
     // Add compression library include paths
     if let Some(ref z) = zlib {

@@ -1,7 +1,7 @@
 Name:           rustafits
-Version:        0.1.0
+Version:        0.2.1
 Release:        1%{?dist}
-Summary:        High-performance FITS to JPEG converter with auto-stretch
+Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
 License:        GPLv3
 URL:            https://github.com/eg013ra1n/rustafits
@@ -10,16 +10,21 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 BuildRequires:  rust-packaging >= 21
 BuildRequires:  cargo
 BuildRequires:  rust
-BuildRequires:  cfitsio-devel
 BuildRequires:  pkgconfig
+BuildRequires:  lz4-devel
+BuildRequires:  libzstd-devel
+BuildRequires:  zlib-devel
 
-Requires:       cfitsio
+Requires:       lz4
+Requires:       libzstd
+Requires:       zlib
 
 %description
-High-performance FITS to JPEG converter for astronomical images with
+High-performance FITS/XISF to JPEG converter for astronomical images with
 QuickFits/PixInsight-compatible auto-stretch and Bayer debayering.
 
 Features:
+- FITS and XISF format support (including compressed XISF)
 - Auto-Stretch: Median-based statistical stretching (robust to outliers)
 - Bayer Debayering: Super-pixel 2×2 block averaging (RGGB, BGGR, GBRG, GRBG)
 - Preview Mode: 2×2 binning for mono images (4× fewer pixels, ~90ms processing)
@@ -31,9 +36,11 @@ Features:
 %cargo_prep
 
 %build
+export RUSTAFITS_PORTABLE=1
 %cargo_build
 
 %install
+export RUSTAFITS_PORTABLE=1
 %cargo_install
 
 %check
@@ -41,11 +48,19 @@ Features:
 
 %files
 %license LICENSE
-%doc README.md PERFORMANCE.md
+%doc README.md
 %{_bindir}/%{name}
 
 %changelog
-* Wed Nov 06 2025 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.1.0-1
+* Tue Dec 17 2024 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.2.1-1
+- Fix portable builds for package managers (Homebrew, RPM)
+- Add RUSTAFITS_PORTABLE environment variable for portable binaries
+
+* Wed Nov 06 2024 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.2.0-1
+- Add XISF format support with LZ4, zstd, and zlib compression
+- SIMD optimizations for XISF processing
+
+* Wed Nov 06 2024 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.1.0-1
 - Initial package
 - High-performance FITS to JPEG converter
 - QuickFits/PixInsight-compatible auto-stretch
