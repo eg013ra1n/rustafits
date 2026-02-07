@@ -36,17 +36,26 @@ fn main() {
         .file("c_src/xisf_reader.c")
         .file("c_src/base64.c")
         .include("c_src")
-        .opt_level(3)  // Maximum optimization
-        .flag("-ffast-math")  // Fast math optimizations
-        .flag("-ftree-vectorize")  // Enable auto-vectorization
-        .flag("-funroll-loops")  // Unroll loops for better performance
-        .flag("-fomit-frame-pointer");  // Free up a register
+        .opt_level(3);  // Maximum optimization
 
-    // Use native CPU optimizations only for local builds (not package managers)
-    // Set RUSTAFITS_PORTABLE=1 to build portable binaries (e.g., for Homebrew bottles)
-    if std::env::var("RUSTAFITS_PORTABLE").is_err() {
-        build.flag("-march=native");  // Use native CPU instructions
-        build.flag("-mtune=native");  // Tune for native CPU
+    // Compiler-specific optimization flags
+    let is_msvc = build.get_compiler().is_like_msvc();
+
+    if is_msvc {
+        build.flag("/fp:fast");  // Fast floating-point
+        build.flag("/Oy");      // Omit frame pointer
+    } else {
+        build.flag("-ffast-math");          // Fast math optimizations
+        build.flag("-ftree-vectorize");     // Enable auto-vectorization
+        build.flag("-funroll-loops");       // Unroll loops for better performance
+        build.flag("-fomit-frame-pointer"); // Free up a register
+
+        // Use native CPU optimizations only for local builds (not package managers)
+        // Set RUSTAFITS_PORTABLE=1 to build portable binaries (e.g., for Homebrew bottles)
+        if std::env::var("RUSTAFITS_PORTABLE").is_err() {
+            build.flag("-march=native");  // Use native CPU instructions
+            build.flag("-mtune=native");  // Tune for native CPU
+        }
     }
 
     build.warnings(false);
@@ -70,15 +79,23 @@ fn main() {
 
     build.compile("fits_processor");
 
-    // Link math library
+    // Link math library (not needed on Windows - no separate libm)
+    #[cfg(not(target_os = "windows"))]
     println!("cargo:rustc-link-lib=m");
 
-    // Link compression libraries for XISF support
-    println!("cargo:rustc-link-lib=z");      // zlib
-    println!("cargo:rustc-link-lib=lz4");    // LZ4
-    println!("cargo:rustc-link-lib=zstd");   // Zstandard
+    // Link compression libraries only when pkg-config didn't already emit link directives
+    if zlib.is_none() {
+        println!("cargo:rustc-link-lib=z");      // zlib
+    }
+    if lz4.is_none() {
+        println!("cargo:rustc-link-lib=lz4");    // LZ4
+    }
+    if zstd.is_none() {
+        println!("cargo:rustc-link-lib=zstd");   // Zstandard
+    }
 
     // Tell cargo to rerun if C sources change
+    println!("cargo:rerun-if-changed=c_src/compat.h");
     println!("cargo:rerun-if-changed=c_src/fits_processor.c");
     println!("cargo:rerun-if-changed=c_src/fits_processor.h");
     println!("cargo:rerun-if-changed=c_src/fits_reader.c");

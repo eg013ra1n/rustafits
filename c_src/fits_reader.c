@@ -1,4 +1,5 @@
 #include "fits_reader.h"
+#include "compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,7 +7,7 @@
 #include <math.h>
 
 // Thread-local error buffer (shared with fits_processor.c)
-extern __thread char error_buffer[512];
+extern THREAD_LOCAL char error_buffer[512];
 
 static void set_fits_error(const char* msg) {
     snprintf(error_buffer, sizeof(error_buffer), "%s", msg);
@@ -14,25 +15,25 @@ static void set_fits_error(const char* msg) {
 
 // FITS uses big-endian byte order - use compiler builtins for single-instruction swaps
 static inline uint16_t swap16(uint16_t val) {
-    return __builtin_bswap16(val);
+    return BSWAP16(val);
 }
 
 static inline int16_t swap16s(int16_t val) {
-    return (int16_t)__builtin_bswap16((uint16_t)val);
+    return (int16_t)BSWAP16((uint16_t)val);
 }
 
 static inline uint32_t swap32(uint32_t val) {
-    return __builtin_bswap32(val);
+    return BSWAP32(val);
 }
 
 static inline uint64_t swap64(uint64_t val) {
-    return __builtin_bswap64(val);
+    return BSWAP64(val);
 }
 
 static inline float swap_float(float val) {
     uint32_t tmp;
     memcpy(&tmp, &val, 4);
-    tmp = __builtin_bswap32(tmp);
+    tmp = BSWAP32(tmp);
     float result;
     memcpy(&result, &tmp, 4);
     return result;
@@ -42,7 +43,7 @@ int is_fits_file(const char* path) {
     // Check extension
     const char* ext = strrchr(path, '.');
     if (ext) {
-        if (strcasecmp(ext, ".fits") == 0 || strcasecmp(ext, ".fit") == 0) {
+        if (STRCASECMP(ext, ".fits") == 0 || STRCASECMP(ext, ".fit") == 0) {
             return 1;
         }
     }

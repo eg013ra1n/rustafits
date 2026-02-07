@@ -1,6 +1,7 @@
 #include "fits_processor.h"
 #include "xisf_reader.h"
 #include "fits_reader.h"
+#include "compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,7 @@
 #endif
 
 // Thread-local error buffer (also used by xisf_reader.c)
-__thread char error_buffer[512] = {0};
+THREAD_LOCAL char error_buffer[512] = {0};
 
 const char* get_last_error(void) {
     return error_buffer;

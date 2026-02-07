@@ -1,4 +1,5 @@
 #include "xisf_reader.h"
+#include "compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,7 @@
 #endif
 
 // Thread-local error buffer (shared with fits_processor.c via extern)
-extern __thread char error_buffer[512];
+extern THREAD_LOCAL char error_buffer[512];
 
 static void set_xisf_error(const char* msg) {
     snprintf(error_buffer, sizeof(error_buffer), "%s", msg);
@@ -29,7 +30,7 @@ static const char XISF_SIGNATURE[8] = {'X', 'I', 'S', 'F', '0', '1', '0', '0'};
 int is_xisf_file(const char* path) {
     // Check extension first
     const char* ext = strrchr(path, '.');
-    if (ext && strcasecmp(ext, ".xisf") == 0) {
+    if (ext && STRCASECMP(ext, ".xisf") == 0) {
         return 1;
     }
 
@@ -110,11 +111,11 @@ static int parse_geometry(const char* geom, size_t* width, size_t* height, size_
 
 // Parse sample format string
 static XisfSampleFormat parse_sample_format(const char* fmt) {
-    if (strcasecmp(fmt, "UInt8") == 0) return XISF_SAMPLE_UINT8;
-    if (strcasecmp(fmt, "UInt16") == 0) return XISF_SAMPLE_UINT16;
-    if (strcasecmp(fmt, "UInt32") == 0) return XISF_SAMPLE_UINT32;
-    if (strcasecmp(fmt, "Float32") == 0) return XISF_SAMPLE_FLOAT32;
-    if (strcasecmp(fmt, "Float64") == 0) return XISF_SAMPLE_FLOAT64;
+    if (STRCASECMP(fmt, "UInt8") == 0) return XISF_SAMPLE_UINT8;
+    if (STRCASECMP(fmt, "UInt16") == 0) return XISF_SAMPLE_UINT16;
+    if (STRCASECMP(fmt, "UInt32") == 0) return XISF_SAMPLE_UINT32;
+    if (STRCASECMP(fmt, "Float32") == 0) return XISF_SAMPLE_FLOAT32;
+    if (STRCASECMP(fmt, "Float64") == 0) return XISF_SAMPLE_FLOAT64;
     return XISF_SAMPLE_FLOAT32;  // Default
 }
 
@@ -165,13 +166,13 @@ static int parse_compression(const char* comp, XisfImageInfo* info) {
     }
 
     // Parse codec
-    if (strcasecmp(buf, "zlib") == 0) {
+    if (STRCASECMP(buf, "zlib") == 0) {
         info->compression = XISF_COMPRESS_ZLIB;
-    } else if (strcasecmp(buf, "lz4") == 0) {
+    } else if (STRCASECMP(buf, "lz4") == 0) {
         info->compression = XISF_COMPRESS_LZ4;
-    } else if (strcasecmp(buf, "lz4hc") == 0 || strcasecmp(buf, "lz4+hc") == 0) {
+    } else if (STRCASECMP(buf, "lz4hc") == 0 || STRCASECMP(buf, "lz4+hc") == 0) {
         info->compression = XISF_COMPRESS_LZ4HC;
-    } else if (strcasecmp(buf, "zstd") == 0) {
+    } else if (STRCASECMP(buf, "zstd") == 0) {
         info->compression = XISF_COMPRESS_ZSTD;
     } else {
         return -1;  // Unknown codec
@@ -243,7 +244,7 @@ static int parse_xisf_xml(const char* xml, size_t xml_len, XisfImageInfo* info) 
     // Parse pixelStorage (normal or planar)
     char storage[32] = "planar";  // PixInsight default is planar
     get_xml_attr_str(img_elem, "pixelStorage", storage, sizeof(storage));
-    info->is_planar = (strcasecmp(storage, "planar") == 0) ? 1 : 0;
+    info->is_planar = (STRCASECMP(storage, "planar") == 0) ? 1 : 0;
 
     // Parse location (required)
     char location[256];
