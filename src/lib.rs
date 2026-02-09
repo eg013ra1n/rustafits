@@ -1,3 +1,8 @@
-// Re-export the C-based implementation
-mod lib_c;
-pub use lib_c::FitsConverter;
+mod converter;
+mod formats;
+mod output;
+mod pipeline;
+mod processing;
+mod types;
+
+pub use converter::FitsConverter;

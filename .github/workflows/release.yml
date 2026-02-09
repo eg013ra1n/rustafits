@@ -37,11 +37,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y liblz4-dev libzstd-dev zlib1g-dev pkg-config
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -87,12 +82,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y debhelper devscripts liblz4-dev libzstd-dev zlib1g-dev pkg-config
-
-      - name: Build with cargo (debian uses system cargo)
+      - name: Build with cargo
         run: |
           cargo build --release
 
@@ -109,10 +99,9 @@ jobs:
           Priority: optional
           Architecture: amd64
           Maintainer: Vilen Sharifov <vilen.sharifov@gmail.com>
-          Depends: liblz4-1, libzstd1, zlib1g
           Description: High-performance FITS/XISF to JPEG converter
            FITS/XISF to JPEG converter for astronomical images with QuickFits/PixInsight-
-           compatible auto-stretch and Bayer debayering.
+           compatible auto-stretch and Bayer debayering. Pure Rust, no C dependencies.
           EOF
 
           dpkg-deb --build debian-pkg
@@ -133,11 +122,6 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y liblz4-dev libzstd-dev zlib1g-dev pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
