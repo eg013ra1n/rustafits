@@ -6,3 +6,4 @@ mod processing;
 mod types;
 
 pub use converter::FitsConverter;
+pub use types::ProcessedImage;

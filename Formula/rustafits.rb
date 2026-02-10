@@ -3,7 +3,7 @@ class Rustafits < Formula
   homepage "https://github.com/eg013ra1n/rustafits"
   url "https://github.com/eg013ra1n/rustafits/archive/v0.3.0.tar.gz"
   sha256 "CHECKSUM_HERE"
-  license "GPL-3.0"
+  license "Apache-2.0"
 
   depends_on "rust" => :build
 

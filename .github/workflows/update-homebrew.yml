@@ -35,7 +35,7 @@ jobs:
             homepage "https://github.com/${{ github.repository }}"
             url "https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz"
             sha256 "${{ env.sha256 }}"
-            license "GPL-3.0"
+            license "Apache-2.0"
 
             depends_on "rust" => :build
             depends_on "pkg-config" => :build

@@ -104,7 +104,7 @@ pub fn compute_stretch_params(data: &[f32], max_input: f32) -> StretchParams {
         (norm_median - (-2.8 * norm_madn)).clamp(0.0, 1.0)
     };
 
-    // Midtones via QuickFits formula
+    // Midtones Transfer Function (PixInsight STF)
     let b = 0.25f32;
     let (x, m) = if !upper_half {
         (norm_median - shadows, b)

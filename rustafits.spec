@@ -3,7 +3,7 @@ Version:        0.3.0
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
-License:        GPLv3
+License:        Apache-2.0
 URL:            https://github.com/eg013ra1n/rustafits
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 

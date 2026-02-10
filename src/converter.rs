@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::output;
 use crate::pipeline;
-use crate::types::ProcessConfig;
+use crate::types::{ProcessConfig, ProcessedImage};
 
 pub struct FitsConverter {
     downscale: usize,
@@ -43,14 +43,11 @@ impl FitsConverter {
         self
     }
 
-    pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
-        &self,
-        input_path: P,
-        output_path: Q,
-    ) -> Result<()> {
-        let input = input_path.as_ref();
-        let output = output_path.as_ref();
-
+    /// Process a FITS/XISF image and return raw pixel data without writing to disk.
+    ///
+    /// Returns a `ProcessedImage` containing interleaved RGB u8 bytes,
+    /// suitable for display in a GUI, web backend, or further processing.
+    pub fn process<P: AsRef<Path>>(&self, input_path: P) -> Result<ProcessedImage> {
         let config = ProcessConfig {
             downscale_factor: self.downscale,
             jpeg_quality: self.quality,
@@ -59,10 +56,19 @@ impl FitsConverter {
             auto_stretch: true,
         };
 
-        let image = pipeline::process_image(input, &config)
-            .context("Image processing failed")?;
+        pipeline::process_image(input_path.as_ref(), &config)
+            .context("Image processing failed")
+    }
 
-        output::save_image(&image, output, self.quality)
+    /// Process a FITS/XISF image and save the result as JPEG or PNG.
+    pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
+        &self,
+        input_path: P,
+        output_path: Q,
+    ) -> Result<()> {
+        let image = self.process(&input_path)?;
+
+        output::save_image(&image, output_path.as_ref(), self.quality)
             .context("Image save failed")?;
 
         Ok(())
