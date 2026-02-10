@@ -4,9 +4,7 @@ Since GitHub Actions charges for macOS runners, macOS binaries need to be built 
 
 ## Prerequisites
 
-```bash
-brew install cfitsio
-```
+Rust toolchain only — no system dependencies needed (pure Rust).
 
 ## Build for Your Architecture
 

@@ -5,9 +5,9 @@ pkgrel=1
 pkgdesc="High-performance FITS to JPEG converter with auto-stretch and Bayer debayering"
 arch=('x86_64' 'aarch64')
 url="https://github.com/eg013ra1n/rustafits"
-license=('GPL3')
-depends=('cfitsio')
-makedepends=('rust' 'cargo' 'pkg-config')
+license=('Apache-2.0')
+depends=()
+makedepends=('rust' 'cargo')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/eg013ra1n/$pkgname/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')  # Update with actual checksum after first release
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use fits_converter::FitsConverter;
+use astroimage::ImageConverter;
 use std::env;
 use std::process;
 
@@ -108,7 +108,7 @@ fn run() -> Result<()> {
     }
 
     // Build converter with options
-    let mut converter = FitsConverter::new()
+    let mut converter = ImageConverter::new()
         .with_downscale(downscale)
         .with_quality(quality);
 
