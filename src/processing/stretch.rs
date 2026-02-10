@@ -143,17 +143,33 @@ pub fn apply_stretch(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        apply_stretch_sse2(
-            channel_data,
-            output,
-            output_offset,
-            stride,
-            native_shadows,
-            native_highlights,
-            k1,
-            k2,
-            midtones,
-        );
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                apply_stretch_avx2(
+                    channel_data,
+                    output,
+                    output_offset,
+                    stride,
+                    native_shadows,
+                    native_highlights,
+                    k1,
+                    k2,
+                    midtones,
+                );
+            }
+        } else {
+            apply_stretch_sse2(
+                channel_data,
+                output,
+                output_offset,
+                stride,
+                native_shadows,
+                native_highlights,
+                k1,
+                k2,
+                midtones,
+            );
+        }
         return;
     }
 
@@ -216,6 +232,80 @@ fn apply_stretch_scalar(
     for (i, &input) in channel_data.iter().enumerate() {
         output[output_offset + i * stride] =
             stretch_pixel(input, native_shadows, native_highlights, k1, k2, midtones);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_stretch_avx2(
+    channel_data: &[f32],
+    output: &mut [u8],
+    output_offset: usize,
+    stride: usize,
+    native_shadows: f32,
+    native_highlights: f32,
+    k1: f32,
+    k2: f32,
+    midtones: f32,
+) {
+    use std::arch::x86_64::*;
+
+    let count = channel_data.len();
+    let mut i = 0;
+
+    let v_shadows = _mm256_set1_ps(native_shadows);
+    let v_highlights = _mm256_set1_ps(native_highlights);
+    let v_k1 = _mm256_set1_ps(k1);
+    let v_k2 = _mm256_set1_ps(k2);
+    let v_midtones = _mm256_set1_ps(midtones);
+    let v_zero = _mm256_setzero_ps();
+    let v_255 = _mm256_set1_ps(255.0);
+
+    while i + 8 <= count {
+        let input = _mm256_loadu_ps(channel_data.as_ptr().add(i));
+
+        // Masks: CMP returns all-ones or all-zeros per lane
+        let mask_low = _mm256_cmp_ps(input, v_shadows, _CMP_LT_OS);
+        let mask_high = _mm256_cmp_ps(input, v_highlights, _CMP_GE_OS);
+
+        // Midtones transfer
+        let input_floored = _mm256_sub_ps(input, v_shadows);
+        let numerator = _mm256_mul_ps(input_floored, v_k1);
+        let denominator = _mm256_sub_ps(_mm256_mul_ps(input_floored, v_k2), v_midtones);
+        let output_val = _mm256_div_ps(numerator, denominator);
+
+        // Blend: 0 if < shadows, 255 if >= highlights, computed otherwise
+        let result = _mm256_blendv_ps(output_val, v_zero, mask_low);
+        let result = _mm256_blendv_ps(result, v_255, mask_high);
+
+        // Clamp to [0, 255]
+        let clamped = _mm256_min_ps(_mm256_max_ps(result, v_zero), v_255);
+
+        // Convert f32 → i32 → pack to u8
+        let output_int = _mm256_cvtps_epi32(clamped);
+        // Pack 8x i32 → 8x i16 (with saturation)
+        // _mm256_packs_epi32 packs within 128-bit lanes: [0..3,4..7] → [0..3 as i16, 4..7 as i16] per lane
+        let packed16 = _mm256_packs_epi32(output_int, output_int);
+        // Pack 8x i16 → 8x u8 (with saturation)
+        let packed8 = _mm256_packus_epi16(packed16, packed16);
+
+        // Extract the 8 bytes: they're at bytes [0..3] and [16..19] due to lane interleaving
+        // Use permute to bring lane1 data adjacent to lane0
+        let shuffled = _mm256_permute4x64_epi64(packed8, 0b11_01_10_00);
+        let lo128 = _mm256_castsi256_si128(shuffled);
+        let packed = _mm_cvtsi128_si64(lo128) as u64;
+
+        for j in 0..8 {
+            output[output_offset + (i + j) * stride] = ((packed >> (j * 8)) & 0xFF) as u8;
+        }
+
+        i += 8;
+    }
+
+    // Scalar remainder
+    for idx in i..count {
+        output[output_offset + idx * stride] =
+            stretch_pixel(channel_data[idx], native_shadows, native_highlights, k1, k2, midtones);
     }
 }
 
