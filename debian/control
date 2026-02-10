@@ -14,7 +14,7 @@ Package: rustafits
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: High-performance FITS to JPEG converter
- FITS to JPEG converter for astronomical images with QuickFits/PixInsight-
+ FITS/XISF to JPEG converter for astronomical images with PixInsight STF-
  compatible auto-stretch and Bayer debayering.
  .
  Features:

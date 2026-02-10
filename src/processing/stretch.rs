@@ -4,6 +4,18 @@ fn quickselect(arr: &mut [f32], k: usize) -> f32 {
     let mut right = arr.len() - 1;
 
     while left < right {
+        // For tiny partitions, insertion sort and return
+        if right - left < 3 {
+            for i in (left + 1)..=right {
+                let mut j = i;
+                while j > left && arr[j - 1] > arr[j] {
+                    arr.swap(j - 1, j);
+                    j -= 1;
+                }
+            }
+            return arr[k];
+        }
+
         let mid = left + (right - left) / 2;
 
         // Median-of-three pivot

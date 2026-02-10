@@ -1,7 +1,7 @@
 class Rustafits < Formula
   desc "High-performance FITS to JPEG converter with auto-stretch"
   homepage "https://github.com/eg013ra1n/rustafits"
-  url "https://github.com/eg013ra1n/rustafits/archive/v0.3.0.tar.gz"
+  url "https://github.com/eg013ra1n/rustafits/archive/v0.4.0.tar.gz"
   sha256 "CHECKSUM_HERE"
   license "Apache-2.0"
 

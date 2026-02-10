@@ -127,24 +127,38 @@ pub fn vertical_flip_rgb(data: &mut [u8], width: usize, height: usize) {
     }
 }
 
-/// Convert u16 slice to f32.
+/// Convert u16 slice to f32 (parallel with SIMD dispatch per chunk).
 pub fn u16_to_f32(data: &[u16]) -> Vec<f32> {
+    use rayon::prelude::*;
+
     let mut output = vec![0f32; data.len()];
 
+    const CHUNK: usize = 65536;
+    data.par_chunks(CHUNK)
+        .zip(output.par_chunks_mut(CHUNK))
+        .for_each(|(src, dst)| {
+            u16_to_f32_chunk(src, dst);
+        });
+
+    output
+}
+
+/// SIMD-dispatched u16→f32 conversion for a chunk.
+fn u16_to_f32_chunk(data: &[u16], output: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe { u16_to_f32_avx2(data, &mut output) };
+            unsafe { u16_to_f32_avx2(data, output) };
         } else {
-            u16_to_f32_sse2(data, &mut output);
+            u16_to_f32_sse2(data, output);
         }
-        return output;
+        return;
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        u16_to_f32_neon(data, &mut output);
-        return output;
+        u16_to_f32_neon(data, output);
+        return;
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -152,7 +166,6 @@ pub fn u16_to_f32(data: &[u16]) -> Vec<f32> {
         for (i, &v) in data.iter().enumerate() {
             output[i] = v as f32;
         }
-        output
     }
 }
 

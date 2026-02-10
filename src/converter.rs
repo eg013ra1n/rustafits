@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -11,6 +12,7 @@ pub struct ImageConverter {
     quality: u8,
     apply_debayer: bool,
     preview_mode: bool,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl ImageConverter {
@@ -20,6 +22,7 @@ impl ImageConverter {
             quality: 95,
             apply_debayer: true,
             preview_mode: false,
+            thread_pool: None,
         }
     }
 
@@ -43,6 +46,11 @@ impl ImageConverter {
         self
     }
 
+    pub fn with_thread_pool(mut self, pool: Arc<rayon::ThreadPool>) -> Self {
+        self.thread_pool = Some(pool);
+        self
+    }
+
     /// Process a FITS/XISF image and return raw pixel data without writing to disk.
     ///
     /// Returns a `ProcessedImage` containing interleaved RGB u8 bytes,
@@ -56,8 +64,12 @@ impl ImageConverter {
             auto_stretch: true,
         };
 
-        pipeline::process_image(input_path.as_ref(), &config)
-            .context("Image processing failed")
+        let path = input_path.as_ref();
+        match &self.thread_pool {
+            Some(pool) => pool.install(|| pipeline::process_image(path, &config)),
+            None => pipeline::process_image(path, &config),
+        }
+        .context("Image processing failed")
     }
 
     /// Process a FITS/XISF image and save the result as JPEG or PNG.

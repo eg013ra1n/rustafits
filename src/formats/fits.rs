@@ -3,6 +3,7 @@ use std::fs::File;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 
 use crate::types::{BayerPattern, DataType, ImageMetadata, PixelData};
 
@@ -153,26 +154,53 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
         .read_exact(&mut raw_data)
         .context("Failed to read FITS data")?;
 
+    const CHUNK: usize = 65536;
+    const PAR_THRESHOLD: usize = CHUNK * 2;
+
     let (dtype, pixels) = match hdr.bitpix {
         16 => {
             let mut u16_data = vec![0u16; num_pixels];
             let src = &raw_data;
+            let use_par = num_pixels >= PAR_THRESHOLD;
 
             if hdr.bzero == 32768.0 && hdr.bscale == 1.0 {
                 // Fast path: signed→unsigned via XOR 0x8000
-                for i in 0..num_pixels {
-                    let raw = u16::from_be_bytes([src[i * 2], src[i * 2 + 1]]);
-                    u16_data[i] = raw ^ 0x8000;
+                let convert = |s: &[u8], d: &mut [u16]| {
+                    for i in 0..d.len() {
+                        let raw = u16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+                        d[i] = raw ^ 0x8000;
+                    }
+                };
+                if use_par {
+                    src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                } else {
+                    convert(src, &mut u16_data);
                 }
             } else if hdr.bzero == 0.0 && hdr.bscale == 1.0 {
-                for i in 0..num_pixels {
-                    u16_data[i] = u16::from_be_bytes([src[i * 2], src[i * 2 + 1]]);
+                let convert = |s: &[u8], d: &mut [u16]| {
+                    for i in 0..d.len() {
+                        d[i] = u16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+                    }
+                };
+                if use_par {
+                    src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                } else {
+                    convert(src, &mut u16_data);
                 }
             } else {
-                for i in 0..num_pixels {
-                    let val = i16::from_be_bytes([src[i * 2], src[i * 2 + 1]]);
-                    let scaled = hdr.bzero + hdr.bscale * val as f64;
-                    u16_data[i] = scaled.clamp(0.0, 65535.0) as u16;
+                let bzero = hdr.bzero;
+                let bscale = hdr.bscale;
+                let convert = |s: &[u8], d: &mut [u16]| {
+                    for i in 0..d.len() {
+                        let val = i16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+                        let scaled = bzero + bscale * val as f64;
+                        d[i] = scaled.clamp(0.0, 65535.0) as u16;
+                    }
+                };
+                if use_par {
+                    src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                } else {
+                    convert(src, &mut u16_data);
                 }
             }
 
@@ -181,20 +209,39 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
         -32 => {
             let mut f32_data = vec![0f32; num_pixels];
             let src = &raw_data;
-            for i in 0..num_pixels {
-                let off = i * 4;
-                let val =
-                    f32::from_be_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
-                f32_data[i] = (hdr.bzero + hdr.bscale * val as f64) as f32;
+            let bzero = hdr.bzero;
+            let bscale = hdr.bscale;
+
+            let convert = |s: &[u8], d: &mut [f32]| {
+                for i in 0..d.len() {
+                    let off = i * 4;
+                    let val = f32::from_be_bytes([s[off], s[off + 1], s[off + 2], s[off + 3]]);
+                    d[i] = (bzero + bscale * val as f64) as f32;
+                }
+            };
+            if num_pixels >= PAR_THRESHOLD {
+                src.par_chunks(CHUNK * 4).zip(f32_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+            } else {
+                convert(src, &mut f32_data);
             }
 
             (DataType::Float32, PixelData::Float32(f32_data))
         }
         8 => {
             let mut u16_data = vec![0u16; num_pixels];
-            for i in 0..num_pixels {
-                let scaled = hdr.bzero + hdr.bscale * raw_data[i] as f64;
-                u16_data[i] = (scaled * 256.0) as u16;
+            let bzero = hdr.bzero;
+            let bscale = hdr.bscale;
+
+            let convert = |s: &[u8], d: &mut [u16]| {
+                for i in 0..d.len() {
+                    let scaled = bzero + bscale * s[i] as f64;
+                    d[i] = (scaled * 256.0) as u16;
+                }
+            };
+            if num_pixels >= PAR_THRESHOLD {
+                raw_data.par_chunks(CHUNK).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+            } else {
+                convert(&raw_data, &mut u16_data);
             }
 
             (DataType::Uint16, PixelData::Uint16(u16_data))
@@ -202,11 +249,20 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
         32 => {
             let mut f32_data = vec![0f32; num_pixels];
             let src = &raw_data;
-            for i in 0..num_pixels {
-                let off = i * 4;
-                let val =
-                    i32::from_be_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
-                f32_data[i] = (hdr.bzero + hdr.bscale * val as f64) as f32;
+            let bzero = hdr.bzero;
+            let bscale = hdr.bscale;
+
+            let convert = |s: &[u8], d: &mut [f32]| {
+                for i in 0..d.len() {
+                    let off = i * 4;
+                    let val = i32::from_be_bytes([s[off], s[off + 1], s[off + 2], s[off + 3]]);
+                    d[i] = (bzero + bscale * val as f64) as f32;
+                }
+            };
+            if num_pixels >= PAR_THRESHOLD {
+                src.par_chunks(CHUNK * 4).zip(f32_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+            } else {
+                convert(src, &mut f32_data);
             }
 
             (DataType::Float32, PixelData::Float32(f32_data))
@@ -214,19 +270,23 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
         -64 => {
             let mut f32_data = vec![0f32; num_pixels];
             let src = &raw_data;
-            for i in 0..num_pixels {
-                let off = i * 8;
-                let val = f64::from_be_bytes([
-                    src[off],
-                    src[off + 1],
-                    src[off + 2],
-                    src[off + 3],
-                    src[off + 4],
-                    src[off + 5],
-                    src[off + 6],
-                    src[off + 7],
-                ]);
-                f32_data[i] = (hdr.bzero + hdr.bscale * val) as f32;
+            let bzero = hdr.bzero;
+            let bscale = hdr.bscale;
+
+            let convert = |s: &[u8], d: &mut [f32]| {
+                for i in 0..d.len() {
+                    let off = i * 8;
+                    let val = f64::from_be_bytes([
+                        s[off], s[off + 1], s[off + 2], s[off + 3],
+                        s[off + 4], s[off + 5], s[off + 6], s[off + 7],
+                    ]);
+                    d[i] = (bzero + bscale * val) as f32;
+                }
+            };
+            if num_pixels >= PAR_THRESHOLD {
+                src.par_chunks(CHUNK * 8).zip(f32_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+            } else {
+                convert(src, &mut f32_data);
             }
 
             (DataType::Float32, PixelData::Float32(f32_data))

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use rayon::prelude::*;
 
 use crate::formats;
 use crate::processing::{binning, color, debayer, downscale, stretch};
@@ -116,6 +117,21 @@ fn process_f32(
     apply_stretch_and_finalize(float_data, width, height, is_color, num_channels, &meta, config)
 }
 
+fn compute_stretch_coefficients(channel_data: &[f32]) -> (f32, f32, f32, f32, f32) {
+    let max_input = 65536.0f32;
+    let params = stretch::compute_stretch_params(channel_data, max_input);
+    let hs_range_factor = if params.highlights == params.shadows {
+        1.0
+    } else {
+        1.0 / (params.highlights - params.shadows)
+    };
+    let native_shadows = params.shadows * max_input;
+    let native_highlights = params.highlights * max_input;
+    let k1 = (params.midtones - 1.0) * hs_range_factor * 255.0 / max_input;
+    let k2 = (2.0 * params.midtones - 1.0) * hs_range_factor / max_input;
+    (native_shadows, native_highlights, k1, k2, params.midtones)
+}
+
 fn apply_stretch_and_finalize(
     float_data: Vec<f32>,
     width: usize,
@@ -129,51 +145,40 @@ fn apply_stretch_and_finalize(
     let mut rgb_data = vec![0u8; width * height * 3];
 
     if config.auto_stretch {
-        for c in 0..num_channels {
-            let channel_data = &float_data[c * channel_size..(c + 1) * channel_size];
+        if is_color {
+            // Compute stretch params for each channel in parallel (includes quickselect)
+            let coeffs: Vec<_> = (0..num_channels)
+                .into_par_iter()
+                .map(|c| {
+                    let ch = &float_data[c * channel_size..(c + 1) * channel_size];
+                    compute_stretch_coefficients(ch)
+                })
+                .collect();
 
-            let max_input = 65536.0f32;
-            let params = stretch::compute_stretch_params(channel_data, max_input);
-
-            let hs_range_factor = if params.highlights == params.shadows {
-                1.0
-            } else {
-                1.0 / (params.highlights - params.shadows)
-            };
-            let native_shadows = params.shadows * max_input;
-            let native_highlights = params.highlights * max_input;
-            let k1 = (params.midtones - 1.0) * hs_range_factor * 255.0 / max_input;
-            let k2 = (2.0 * params.midtones - 1.0) * hs_range_factor / max_input;
-
-            if is_color {
-                // Write channel c into interleaved RGB at offset c, stride 3
-                stretch::apply_stretch(
-                    channel_data,
-                    &mut rgb_data,
-                    c,
-                    3,
-                    native_shadows,
-                    native_highlights,
-                    k1,
-                    k2,
-                    params.midtones,
-                );
-            } else {
-                // Grayscale: stretch into temp then replicate
-                let mut temp = vec![0u8; channel_size];
-                stretch::apply_stretch(
-                    channel_data,
-                    &mut temp,
-                    0,
-                    1,
-                    native_shadows,
-                    native_highlights,
-                    k1,
-                    k2,
-                    params.midtones,
-                );
-                rgb_data = color::replicate_gray_to_rgb(&temp);
+            // Apply stretch with stride=3 directly into rgb_data (no intermediate buffers)
+            for c in 0..num_channels {
+                let ch = &float_data[c * channel_size..(c + 1) * channel_size];
+                let (ns, nh, k1, k2, m) = coeffs[c];
+                stretch::apply_stretch(ch, &mut rgb_data, c, 3, ns, nh, k1, k2, m);
             }
+        } else {
+            let channel_data = &float_data[0..channel_size];
+            let (native_shadows, native_highlights, k1, k2, midtones) =
+                compute_stretch_coefficients(channel_data);
+
+            let mut temp = vec![0u8; channel_size];
+            stretch::apply_stretch(
+                channel_data,
+                &mut temp,
+                0,
+                1,
+                native_shadows,
+                native_highlights,
+                k1,
+                k2,
+                midtones,
+            );
+            rgb_data = color::replicate_gray_to_rgb(&temp);
         }
     }
 

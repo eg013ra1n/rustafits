@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use rayon::prelude::*;
 
 use crate::types::{BayerPattern, DataType, ImageMetadata, PixelData};
 
@@ -281,62 +282,71 @@ fn decompress_block(compressed: &[u8], uncompressed_size: usize, codec: XisfComp
     }
 }
 
-fn convert_to_float32(raw_data: &[u8], info: &XisfImageInfo) -> Vec<f32> {
-    let num_samples = info.width * info.height * info.channels;
-    let mut float_data = vec![0f32; num_samples];
-
-    match info.sample_format {
+fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat) {
+    match format {
         XisfSampleFormat::Uint8 => {
-            for i in 0..num_samples {
-                float_data[i] = raw_data[i] as f32 * 256.0;
+            for i in 0..dst.len() {
+                dst[i] = src[i] as f32 * 256.0;
             }
         }
         XisfSampleFormat::Uint16 => {
-            for i in 0..num_samples {
-                let val = u16::from_le_bytes([raw_data[i * 2], raw_data[i * 2 + 1]]);
-                float_data[i] = val as f32;
+            for i in 0..dst.len() {
+                let val = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
+                dst[i] = val as f32;
             }
         }
         XisfSampleFormat::Uint32 => {
-            for i in 0..num_samples {
+            for i in 0..dst.len() {
                 let off = i * 4;
                 let val = u32::from_le_bytes([
-                    raw_data[off],
-                    raw_data[off + 1],
-                    raw_data[off + 2],
-                    raw_data[off + 3],
+                    src[off], src[off + 1], src[off + 2], src[off + 3],
                 ]);
-                float_data[i] = (val >> 16) as f32;
+                dst[i] = (val >> 16) as f32;
             }
         }
         XisfSampleFormat::Float32 => {
-            for i in 0..num_samples {
+            for i in 0..dst.len() {
                 let off = i * 4;
                 let val = f32::from_le_bytes([
-                    raw_data[off],
-                    raw_data[off + 1],
-                    raw_data[off + 2],
-                    raw_data[off + 3],
+                    src[off], src[off + 1], src[off + 2], src[off + 3],
                 ]);
-                float_data[i] = val * 65535.0;
+                dst[i] = val * 65535.0;
             }
         }
         XisfSampleFormat::Float64 => {
-            for i in 0..num_samples {
+            for i in 0..dst.len() {
                 let off = i * 8;
                 let val = f64::from_le_bytes([
-                    raw_data[off],
-                    raw_data[off + 1],
-                    raw_data[off + 2],
-                    raw_data[off + 3],
-                    raw_data[off + 4],
-                    raw_data[off + 5],
-                    raw_data[off + 6],
-                    raw_data[off + 7],
+                    src[off], src[off + 1], src[off + 2], src[off + 3],
+                    src[off + 4], src[off + 5], src[off + 6], src[off + 7],
                 ]);
-                float_data[i] = (val * 65535.0) as f32;
+                dst[i] = (val * 65535.0) as f32;
             }
         }
+    }
+}
+
+fn convert_to_float32(raw_data: &[u8], info: &XisfImageInfo) -> Vec<f32> {
+    let num_samples = info.width * info.height * info.channels;
+    let mut float_data = vec![0f32; num_samples];
+    let bytes_per_sample = match info.sample_format {
+        XisfSampleFormat::Uint8 => 1,
+        XisfSampleFormat::Uint16 => 2,
+        XisfSampleFormat::Uint32 | XisfSampleFormat::Float32 => 4,
+        XisfSampleFormat::Float64 => 8,
+    };
+    let format = info.sample_format;
+    const CHUNK: usize = 65536;
+    const PAR_THRESHOLD: usize = CHUNK * 2;
+
+    if num_samples >= PAR_THRESHOLD {
+        raw_data.par_chunks(CHUNK * bytes_per_sample)
+            .zip(float_data.par_chunks_mut(CHUNK))
+            .for_each(|(src, dst)| {
+                convert_chunk(src, dst, format);
+            });
+    } else {
+        convert_chunk(raw_data, &mut float_data, format);
     }
 
     float_data
@@ -349,11 +359,33 @@ fn convert_normal_to_planar(data: &mut Vec<f32>, width: usize, height: usize, ch
 
     let plane_size = width * height;
     let mut temp = vec![0f32; plane_size * 3];
+    let (r_plane, rest) = temp.split_at_mut(plane_size);
+    let (g_plane, b_plane) = rest.split_at_mut(plane_size);
 
-    for i in 0..plane_size {
-        temp[i] = data[i * 3];                     // R
-        temp[i + plane_size] = data[i * 3 + 1];    // G
-        temp[i + plane_size * 2] = data[i * 3 + 2]; // B
+    const PAR_ROW_THRESHOLD: usize = 128;
+
+    if height >= PAR_ROW_THRESHOLD {
+        r_plane.par_chunks_mut(width)
+            .zip(g_plane.par_chunks_mut(width))
+            .zip(b_plane.par_chunks_mut(width))
+            .enumerate()
+            .for_each(|(row, ((r_row, g_row), b_row))| {
+                let base = row * width * 3;
+                for x in 0..r_row.len() {
+                    r_row[x] = data[base + x * 3];
+                    g_row[x] = data[base + x * 3 + 1];
+                    b_row[x] = data[base + x * 3 + 2];
+                }
+            });
+    } else {
+        for row in 0..height {
+            let base = row * width * 3;
+            for x in 0..width {
+                r_plane[row * width + x] = data[base + x * 3];
+                g_plane[row * width + x] = data[base + x * 3 + 1];
+                b_plane[row * width + x] = data[base + x * 3 + 2];
+            }
+        }
     }
 
     *data = temp;

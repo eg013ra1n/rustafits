@@ -5,7 +5,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 ## Features
 
 - **FITS & XISF Support**: Native readers for both formats (no external libraries)
-- **Auto-Stretch**: Median-based statistical stretching (QuickFits/PixInsight compatible)
+- **Auto-Stretch**: Median-based statistical stretching (PixInsight STF compatible)
 - **Bayer Debayering**: Super-pixel 2x2 block averaging (RGGB, BGGR, GBRG, GRBG)
 - **Preview Mode**: 2x2 binning for fast previews
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
@@ -72,7 +72,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustafits = "0.3"
+rustafits = "0.4"
 ```
 
 ### File output
@@ -111,6 +111,51 @@ let image: ProcessedImage = ImageConverter::new()
 | `with_quality(q)` | JPEG quality 1-100 |
 | `without_debayer()` | Skip Bayer debayering |
 | `with_preview_mode()` | 2x2 binning for fast previews |
+| `with_thread_pool(pool)` | Use a custom rayon thread pool (see below) |
+
+### Multi-image concurrent processing
+
+By default, all parallel work (debayering, stretch, binning, byte conversion) runs on rayon's global thread pool. This works well for single-image processing, but when processing multiple images concurrently from separate threads, they all compete for the same pool — causing thread oversubscription and degraded throughput.
+
+Use `with_thread_pool()` to route all parallel work to a dedicated or shared pool:
+
+```rust
+use std::sync::Arc;
+use astroimage::{ImageConverter, ThreadPoolBuilder};
+
+// Create a shared pool once at startup
+let pool = Arc::new(
+    ThreadPoolBuilder::new()
+        .num_threads(num_cpus::get())
+        .build()
+        .unwrap()
+);
+
+// Process multiple images concurrently
+let handles: Vec<_> = paths.iter().map(|path| {
+    let pool = Arc::clone(&pool);
+    let path = path.clone();
+    std::thread::spawn(move || {
+        ImageConverter::new()
+            .with_thread_pool(pool)
+            .process(&path)
+    })
+}).collect();
+
+let results: Vec<_> = handles.into_iter()
+    .map(|h| h.join().unwrap())
+    .collect();
+```
+
+**Recommendations by concurrency level:**
+
+| Concurrent images | Strategy |
+|-------------------|----------|
+| 1-3 | Default global pool is fine |
+| 4-8 | Shared pool via `with_thread_pool()` with `num_cpus` threads |
+| 8+ | Shared pool + limit concurrency with a semaphore or channel |
+
+**Memory budget:** Each full-resolution image (e.g. 4096x3072 16-bit) uses ~150 MB peak. For 10 concurrent images, budget ~1.5 GB. Use `with_preview_mode()` or `with_downscale()` to reduce memory usage.
 
 ## Performance
 
@@ -168,7 +213,6 @@ rustafits/
 
 ## References
 
-- QuickLook.Plugin.FitsViewer (Siyu Zhang) — Stretch algorithm reference
 - PixInsight — Screen Transfer Function documentation
 - [FITS Standard](https://fits.gsfc.nasa.gov/)
 - [XISF Specification](https://pixinsight.com/xisf/)

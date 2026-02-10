@@ -61,6 +61,9 @@ fn run() -> Result<()> {
                 downscale = args[i + 1]
                     .parse::<usize>()
                     .context("Invalid downscale factor")?;
+                if downscale == 0 {
+                    return Err(anyhow::anyhow!("Downscale factor must be >= 1"));
+                }
                 i += 2;
             }
             "--quality" => {

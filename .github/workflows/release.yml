@@ -100,7 +100,7 @@ jobs:
           Architecture: amd64
           Maintainer: Vilen Sharifov <vilen.sharifov@gmail.com>
           Description: High-performance FITS/XISF to JPEG converter
-           FITS/XISF to JPEG converter for astronomical images with QuickFits/PixInsight-
+           FITS/XISF to JPEG converter for astronomical images with PixInsight STF-
            compatible auto-stretch and Bayer debayering. Pure Rust, no C dependencies.
           EOF
 

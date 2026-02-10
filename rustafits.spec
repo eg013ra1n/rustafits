@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -13,7 +13,7 @@ BuildRequires:  rust
 
 %description
 High-performance FITS/XISF to JPEG converter for astronomical images with
-QuickFits/PixInsight-compatible auto-stretch and Bayer debayering.
+PixInsight STF-compatible auto-stretch and Bayer debayering.
 
 Features:
 - FITS and XISF format support (including compressed XISF)
@@ -43,6 +43,10 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Mon Feb 10 2025 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.4.0-1
+- Add configurable rayon thread pool for multi-image concurrent processing
+- Re-export rayon ThreadPool and ThreadPoolBuilder from library API
+
 * Sun Feb 09 2025 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.3.0-1
 - Rewrite all C code to pure Rust
 - Remove system library dependencies (zlib, lz4, zstd)
@@ -62,6 +66,6 @@ Features:
 * Wed Nov 06 2024 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.1.0-1
 - Initial package
 - High-performance FITS to JPEG converter
-- QuickFits/PixInsight-compatible auto-stretch
+- PixInsight STF-compatible auto-stretch
 - Super-pixel Bayer debayering
 - Multi-platform SIMD optimization (NEON/SSE2)
