@@ -5,5 +5,5 @@ mod pipeline;
 mod processing;
 mod types;
 
-pub use converter::FitsConverter;
+pub use converter::ImageConverter;
 pub use types::ProcessedImage;

@@ -4,9 +4,7 @@ Priority: optional
 Maintainer: Vilen Sharifov <vilen.sharifov@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                cargo,
-               rustc (>= 1.70),
-               libcfitsio-dev,
-               pkg-config
+               rustc (>= 1.70)
 Standards-Version: 4.6.0
 Homepage: https://github.com/eg013ra1n/rustafits
 Vcs-Browser: https://github.com/eg013ra1n/rustafits
@@ -14,7 +12,7 @@ Vcs-Git: https://github.com/eg013ra1n/rustafits.git
 
 Package: rustafits
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libcfitsio9
+Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: High-performance FITS to JPEG converter
  FITS to JPEG converter for astronomical images with QuickFits/PixInsight-
  compatible auto-stretch and Bayer debayering.

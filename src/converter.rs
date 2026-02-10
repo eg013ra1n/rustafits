@@ -6,16 +6,16 @@ use crate::output;
 use crate::pipeline;
 use crate::types::{ProcessConfig, ProcessedImage};
 
-pub struct FitsConverter {
+pub struct ImageConverter {
     downscale: usize,
     quality: u8,
     apply_debayer: bool,
     preview_mode: bool,
 }
 
-impl FitsConverter {
+impl ImageConverter {
     pub fn new() -> Self {
-        FitsConverter {
+        ImageConverter {
             downscale: 1,
             quality: 95,
             apply_debayer: true,
@@ -75,7 +75,7 @@ impl FitsConverter {
     }
 }
 
-impl Default for FitsConverter {
+impl Default for ImageConverter {
     fn default() -> Self {
         Self::new()
     }

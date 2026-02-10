@@ -13,7 +13,7 @@ keywords = ["astronomy", "fits", "image-processing", "converter", "astrophotogra
 categories = ["multimedia::images", "science", "command-line-utilities"]
 
 [lib]
-name = "fits_converter"
+name = "astroimage"
 path = "src/lib.rs"
 
 [[bin]]

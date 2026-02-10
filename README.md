@@ -78,9 +78,9 @@ rustafits = "0.3"
 ### File output
 
 ```rust
-use fits_converter::FitsConverter;
+use astroimage::ImageConverter;
 
-FitsConverter::new()
+ImageConverter::new()
     .with_preview_mode()
     .with_quality(90)
     .convert("input.fits", "output.jpg")?;
@@ -91,9 +91,9 @@ FitsConverter::new()
 Get raw RGB pixel data without writing to disk — useful for GUI viewers, web backends, and Tauri apps:
 
 ```rust
-use fits_converter::{FitsConverter, ProcessedImage};
+use astroimage::{ImageConverter, ProcessedImage};
 
-let image: ProcessedImage = FitsConverter::new()
+let image: ProcessedImage = ImageConverter::new()
     .with_downscale(2)
     .process("input.fits")?;
 
@@ -141,7 +141,7 @@ rustafits/
 ├── src/
 │   ├── lib.rs              # Library entry + public API
 │   ├── types.rs            # Core types (PixelData, ProcessedImage, etc.)
-│   ├── converter.rs        # FitsConverter builder
+│   ├── converter.rs        # ImageConverter builder
 │   ├── pipeline.rs         # Processing pipeline
 │   ├── output.rs           # JPEG/PNG file output
 │   ├── bin/rustafits.rs    # CLI tool
