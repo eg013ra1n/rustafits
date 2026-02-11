@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.4.0
+Version:        0.4.2
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,7 +43,7 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
-* Mon Feb 10 2025 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.4.0-1
+* Mon Feb 10 2025 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.4.2-1
 - Add configurable rayon thread pool for multi-image concurrent processing
 - Re-export rayon ThreadPool and ThreadPoolBuilder from library API
 

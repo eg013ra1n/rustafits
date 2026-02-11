@@ -1,4 +1,4 @@
-rustafits (0.4.0-1) unstable; urgency=medium
+rustafits (0.4.2-1) unstable; urgency=medium
 
   * Add configurable rayon thread pool for multi-image concurrent processing
   * Re-export rayon ThreadPool and ThreadPoolBuilder from library API
