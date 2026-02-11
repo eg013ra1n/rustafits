@@ -305,10 +305,16 @@ unsafe fn apply_stretch_avx2(
         // Use permute to bring lane1 data adjacent to lane0
         let shuffled = _mm256_permute4x64_epi64(packed8, 0b11_01_10_00);
         let lo128 = _mm256_castsi256_si128(shuffled);
-        let packed = _mm_cvtsi128_si64(lo128) as u64;
 
-        for j in 0..8 {
-            output[output_offset + (i + j) * stride] = ((packed >> (j * 8)) & 0xFF) as u8;
+        // Extract low 64 bits (pixels 0-3) and high 64 bits (pixels 4-7)
+        let lo = _mm_cvtsi128_si64(lo128) as u64;
+        let hi = _mm_cvtsi128_si64(_mm_srli_si128(lo128, 8)) as u64;
+
+        for j in 0..4 {
+            output[output_offset + (i + j) * stride] = ((lo >> (j * 8)) & 0xFF) as u8;
+        }
+        for j in 0..4 {
+            output[output_offset + (i + 4 + j) * stride] = ((hi >> (j * 8)) & 0xFF) as u8;
         }
 
         i += 8;
