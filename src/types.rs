@@ -35,6 +35,8 @@ pub struct ProcessedImage {
     pub width: usize,
     pub height: usize,
     pub is_color: bool,
+    /// Number of channels in `data`: 3 = RGB, 4 = RGBA.
+    pub channels: u8,
 }
 
 #[allow(dead_code)]
@@ -44,4 +46,6 @@ pub struct ProcessConfig {
     pub apply_debayer: bool,
     pub preview_mode: bool,
     pub auto_stretch: bool,
+    /// Output RGBA (4 bytes/pixel) instead of RGB (3 bytes/pixel).
+    pub rgba_output: bool,
 }

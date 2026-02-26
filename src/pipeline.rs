@@ -159,7 +159,8 @@ fn apply_stretch_and_finalize(
     config: &ProcessConfig,
 ) -> Result<ProcessedImage> {
     let channel_size = width * height;
-    let mut rgb_data = vec![0u8; width * height * 3];
+    let bpp: usize = if config.rgba_output { 4 } else { 3 };
+    let mut out_data = vec![0u8; channel_size * bpp];
 
     if config.auto_stretch {
         if is_color {
@@ -172,11 +173,18 @@ fn apply_stretch_and_finalize(
                 })
                 .collect();
 
-            // Apply stretch with stride=3 directly into rgb_data (no intermediate buffers)
+            // Apply stretch with stride directly into out_data
             for c in 0..num_channels {
                 let ch = &float_data[c * channel_size..(c + 1) * channel_size];
                 let (ns, nh, k1, k2, m) = coeffs[c];
-                stretch::apply_stretch(ch, &mut rgb_data, c, 3, ns, nh, k1, k2, m);
+                stretch::apply_stretch(ch, &mut out_data, c, bpp, ns, nh, k1, k2, m);
+            }
+
+            // Fill alpha channel if RGBA
+            if config.rgba_output {
+                for i in 0..channel_size {
+                    out_data[i * 4 + 3] = 255;
+                }
             }
         } else {
             let channel_data = &float_data[0..channel_size];
@@ -195,19 +203,24 @@ fn apply_stretch_and_finalize(
                 k2,
                 midtones,
             );
-            rgb_data = color::replicate_gray_to_rgb(&temp);
+            if config.rgba_output {
+                out_data = color::replicate_gray_to_rgba(&temp);
+            } else {
+                out_data = color::replicate_gray_to_rgb(&temp);
+            }
         }
     }
 
     // Vertical flip
     if meta.flip_vertical {
-        color::vertical_flip_rgb(&mut rgb_data, width, height);
+        color::vertical_flip(&mut out_data, width, height, bpp);
     }
 
     Ok(ProcessedImage {
-        data: rgb_data,
+        data: out_data,
         width,
         height,
         is_color,
+        channels: bpp as u8,
     })
 }

@@ -59,12 +59,55 @@ fn gray_to_rgb_neon(gray: &[u8], rgb: &mut [u8]) {
     }
 }
 
-// SSE2 doesn't have _mm_shuffle_epi8 (that's SSSE3), so gray→RGB
-// on baseline x86_64 uses scalar. The AVX2 path (which implies SSSE3)
-// uses pshufb for the real SIMD acceleration.
+// SSSE3 path using _mm_shuffle_epi8 (pshufb). Virtually all x86_64 CPUs
+// since 2006 (Core 2) support SSSE3, so this is the effective baseline.
+// Falls back to scalar only on very old AMD CPUs without SSSE3.
 #[cfg(target_arch = "x86_64")]
 fn gray_to_rgb_sse2(gray: &[u8], rgb: &mut [u8]) {
-    gray_to_rgb_scalar(gray, rgb);
+    if is_x86_feature_detected!("ssse3") {
+        unsafe { gray_to_rgb_ssse3(gray, rgb) };
+    } else {
+        gray_to_rgb_scalar(gray, rgb);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn gray_to_rgb_ssse3(gray: &[u8], rgb: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    let count = gray.len();
+    let mut i = 0;
+
+    // Same shuffle masks as the AVX2 path but using 128-bit pshufb
+    let shuf0 = _mm_setr_epi8(0,0,0, 1,1,1, 2,2,2, 3,3,3, 4,4,4, 5);
+    let shuf1 = _mm_setr_epi8(5,5, 6,6,6, 7,7,7, 8,8,8, 9,9,9, 10,10);
+    let shuf2 = _mm_setr_epi8(10, 11,11,11, 12,12,12, 13,13,13, 14,14,14, 15,15,15);
+
+    // Process 16 input pixels → 48 output bytes per iteration
+    while i + 16 <= count {
+        let g = _mm_loadu_si128(gray.as_ptr().add(i) as *const __m128i);
+
+        let out0 = _mm_shuffle_epi8(g, shuf0);
+        let out1 = _mm_shuffle_epi8(g, shuf1);
+        let out2 = _mm_shuffle_epi8(g, shuf2);
+
+        let base = i * 3;
+        _mm_storeu_si128(rgb.as_mut_ptr().add(base) as *mut __m128i, out0);
+        _mm_storeu_si128(rgb.as_mut_ptr().add(base + 16) as *mut __m128i, out1);
+        _mm_storeu_si128(rgb.as_mut_ptr().add(base + 32) as *mut __m128i, out2);
+
+        i += 16;
+    }
+
+    // Scalar remainder
+    for idx in i..count {
+        let val = *gray.get_unchecked(idx);
+        let out = idx * 3;
+        *rgb.get_unchecked_mut(out) = val;
+        *rgb.get_unchecked_mut(out + 1) = val;
+        *rgb.get_unchecked_mut(out + 2) = val;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -114,9 +157,69 @@ unsafe fn gray_to_rgb_avx2(gray: &[u8], rgb: &mut [u8]) {
     }
 }
 
-/// Vertical flip of an RGB image (3 bytes per pixel).
-pub fn vertical_flip_rgb(data: &mut [u8], width: usize, height: usize) {
-    let row_bytes = width * 3;
+/// Replicate grayscale u8 to interleaved RGBA u8 (alpha = 255).
+pub fn replicate_gray_to_rgba(gray: &[u8]) -> Vec<u8> {
+    let mut rgba = vec![0u8; gray.len() * 4];
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        gray_to_rgba_scalar(gray, &mut rgba);
+        return rgba;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        gray_to_rgba_neon(gray, &mut rgba);
+        return rgba;
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        gray_to_rgba_scalar(gray, &mut rgba);
+        rgba
+    }
+}
+
+#[allow(dead_code)]
+fn gray_to_rgba_scalar(gray: &[u8], rgba: &mut [u8]) {
+    for (i, &val) in gray.iter().enumerate() {
+        let base = i * 4;
+        rgba[base] = val;
+        rgba[base + 1] = val;
+        rgba[base + 2] = val;
+        rgba[base + 3] = 255;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn gray_to_rgba_neon(gray: &[u8], rgba: &mut [u8]) {
+    use std::arch::aarch64::*;
+
+    let count = gray.len();
+    let mut i = 0;
+
+    unsafe {
+        let alpha = vdupq_n_u8(255);
+        while i + 16 <= count {
+            let g = vld1q_u8(gray.as_ptr().add(i));
+            let quad = uint8x16x4_t(g, g, g, alpha);
+            vst4q_u8(rgba.as_mut_ptr().add(i * 4), quad);
+            i += 16;
+        }
+    }
+
+    for idx in i..count {
+        let base = idx * 4;
+        rgba[base] = gray[idx];
+        rgba[base + 1] = gray[idx];
+        rgba[base + 2] = gray[idx];
+        rgba[base + 3] = 255;
+    }
+}
+
+/// Vertical flip of an image with `bytes_per_pixel` bytes per pixel.
+pub fn vertical_flip(data: &mut [u8], width: usize, height: usize, bytes_per_pixel: usize) {
+    let row_bytes = width * bytes_per_pixel;
     let mut temp = vec![0u8; row_bytes];
     for y in 0..height / 2 {
         let top = y * row_bytes;

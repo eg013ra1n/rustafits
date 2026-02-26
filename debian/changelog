@@ -1,3 +1,14 @@
+rustafits (0.4.5-1) unstable; urgency=medium
+
+  * Add RGBA output support (with_rgba_output, channels field on ProcessedImage)
+  * SSSE3 gray-to-RGB on x86_64 (replaces scalar fallback)
+  * Parallel downscale via rayon
+  * NEON-accelerated gray-to-RGBA
+  * Generalized vertical flip (RGB and RGBA)
+  * RGBA-aware PNG/JPEG output (auto-strips alpha for JPEG)
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Thu, 26 Feb 2026 00:00:00 +0000
+
 rustafits (0.4.3-1) unstable; urgency=medium
 
   * Fix downscale ordering: debayer before downscale for Bayer/OSC images

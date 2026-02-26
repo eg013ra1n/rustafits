@@ -1,8 +1,8 @@
 # Maintainer: Vilen Sharifov <vilen.sharifov@gmail.com>
 pkgname=rustafits
-pkgver=0.1.0
+pkgver=0.4.5
 pkgrel=1
-pkgdesc="High-performance FITS to JPEG converter with auto-stretch and Bayer debayering"
+pkgdesc="High-performance FITS/XISF to JPEG/PNG converter with auto-stretch and Bayer debayering"
 arch=('x86_64' 'aarch64')
 url="https://github.com/eg013ra1n/rustafits"
 license=('Apache-2.0')

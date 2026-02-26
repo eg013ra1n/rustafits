@@ -12,6 +12,7 @@ pub struct ImageConverter {
     quality: u8,
     apply_debayer: bool,
     preview_mode: bool,
+    rgba_output: bool,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
@@ -22,6 +23,7 @@ impl ImageConverter {
             quality: 95,
             apply_debayer: true,
             preview_mode: false,
+            rgba_output: false,
             thread_pool: None,
         }
     }
@@ -46,6 +48,12 @@ impl ImageConverter {
         self
     }
 
+    /// Output RGBA (4 bytes/pixel) instead of RGB, suitable for HTML Canvas `ImageData`.
+    pub fn with_rgba_output(mut self) -> Self {
+        self.rgba_output = true;
+        self
+    }
+
     pub fn with_thread_pool(mut self, pool: Arc<rayon::ThreadPool>) -> Self {
         self.thread_pool = Some(pool);
         self
@@ -62,6 +70,7 @@ impl ImageConverter {
             apply_debayer: self.apply_debayer,
             preview_mode: self.preview_mode,
             auto_stretch: true,
+            rgba_output: self.rgba_output,
         };
 
         let path = input_path.as_ref();

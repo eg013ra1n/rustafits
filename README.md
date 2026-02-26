@@ -9,6 +9,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **Bayer Debayering**: Super-pixel 2x2 block averaging (RGGB, BGGR, GBRG, GRBG)
 - **Preview Mode**: 2x2 binning for fast previews
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
+- **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
 
 ## Supported Formats
@@ -101,9 +102,10 @@ let image: ProcessedImage = ImageConverter::new()
     .with_downscale(2)
     .process("input.fits")?;
 
-// image.data     - Vec<u8>, interleaved RGB bytes
+// image.data     - Vec<u8>, interleaved RGB or RGBA bytes
 // image.width    - pixel width
 // image.height   - pixel height
+// image.channels - 3 (RGB) or 4 (RGBA)
 // image.is_color - true if debayered/RGB, false if mono (gray replicated to RGB)
 ```
 
@@ -115,6 +117,7 @@ let image: ProcessedImage = ImageConverter::new()
 | `with_quality(q)` | JPEG quality 1-100 |
 | `without_debayer()` | Skip Bayer debayering |
 | `with_preview_mode()` | 2x2 binning for fast previews |
+| `with_rgba_output()` | Output RGBA instead of RGB (adds alpha=255 channel) |
 | `with_thread_pool(pool)` | Use a custom rayon thread pool (see below) |
 
 ### Multi-image concurrent processing
@@ -180,7 +183,7 @@ SIMD is used across the processing pipeline with automatic runtime dispatch:
 | Stretch | 4 px/iter | 8 px/iter | 4 px/iter |
 | Binning | yes | yes | yes |
 | u16 to f32 | yes | yes | yes |
-| Gray to RGB | scalar | pshufb | yes |
+| Gray to RGB | SSSE3 pshufb | AVX2 pshufb | yes |
 | Debayer (f32) | yes | — | yes |
 
 ## Architecture
