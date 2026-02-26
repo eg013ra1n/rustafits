@@ -28,10 +28,9 @@ jobs:
 
       - name: Update formula
         run: |
-          cd tap/Formula
-          cat > rustafits.rb <<EOF
+          cat > tap/Formula/rustafits.rb << 'FORMULA'
           class Rustafits < Formula
-            desc "High-performance FITS to JPEG converter with auto-stretch"
+            desc "High-performance FITS/XISF to JPEG converter with auto-stretch"
             homepage "https://github.com/${{ github.repository }}"
             url "https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz"
             sha256 "${{ env.sha256 }}"
@@ -47,7 +46,7 @@ jobs:
               assert_match "FITS/XISF to JPEG Converter", shell_output("#{bin}/rustafits --help", 1)
             end
           end
-          EOF
+          FORMULA
 
       - name: Commit and push
         run: |
