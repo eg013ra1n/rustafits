@@ -24,26 +24,35 @@ fn process_u16(
     let mut width = meta.width;
     let mut height = meta.height;
 
-    // Downscale
-    if config.downscale_factor > 1 {
-        let (d, nw, nh) = downscale::downscale_u16(&data, width, height, config.downscale_factor);
-        data = d;
-        width = nw;
-        height = nh;
-    }
-
     let (float_data, is_color, num_channels);
 
     if config.apply_debayer && meta.bayer_pattern != BayerPattern::None {
-        // Debayer: u16 mono → f32 planar RGB, half dims
-        let (rgb, ow, oh) =
+        // Debayer first: u16 mono → f32 planar RGB, half dims (inherent 2x reduction)
+        let (mut rgb, mut ow, mut oh) =
             debayer::super_pixel_debayer_u16(&data, width, height, meta.bayer_pattern);
+        // Debayer counts as 2x, so only apply additional downscale for factor > 2
+        let extra = config.downscale_factor / 2;
+        if extra > 1 {
+            let (d, nw, nh) = downscale::downscale_f32_planar(&rgb, ow, oh, 3, extra);
+            rgb = d;
+            ow = nw;
+            oh = nh;
+        }
         width = ow;
         height = oh;
         float_data = rgb;
         is_color = true;
         num_channels = 3;
     } else {
+        // Non-Bayer: downscale raw data directly
+        if config.downscale_factor > 1 {
+            let (d, nw, nh) =
+                downscale::downscale_u16(&data, width, height, config.downscale_factor);
+            data = d;
+            width = nw;
+            height = nh;
+        }
+
         // Convert to float
         let mut fdata = color::u16_to_f32(&data);
 
@@ -71,38 +80,46 @@ fn process_f32(
     let mut width = meta.width;
     let mut height = meta.height;
 
-    // Downscale (handles multi-channel planar data)
-    if config.downscale_factor > 1 {
-        let (d, nw, nh) = downscale::downscale_f32_planar(
-            &data,
-            width,
-            height,
-            meta.channels,
-            config.downscale_factor,
-        );
-        data = d;
-        width = nw;
-        height = nh;
-    }
-
     let (float_data, is_color, num_channels);
 
     if meta.channels == 1 && config.apply_debayer && meta.bayer_pattern != BayerPattern::None {
-        // Debayer mono f32
-        let (rgb, ow, oh) =
+        // Debayer first: f32 mono → f32 planar RGB, half dims (inherent 2x reduction)
+        let (mut rgb, mut ow, mut oh) =
             debayer::super_pixel_debayer_f32(&data, width, height, meta.bayer_pattern);
+        // Debayer counts as 2x, so only apply additional downscale for factor > 2
+        let extra = config.downscale_factor / 2;
+        if extra > 1 {
+            let (d, nw, nh) = downscale::downscale_f32_planar(&rgb, ow, oh, 3, extra);
+            rgb = d;
+            ow = nw;
+            oh = nh;
+        }
         width = ow;
         height = oh;
         float_data = rgb;
         is_color = true;
         num_channels = 3;
     } else if meta.channels == 3 {
-        // Already RGB
+        // Already RGB: downscale planar data directly
+        if config.downscale_factor > 1 {
+            let (d, nw, nh) =
+                downscale::downscale_f32_planar(&data, width, height, 3, config.downscale_factor);
+            data = d;
+            width = nw;
+            height = nh;
+        }
         float_data = data;
         is_color = true;
         num_channels = 3;
     } else {
-        // Mono f32 — optional binning
+        // Mono f32 (no Bayer): downscale then optional binning
+        if config.downscale_factor > 1 {
+            let (d, nw, nh) =
+                downscale::downscale_f32_planar(&data, width, height, 1, config.downscale_factor);
+            data = d;
+            width = nw;
+            height = nh;
+        }
         if config.preview_mode && meta.channels == 1 && meta.bayer_pattern == BayerPattern::None {
             let (binned, nw, nh) = binning::bin_2x2_float(&data, width, height);
             data = binned;

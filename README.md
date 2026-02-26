@@ -60,6 +60,10 @@ rustafits large.fits preview.jpg --downscale 4
 # Options
 rustafits <input> <output> [OPTIONS]
   --downscale <N>   Downscale factor (default: 1)
+                    For Bayer/OSC images, the super-pixel debayer
+                    inherently halves resolution, so --downscale 2
+                    equals debayer only, --downscale 4 = debayer + 2x
+                    extra downscale, etc.
   --quality <Q>     JPEG quality 1-100 (default: 95)
   --no-debayer      Disable Bayer debayering
   --preview         2x2 binning for mono images
@@ -107,7 +111,7 @@ let image: ProcessedImage = ImageConverter::new()
 
 | Method | Description |
 |--------|-------------|
-| `with_downscale(n)` | Downscale by factor n |
+| `with_downscale(n)` | Downscale by factor n (Bayer images: debayer counts as 2x, extra downscale applied for n > 2) |
 | `with_quality(q)` | JPEG quality 1-100 |
 | `without_debayer()` | Skip Bayer debayering |
 | `with_preview_mode()` | 2x2 binning for fast previews |
@@ -210,6 +214,8 @@ rustafits/
 **Slow conversion**: Use `--preview` for mono images or `--downscale 2`
 
 **Black/white output**: Run with `--log` to check stretch parameters
+
+**Downscale + Bayer/OSC**: The super-pixel debayer already halves resolution (2x). A `--downscale 2` on a Bayer image produces debayer-only output with no extra downscale. Use `--downscale 4` or higher for additional reduction beyond debayering.
 
 ## References
 

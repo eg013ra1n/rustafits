@@ -1,7 +1,7 @@
 class Rustafits < Formula
   desc "High-performance FITS to JPEG converter with auto-stretch"
   homepage "https://github.com/eg013ra1n/rustafits"
-  url "https://github.com/eg013ra1n/rustafits/archive/v0.4.2.tar.gz"
+  url "https://github.com/eg013ra1n/rustafits/archive/v0.4.3.tar.gz"
   sha256 "CHECKSUM_HERE"
   license "Apache-2.0"
 
@@ -12,6 +12,6 @@ class Rustafits < Formula
   end
 
   test do
-    assert_match "FITS to JPEG Converter", shell_output("#{bin}/rustafits --help", 1)
+    assert_match "FITS/XISF to JPEG Converter", shell_output("#{bin}/rustafits --help", 1)
   end
 end

@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.4.2
+Version:        0.4.3
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,10 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Wed Feb 26 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.4.3-1
+- Fix downscale ordering: debayer before downscale for Bayer/OSC images
+- Bayer-aware downscale: super-pixel debayer counts as 2x reduction
+
 * Mon Feb 10 2025 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.4.2-1
 - Add configurable rayon thread pool for multi-image concurrent processing
 - Re-export rayon ThreadPool and ThreadPoolBuilder from library API
