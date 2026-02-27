@@ -41,6 +41,10 @@ pub struct StarMetrics {
     pub snr: f32,
     /// Half-flux radius (pixels).
     pub hfr: f32,
+    /// PSF position angle in radians, counter-clockwise from +X axis.
+    /// Orientation of the major axis (fwhm_x direction).
+    /// 0.0 when Gaussian fit is disabled and star is nearly round.
+    pub theta: f32,
 }
 
 /// Full analysis result for an image.
@@ -354,6 +358,7 @@ impl ImageAnalyzer {
                 eccentricity: m.eccentricity,
                 snr: m.snr,
                 hfr: m.hfr,
+                theta: m.theta,
             })
             .collect();
 

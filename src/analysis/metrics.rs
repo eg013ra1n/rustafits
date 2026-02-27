@@ -16,6 +16,8 @@ pub(crate) struct MeasuredStar {
     pub hfr: f32,
     /// Per-star SNR — set later by snr::compute_star_snr.
     pub snr: f32,
+    /// PSF position angle in radians, counter-clockwise from +X axis.
+    pub theta: f32,
 }
 
 const FWHM_FACTOR: f32 = 2.3548;
@@ -216,6 +218,9 @@ fn measure_with_moments(
 
     let eccentricity = (1.0 - lambda2 / lambda1).max(0.0).sqrt();
 
+    // Position angle of major axis from eigenvector direction
+    let theta = 0.5 * (2.0 * m_xy).atan2(m_xx - m_yy);
+
     Some(MeasuredStar {
         x: (cx + x0 as f64) as f32,
         y: (cy + y0 as f64) as f32,
@@ -227,6 +232,7 @@ fn measure_with_moments(
         eccentricity: eccentricity as f32,
         hfr,
         snr: 0.0,
+        theta: theta as f32,
     })
 }
 
@@ -301,6 +307,7 @@ fn measure_with_gaussian_fit(
         eccentricity: eccentricity as f32,
         hfr,
         snr: 0.0,
+        theta: result.theta as f32,
     })
 }
 

@@ -116,6 +116,7 @@ be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
 | `eccentricity` | `f32` | 0 = round, approaching 1 = elongated. |
 | `snr` | `f32` | Per-star aperture photometry SNR. |
 | `hfr` | `f32` | Half-flux radius (pixels). |
+| `theta` | `f32` | PSF position angle in radians, counter-clockwise from +X axis. Orientation of the major axis (`fwhm_x` direction). With `theta`, `fwhm_x`, and `fwhm_y` you can reconstruct the full 2D Gaussian ellipse: `sigma_x = fwhm_x / 2.3548`, `sigma_y = fwhm_y / 2.3548`. |
 
 ## Thread Pool Usage
 
