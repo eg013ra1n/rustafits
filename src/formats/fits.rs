@@ -164,12 +164,9 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
             let use_par = num_pixels >= PAR_THRESHOLD;
 
             if hdr.bzero == 32768.0 && hdr.bscale == 1.0 {
-                // Fast path: signed→unsigned via XOR 0x8000
+                // Fast path: signed→unsigned via byte-swap + XOR 0x8000
                 let convert = |s: &[u8], d: &mut [u16]| {
-                    for i in 0..d.len() {
-                        let raw = u16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
-                        d[i] = raw ^ 0x8000;
-                    }
+                    bswap_u16_xor(s, d);
                 };
                 if use_par {
                     src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
@@ -178,9 +175,7 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
                 }
             } else if hdr.bzero == 0.0 && hdr.bscale == 1.0 {
                 let convert = |s: &[u8], d: &mut [u16]| {
-                    for i in 0..d.len() {
-                        d[i] = u16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
-                    }
+                    bswap_u16(s, d);
                 };
                 if use_par {
                     src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
@@ -304,4 +299,103 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     };
 
     Ok((meta, pixels))
+}
+
+/// SIMD-accelerated big-endian u16 byte swap.
+fn bswap_u16(src: &[u8], dst: &mut [u16]) {
+    let n = dst.len();
+    let mut i = 0;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        // NEON: vrev16q_u8 swaps adjacent bytes in each 16-bit lane (16 bytes = 8 u16 at a time)
+        while i + 8 <= n {
+            unsafe {
+                let bytes = vld1q_u8(src.as_ptr().add(i * 2));
+                let swapped = vrev16q_u8(bytes);
+                vst1q_u8(dst.as_mut_ptr().add(i) as *mut u8, swapped);
+            }
+            i += 8;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("ssse3") {
+            i = bswap_u16_ssse3(src, dst, i, n);
+        }
+    }
+
+    // Scalar remainder
+    for j in i..n {
+        dst[j] = u16::from_be_bytes([src[j * 2], src[j * 2 + 1]]);
+    }
+}
+
+/// SIMD-accelerated big-endian u16 byte swap with XOR 0x8000.
+fn bswap_u16_xor(src: &[u8], dst: &mut [u16]) {
+    let n = dst.len();
+    let mut i = 0;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let xor_mask = unsafe { vdupq_n_u16(0x8000) };
+        while i + 8 <= n {
+            unsafe {
+                let bytes = vld1q_u8(src.as_ptr().add(i * 2));
+                let swapped = vrev16q_u8(bytes);
+                let vals = vreinterpretq_u16_u8(swapped);
+                let result = veorq_u16(vals, xor_mask);
+                vst1q_u16(dst.as_mut_ptr().add(i), result);
+            }
+            i += 8;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("ssse3") {
+            i = bswap_u16_xor_ssse3(src, dst, i, n);
+        }
+    }
+
+    // Scalar remainder
+    for j in i..n {
+        let raw = u16::from_be_bytes([src[j * 2], src[j * 2 + 1]]);
+        dst[j] = raw ^ 0x8000;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn bswap_u16_ssse3(src: &[u8], dst: &mut [u16], start: usize, n: usize) -> usize {
+    use std::arch::x86_64::*;
+    let shuffle = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    let mut i = start;
+    while i + 8 <= n {
+        let bytes = _mm_loadu_si128(src.as_ptr().add(i * 2) as *const __m128i);
+        let swapped = _mm_shuffle_epi8(bytes, shuffle);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, swapped);
+        i += 8;
+    }
+    i
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn bswap_u16_xor_ssse3(src: &[u8], dst: &mut [u16], start: usize, n: usize) -> usize {
+    use std::arch::x86_64::*;
+    let shuffle = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    let xor_mask = _mm_set1_epi16(0x8000u16 as i16);
+    let mut i = start;
+    while i + 8 <= n {
+        let bytes = _mm_loadu_si128(src.as_ptr().add(i * 2) as *const __m128i);
+        let swapped = _mm_shuffle_epi8(bytes, shuffle);
+        let result = _mm_xor_si128(swapped, xor_mask);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, result);
+        i += 8;
+    }
+    i
 }

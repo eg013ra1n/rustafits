@@ -1,5 +1,5 @@
 /// Quickselect: find k-th smallest element (in-place, modifies slice).
-fn quickselect(arr: &mut [f32], k: usize) -> f32 {
+pub(crate) fn quickselect(arr: &mut [f32], k: usize) -> f32 {
     let mut left = 0usize;
     let mut right = arr.len() - 1;
 
@@ -68,7 +68,7 @@ fn quickselect(arr: &mut [f32], k: usize) -> f32 {
     arr[k]
 }
 
-fn find_median(data: &mut [f32]) -> f32 {
+pub(crate) fn find_median(data: &mut [f32]) -> f32 {
     let k = data.len() / 2;
     quickselect(data, k)
 }
