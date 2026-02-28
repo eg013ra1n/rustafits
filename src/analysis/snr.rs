@@ -19,6 +19,11 @@ pub(crate) fn compute_star_snr(
 ) {
     use rayon::prelude::*;
 
+    // Guard against NaN/Inf/nonsensical FWHM — leave SNR at 0.0
+    if !median_fwhm.is_finite() || median_fwhm <= 0.0 {
+        return;
+    }
+
     let r_ap = (1.5 * median_fwhm).max(3.0);
     let r_inner = 3.0 * median_fwhm;
     let r_outer = 5.0 * median_fwhm;
@@ -38,18 +43,22 @@ fn compute_single_snr(
     r_inner: f32,
     r_outer: f32,
 ) -> f32 {
-    let r_outer_ceil = r_outer.ceil() as i32;
-    let ix = cx.round() as i32;
-    let iy = cy.round() as i32;
+    let r_outer_ceil = r_outer.ceil() as i64;
+    let ix = cx.round() as i64;
+    let iy = cy.round() as i64;
 
-    // Check bounds
+    // Check bounds (use i64 to prevent overflow with large aperture radii)
     if ix - r_outer_ceil < 0
         || iy - r_outer_ceil < 0
-        || ix + r_outer_ceil >= width as i32
-        || iy + r_outer_ceil >= height as i32
+        || ix + r_outer_ceil >= width as i64
+        || iy + r_outer_ceil >= height as i64
     {
         return 0.0;
     }
+
+    let ix = ix as i32;
+    let iy = iy as i32;
+    let r_outer_ceil = r_outer_ceil as i32;
 
     let r_ap_sq = r_ap * r_ap;
     let r_inner_sq = r_inner * r_inner;

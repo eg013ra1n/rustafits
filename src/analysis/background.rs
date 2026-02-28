@@ -168,11 +168,16 @@ pub(crate) fn estimate_background_mesh(
 
     // Bilinear interpolation to full resolution (parallelized)
     let mut bg_map = vec![0.0_f32; width * height];
-    let half_cell = cell_size as f32 * 0.5;
-    let inv_cell = 1.0 / cell_size as f32;
-    let nx_clamp = nx as i32 - 2;
 
-    {
+    if nx < 2 || ny < 2 {
+        // Too few cells for bilinear interpolation — fill with flat background
+        let flat_val = filtered_bg[0];
+        bg_map.fill(flat_val);
+    } else {
+        let half_cell = cell_size as f32 * 0.5;
+        let inv_cell = 1.0 / cell_size as f32;
+        let nx_clamp = nx as i32 - 2;
+
         use rayon::prelude::*;
         bg_map
             .par_chunks_mut(width)

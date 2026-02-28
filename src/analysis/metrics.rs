@@ -272,7 +272,7 @@ fn measure_with_gaussian_fit(
         edge_vals.push(stamp[sy * stamp_w].max(0.0) as f64);
         edge_vals.push(stamp[sy * stamp_w + stamp_w - 1].max(0.0) as f64);
     }
-    edge_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    edge_vals.sort_by(|a, b| a.total_cmp(b));
     let init_bg = if edge_vals.is_empty() {
         0.0
     } else {

@@ -122,7 +122,7 @@ pub(crate) fn detect_stars(
     }
 
     // Non-maximum suppression using spatial hashing
-    peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    peaks.sort_by(|a, b| b.2.total_cmp(&a.2));
     let sup_radius = radius;
     let sup_radius_sq = (sup_radius * sup_radius) as f32;
     let cell_size = sup_radius.max(1);
@@ -178,7 +178,7 @@ pub(crate) fn detect_stars(
         for x in 0..width {
             let bg = bg_map.map_or(background, |m| m[y * width + x]);
             let val = data[y * width + x] - bg;
-            if val <= low_threshold {
+            if !val.is_finite() || val <= low_threshold {
                 continue;
             }
 
@@ -193,11 +193,11 @@ pub(crate) fn detect_stars(
                     next_label += 1;
                 }
                 (l, 0) | (0, l) => {
-                    labels[idx] = find(&parent, l);
+                    labels[idx] = find(&mut parent, l);
                 }
                 (l, t) => {
-                    let rl = find(&parent, l);
-                    let rt = find(&parent, t);
+                    let rl = find(&mut parent, l);
+                    let rt = find(&mut parent, t);
                     labels[idx] = rl.min(rt);
                     if rl != rt {
                         union(&mut parent, rl, rt);
@@ -210,7 +210,7 @@ pub(crate) fn detect_stars(
     // Second pass: resolve labels
     for l in labels.iter_mut() {
         if *l > 0 {
-            *l = find(&parent, *l);
+            *l = find(&mut parent, *l);
         }
     }
 
@@ -329,7 +329,7 @@ pub(crate) fn detect_stars(
     }
 
     // Sort by flux descending, keep top max_stars
-    stars.sort_by(|a, b| b.flux.partial_cmp(&a.flux).unwrap());
+    stars.sort_by(|a, b| b.flux.total_cmp(&a.flux));
     stars.truncate(params.max_stars);
 
     stars
@@ -337,8 +337,9 @@ pub(crate) fn detect_stars(
 
 // ── Union-Find ──────────────────────────────────────────────────────────────
 
-fn find(parent: &[u32], mut x: u32) -> u32 {
+fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
+        parent[x as usize] = parent[parent[x as usize] as usize]; // path halving
         x = parent[x as usize];
     }
     x

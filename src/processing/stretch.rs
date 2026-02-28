@@ -1,5 +1,11 @@
 /// Quickselect: find k-th smallest element (in-place, modifies slice).
 pub(crate) fn quickselect(arr: &mut [f32], k: usize) -> f32 {
+    if arr.is_empty() {
+        return 0.0;
+    }
+    if arr.len() == 1 {
+        return arr[0];
+    }
     let mut left = 0usize;
     let mut right = arr.len() - 1;
 
