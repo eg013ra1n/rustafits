@@ -86,9 +86,23 @@ Star Stamp
 |   max_s = max(sx, sy)       |
 |   e = sqrt(1 - min^2/max^2) |
 +-----------------------------+
+    |
+    v
++-----------------------------+
+| Theta (moments-based)       |  Always from I-weighted second moments,
+|                             |  NOT from the Gaussian fitter's theta.
+|                             |  See note below.
++-----------------------------+
 ```
 
 **Accuracy:** Matches PixInsight FWHMEccentricity within ~2% on typical data.
+
+**Note on theta:** The position angle is always computed from intensity-weighted
+second-order moments over the stamp, even when using Gaussian fitting for FWHM.
+The Gaussian fitter only fits theta for stars with ellipticity > 0.1 and may
+return 0 for round sources. The moments-based theta is defined for all shapes
+and carries directional signal even for barely-elongated trail knots — this is
+critical for the Rayleigh trail rejection test to work on oversampled trails.
 
 ### Method 2: Windowed Moments (Fast Path)
 

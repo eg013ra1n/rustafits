@@ -41,16 +41,29 @@ FITS / XISF File
        v
 +----------------------------+
 | Star Detection             |  DAOFIND matched filter + Connected Component Labeling
-| -> candidate list          |  Filtered by area, saturation, aspect ratio
+| -> candidate list          |  Stamp-based theta & eccentricity per star
 | -> sorted by flux          |
++----------------------------+
+       |
+       v
++----------------------------+
+| Trail Rejection            |  Rayleigh test on position angles (2 theta)
+| (Phase 1: image-level)     |  Dual-path: strong R^2 OR eccentricity-gated
+| -> zero result if trailing |
 +----------------------------+
        |
        v
 +----------------------------+
 | PSF Measurement (per star) |  Extract stamp around each star
 | -> FWHM (x, y, geometric) |  2D Gaussian fit (default) or windowed moments
-| -> Eccentricity            |
-| -> HFR                     |
+| -> Eccentricity            |  Moments-based theta (always)
+| -> HFR, theta              |
++----------------------------+
+       |
+       v
++----------------------------+
+| Eccentricity Filter        |  Reject stars with ecc > max_eccentricity (default 0.5)
+| (Phase 2: per-star)        |  Removes remaining cosmic rays, satellite trails
 +----------------------------+
        |
        v
@@ -83,7 +96,32 @@ FITS / XISF File
 | Fitting          | `fitting.rs`      | Levenberg-Marquardt 1D and 2D Gaussian fits   |
 | Metrics          | `metrics.rs`      | Per-star FWHM, eccentricity, HFR measurement |
 | SNR              | `snr.rs`          | Per-star and image-wide SNR computations      |
-| Orchestration    | `mod.rs`          | Builder API, data loading, pipeline wiring    |
+| Orchestration    | `mod.rs`          | Builder API, trail rejection, pipeline wiring |
+
+## Trail Rejection
+
+The pipeline has a two-phase strategy for rejecting trailed images:
+
+**Phase 1 — Image-level Rayleigh test** (in `mod.rs`, before PSF measurement):
+
+Detects directional coherence across all detected stars using circular statistics
+on position angles. If the position angles of all detected blobs point the same
+direction, the image is trailed and the pipeline returns a zero result (no stars).
+
+Two rejection paths cover different regimes:
+
+| Path | Condition | Catches |
+|------|-----------|---------|
+| A — Strong coherence | R^2 > 0.3 AND p < 0.01 | Oversampled trails (low-ecc knots, consistent theta) |
+| B — Eccentricity-gated | median ecc > 0.6 AND p < 0.05 | Undersampled trails (elongated blobs) |
+
+See [Trail Rejection](trail-rejection.md) for the full algorithm and rationale.
+
+**Phase 2 — Per-star eccentricity filter** (after PSF measurement):
+
+Stars with eccentricity above `max_eccentricity` (default 0.5) are removed from the
+final result. This catches individual trailed stars, cosmic rays, and other elongated
+artifacts that survived Phase 1.
 
 ## PixInsight Comparison
 
@@ -99,6 +137,7 @@ See individual algorithm documents for full details:
 
 - [Background Estimation](background.md)
 - [Star Detection](detection.md)
+- [Trail Rejection (Rayleigh Test)](trail-rejection.md)
 - [Gaussian Fitting](fitting.md)
 - [PSF Metrics (FWHM, Eccentricity, HFR)](metrics.md)
 - [SNR Computations](snr.md)

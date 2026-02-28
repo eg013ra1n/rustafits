@@ -12,6 +12,10 @@ pub(crate) struct DetectedStar {
     pub flux: f32,
     /// Number of connected pixels above threshold.
     pub area: usize,
+    /// Position angle from stamp-based I-weighted second-order moments (radians).
+    pub theta: f32,
+    /// Eccentricity from stamp-based moments (0 = round, approaching 1 = elongated).
+    pub eccentricity: f32,
 }
 
 /// Detection parameters.
@@ -319,12 +323,62 @@ pub(crate) fn detect_stars(
         let cx = (sum_wx / sum_w) as f32;
         let cy = (sum_wy / sum_w) as f32;
 
+        // Theta from stamp-based I-weighted second moments (not CCL pixels).
+        // CCL blobs have too few pixels → grid-induced theta coherence.
+        // A stamp over the continuous image gives reliable orientation.
+        let stamp_r = ((2.0 * (area as f64 / std::f64::consts::PI).sqrt()) as i32).max(5);
+        let cx_i = cx.round() as i32;
+        let cy_i = cy.round() as i32;
+        let (theta, ecc) = {
+            let mut sf = 0.0_f64;
+            let mut six = 0.0_f64;
+            let mut siy = 0.0_f64;
+            let mut sixx = 0.0_f64;
+            let mut siyy = 0.0_f64;
+            let mut sixy = 0.0_f64;
+            for dy in -stamp_r..=stamp_r {
+                let py = cy_i + dy;
+                if py < 0 || py >= height as i32 { continue; }
+                for dx in -stamp_r..=stamp_r {
+                    let px = cx_i + dx;
+                    if px < 0 || px >= width as i32 { continue; }
+                    let bg = bg_map.map_or(background, |m| m[py as usize * width + px as usize]);
+                    let v = (data[py as usize * width + px as usize] - bg).max(0.0) as f64;
+                    sf += v;
+                    six += v * px as f64;
+                    siy += v * py as f64;
+                    sixx += v * (px as f64) * (px as f64);
+                    siyy += v * (py as f64) * (py as f64);
+                    sixy += v * (px as f64) * (py as f64);
+                }
+            }
+            if sf > 1e-10 {
+                let icx = six / sf;
+                let icy = siy / sf;
+                let mxx = sixx / sf - icx * icx;
+                let myy = siyy / sf - icy * icy;
+                let mxy = sixy / sf - icx * icy;
+                let t = (0.5 * (2.0 * mxy).atan2(mxx - myy)) as f32;
+                let trace = mxx + myy;
+                let det = mxx * myy - mxy * mxy;
+                let disc = (trace * trace - 4.0 * det).max(0.0);
+                let l1 = (trace + disc.sqrt()) * 0.5;
+                let l2 = (trace - disc.sqrt()) * 0.5;
+                let e = if l1 > 0.0 { (1.0 - l2 / l1).max(0.0).sqrt() as f32 } else { 0.0 };
+                (t, e)
+            } else {
+                (0.0, 0.0)
+            }
+        };
+
         stars.push(DetectedStar {
             x: cx,
             y: cy,
             peak,
             flux: flux as f32,
             area,
+            theta,
+            eccentricity: ecc,
         });
     }
 

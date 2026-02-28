@@ -236,6 +236,31 @@ fn measure_with_moments(
     })
 }
 
+/// Compute position angle (theta) from intensity-weighted second-order moments.
+/// Returns the angle of the major axis in radians, always defined even for round sources.
+fn moments_theta(stamp: &[f32], stamp_w: usize, cx: f32, cy: f32) -> f64 {
+    let stamp_h = stamp.len() / stamp_w;
+    let mut m_xx = 0.0_f64;
+    let mut m_yy = 0.0_f64;
+    let mut m_xy = 0.0_f64;
+
+    for sy in 0..stamp_h {
+        for sx in 0..stamp_w {
+            let val = stamp[sy * stamp_w + sx].max(0.0) as f64;
+            if val <= 0.0 {
+                continue;
+            }
+            let dx = sx as f64 - cx as f64;
+            let dy = sy as f64 - cy as f64;
+            m_xx += val * dx * dx;
+            m_yy += val * dy * dy;
+            m_xy += val * dx * dy;
+        }
+    }
+
+    0.5 * (2.0 * m_xy).atan2(m_xx - m_yy)
+}
+
 /// Measure using full 2D elliptical Gaussian fit.
 fn measure_with_gaussian_fit(
     stamp: &[f32],
@@ -296,6 +321,11 @@ fn measure_with_gaussian_fit(
     let max_s = result.sigma_x.max(result.sigma_y);
     let eccentricity = (1.0 - (min_s * min_s) / (max_s * max_s)).max(0.0).sqrt();
 
+    // Always use moments-based theta — the Gaussian fitter only fits theta for
+    // obviously elliptical stars, but moments theta is defined for all shapes
+    // and carries directional signal even for nearly-round trail knots.
+    let theta = moments_theta(stamp, stamp_w, result.x0 as f32, result.y0 as f32);
+
     Some(MeasuredStar {
         x: (result.x0 + x0 as f64) as f32,
         y: (result.y0 + y0 as f64) as f32,
@@ -307,7 +337,7 @@ fn measure_with_gaussian_fit(
         eccentricity: eccentricity as f32,
         hfr,
         snr: 0.0,
-        theta: result.theta as f32,
+        theta: theta as f32,
     })
 }
 
@@ -377,6 +407,8 @@ mod tests {
             peak: 5000.0,
             flux: 50000.0,
             area: 50,
+            theta: 0.0,
+            eccentricity: 0.0,
         };
 
         let result =
@@ -409,6 +441,8 @@ mod tests {
             peak: 5000.0,
             flux: 50000.0,
             area: 80,
+            theta: 0.0,
+            eccentricity: 0.0,
         };
 
         let result =
@@ -452,6 +486,8 @@ mod tests {
             peak: 5000.0,
             flux: 50000.0,
             area: 50,
+            theta: 0.0,
+            eccentricity: 0.0,
         };
 
         let moments_result =

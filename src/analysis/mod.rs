@@ -91,6 +91,7 @@ pub struct AnalysisConfig {
     use_gaussian_fit: bool,
     background_mesh_size: Option<usize>,
     apply_debayer: bool,
+    max_eccentricity: f32,
 }
 
 /// Image analyzer with builder pattern.
@@ -111,6 +112,7 @@ impl ImageAnalyzer {
                 use_gaussian_fit: true,
                 background_mesh_size: None,
                 apply_debayer: true,
+                max_eccentricity: 0.5,
             },
             thread_pool: None,
         }
@@ -161,6 +163,13 @@ impl ImageAnalyzer {
     /// Skip debayering for OSC images (less accurate but faster).
     pub fn without_debayer(mut self) -> Self {
         self.config.apply_debayer = false;
+        self
+    }
+
+    /// Reject stars with eccentricity above this threshold (filters elongated objects/trails).
+    /// Default: 0.5. Set to 1.0 to disable.
+    pub fn with_max_eccentricity(mut self, ecc: f32) -> Self {
+        self.config.max_eccentricity = ecc.clamp(0.0, 1.0);
         self
     }
 
@@ -273,39 +282,8 @@ impl ImageAnalyzer {
         let stars_detected = detected.len();
         let detection_threshold = self.config.detection_sigma * bg_result.noise;
 
-        if stars_detected == 0 {
-            return Ok(AnalysisResult {
-                width,
-                height,
-                source_channels: channels,
-                background: bg_result.background,
-                noise: bg_result.noise,
-                detection_threshold,
-                stars_detected: 0,
-                stars: Vec::new(),
-                median_fwhm: 0.0,
-                median_eccentricity: 0.0,
-                median_snr: 0.0,
-                median_hfr: 0.0,
-                snr_db: snr::compute_snr_db(&lum, bg_result.noise),
-                snr_weight: snr::compute_snr_weight(&lum, bg_result.background, bg_result.noise),
-                psf_signal: 0.0,
-            });
-        }
-
-        // Measure PSF metrics
-        let mut measured = metrics::measure_stars(
-            &lum,
-            width,
-            height,
-            &detected,
-            bg_result.background,
-            bg_map_ref,
-            self.config.use_gaussian_fit,
-        );
-
-        if measured.is_empty() {
-            return Ok(AnalysisResult {
+        let zero_result = || {
+            Ok(AnalysisResult {
                 width,
                 height,
                 source_channels: channels,
@@ -321,7 +299,70 @@ impl ImageAnalyzer {
                 snr_db: snr::compute_snr_db(&lum, bg_result.noise),
                 snr_weight: snr::compute_snr_weight(&lum, bg_result.background, bg_result.noise),
                 psf_signal: 0.0,
-            });
+            })
+        };
+
+        if stars_detected == 0 {
+            return zero_result();
+        }
+
+        // ── Phase 1: Image-level trailing detection (Rayleigh test) ─────
+        // Two paths to trail rejection via Rayleigh test on 2θ:
+        //
+        // Path A — Strong R² (> 0.3): Reject regardless of eccentricity.
+        //   Real trails produce R² > 0.5 (strong directional coherence).
+        //   Grid-induced coherence on undersampled stars gives R² ≈ 0.15.
+        //   This path catches oversampled trails where individual CCL knots
+        //   have low eccentricity but consistent theta.
+        //
+        // Path B — Eccentricity-gated (median ecc > 0.6): standard Rayleigh.
+        //   For undersampled stars, moments are noisy and theta has grid bias.
+        //   Only test when blobs are genuinely elongated (ecc > 0.6), which
+        //   exceeds the undersampled baseline (~0.3-0.4).
+        if detected.len() >= 5 {
+            let n = detected.len();
+            let (sum_cos, sum_sin) =
+                detected
+                    .iter()
+                    .fold((0.0f64, 0.0f64), |(sc, ss), s| {
+                        let a = 2.0 * s.theta as f64;
+                        (sc + a.cos(), ss + a.sin())
+                    });
+            let r_sq = (sum_cos * sum_cos + sum_sin * sum_sin) / (n as f64 * n as f64);
+            let p = (-(n as f64) * r_sq).exp();
+
+            let mut eccs: Vec<f32> = detected.iter().map(|s| s.eccentricity).collect();
+            eccs.sort_unstable_by(|a, b| a.total_cmp(b));
+            let median_ecc = eccs[eccs.len() / 2];
+
+            let reject = (r_sq > 0.3 && p < 0.01)
+                || (median_ecc > 0.6 && p < 0.05);
+
+            if reject {
+                return zero_result();
+            }
+        }
+
+        // Measure PSF metrics
+        let mut measured = metrics::measure_stars(
+            &lum,
+            width,
+            height,
+            &detected,
+            bg_result.background,
+            bg_map_ref,
+            self.config.use_gaussian_fit,
+        );
+
+        if measured.is_empty() {
+            return zero_result();
+        }
+
+        // ── Phase 2: Per-star eccentricity filter (after measurement) ───
+        measured.retain(|s| s.eccentricity <= self.config.max_eccentricity);
+
+        if measured.is_empty() {
+            return zero_result();
         }
 
         // Compute median FWHM for aperture sizing
