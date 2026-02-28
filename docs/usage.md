@@ -48,6 +48,7 @@ let result = analyzer.analyze("light_001.fits")?;
 | `without_gaussian_fit()` | Gaussian fit enabled | Use fast windowed-moments instead of iterative Gaussian fitting for FWHM/eccentricity. Less accurate but faster. |
 | `with_background_mesh(usize)` | Global background | Enable mesh-grid background estimation with the given cell size in pixels. Handles uneven backgrounds and gradients. Cell size clamped to minimum 16. |
 | `without_debayer()` | Debayer enabled | Skip debayering for OSC images. Faster but less accurate — analysis runs on the raw Bayer mosaic. |
+| `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection (Path A). Lower = more aggressive. The raw `trail_r_squared` is always reported regardless of this setting. Clamped to 0.0-1.0. |
 | `with_thread_pool(Arc<ThreadPool>)` | Global rayon pool | Route all parallel work through a custom rayon thread pool. |
 
 ### When to Adjust
@@ -102,6 +103,8 @@ be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
 | `snr_db` | `f32` | Image-wide SNR in decibels: `20 * log10(mean_signal / noise)`. Comparable to PixInsight SNRViews. |
 | `snr_weight` | `f32` | PixInsight-style SNR weight: `(MeanDev / noise)^2`. Useful for weighting frames in stacking. |
 | `psf_signal` | `f32` | PSF signal strength: `median(star_peaks) / noise`. Higher = better signal. |
+| `trail_r_squared` | `f32` | Rayleigh R² statistic for directional coherence of star position angles. 0.0 = uniform (no trail), 1.0 = all aligned (strong trail). |
+| `possibly_trailed` | `bool` | True if the image is likely trailed (R² above threshold or eccentricity-gated Rayleigh fires). |
 
 ### `StarMetrics`
 

@@ -79,6 +79,13 @@ pub struct AnalysisResult {
     pub snr_weight: f32,
     /// PSF signal: median(star_peaks) / noise.
     pub psf_signal: f32,
+    /// Rayleigh R² statistic for directional coherence of star position angles.
+    /// 0.0 = uniform (no trail), 1.0 = all stars aligned (strong trail).
+    /// Computed from detection-stage stamp moments on 2θ.
+    pub trail_r_squared: f32,
+    /// True if the image is likely trailed, based on the Rayleigh test.
+    /// Uses configurable R² threshold (default 0.5) and eccentricity gate.
+    pub possibly_trailed: bool,
 }
 
 /// Builder configuration for analysis (internal).
@@ -92,6 +99,7 @@ pub struct AnalysisConfig {
     background_mesh_size: Option<usize>,
     apply_debayer: bool,
     max_eccentricity: f32,
+    trail_r_squared_threshold: f32,
 }
 
 /// Image analyzer with builder pattern.
@@ -113,6 +121,7 @@ impl ImageAnalyzer {
                 background_mesh_size: None,
                 apply_debayer: true,
                 max_eccentricity: 0.5,
+                trail_r_squared_threshold: 0.5,
             },
             thread_pool: None,
         }
@@ -170,6 +179,14 @@ impl ImageAnalyzer {
     /// Default: 0.5. Set to 1.0 to disable.
     pub fn with_max_eccentricity(mut self, ecc: f32) -> Self {
         self.config.max_eccentricity = ecc.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set the R² threshold for trail detection.
+    /// Images with Rayleigh R² above this are flagged as possibly trailed.
+    /// Default: 0.5. Lower values are more aggressive (more false positives).
+    pub fn with_trail_threshold(mut self, threshold: f32) -> Self {
+        self.config.trail_r_squared_threshold = threshold.clamp(0.0, 1.0);
         self
     }
 
@@ -282,6 +299,44 @@ impl ImageAnalyzer {
         let stars_detected = detected.len();
         let detection_threshold = self.config.detection_sigma * bg_result.noise;
 
+        // ── Phase 1: Image-level trailing detection (Rayleigh test) ─────
+        // Compute R² and advisory flag; never reject — let callers decide.
+        //
+        // Two paths flag trailing via Rayleigh test on 2θ:
+        //
+        // Path A — Strong R² (> threshold): Flag regardless of eccentricity.
+        //   Real trails produce R² > 0.7 (strong directional coherence).
+        //   Grid-induced coherence gives R² ≈ 0.15 (undersampled) to 0.40
+        //   (oversampled with field-angle effects like coma/curvature).
+        //
+        // Path B — Eccentricity-gated (median ecc > 0.6): standard Rayleigh.
+        //   For undersampled stars, moments are noisy and theta has grid bias.
+        //   Only flag when blobs are genuinely elongated (ecc > 0.6).
+        let (trail_r_squared, possibly_trailed) = if detected.len() >= 5 {
+            let n = detected.len();
+            let (sum_cos, sum_sin) =
+                detected
+                    .iter()
+                    .fold((0.0f64, 0.0f64), |(sc, ss), s| {
+                        let a = 2.0 * s.theta as f64;
+                        (sc + a.cos(), ss + a.sin())
+                    });
+            let r_sq = (sum_cos * sum_cos + sum_sin * sum_sin) / (n as f64 * n as f64);
+            let p = (-(n as f64) * r_sq).exp();
+
+            let mut eccs: Vec<f32> = detected.iter().map(|s| s.eccentricity).collect();
+            eccs.sort_unstable_by(|a, b| a.total_cmp(b));
+            let median_ecc = eccs[eccs.len() / 2];
+
+            let threshold = self.config.trail_r_squared_threshold as f64;
+            let trailed = (r_sq > threshold && p < 0.01)
+                || (median_ecc > 0.6 && p < 0.05);
+
+            (r_sq as f32, trailed)
+        } else {
+            (0.0, false)
+        };
+
         let zero_result = || {
             Ok(AnalysisResult {
                 width,
@@ -299,48 +354,13 @@ impl ImageAnalyzer {
                 snr_db: snr::compute_snr_db(&lum, bg_result.noise),
                 snr_weight: snr::compute_snr_weight(&lum, bg_result.background, bg_result.noise),
                 psf_signal: 0.0,
+                trail_r_squared,
+                possibly_trailed,
             })
         };
 
         if stars_detected == 0 {
             return zero_result();
-        }
-
-        // ── Phase 1: Image-level trailing detection (Rayleigh test) ─────
-        // Two paths to trail rejection via Rayleigh test on 2θ:
-        //
-        // Path A — Strong R² (> 0.3): Reject regardless of eccentricity.
-        //   Real trails produce R² > 0.5 (strong directional coherence).
-        //   Grid-induced coherence on undersampled stars gives R² ≈ 0.15.
-        //   This path catches oversampled trails where individual CCL knots
-        //   have low eccentricity but consistent theta.
-        //
-        // Path B — Eccentricity-gated (median ecc > 0.6): standard Rayleigh.
-        //   For undersampled stars, moments are noisy and theta has grid bias.
-        //   Only test when blobs are genuinely elongated (ecc > 0.6), which
-        //   exceeds the undersampled baseline (~0.3-0.4).
-        if detected.len() >= 5 {
-            let n = detected.len();
-            let (sum_cos, sum_sin) =
-                detected
-                    .iter()
-                    .fold((0.0f64, 0.0f64), |(sc, ss), s| {
-                        let a = 2.0 * s.theta as f64;
-                        (sc + a.cos(), ss + a.sin())
-                    });
-            let r_sq = (sum_cos * sum_cos + sum_sin * sum_sin) / (n as f64 * n as f64);
-            let p = (-(n as f64) * r_sq).exp();
-
-            let mut eccs: Vec<f32> = detected.iter().map(|s| s.eccentricity).collect();
-            eccs.sort_unstable_by(|a, b| a.total_cmp(b));
-            let median_ecc = eccs[eccs.len() / 2];
-
-            let reject = (r_sq > 0.3 && p < 0.01)
-                || (median_ecc > 0.6 && p < 0.05);
-
-            if reject {
-                return zero_result();
-            }
         }
 
         // Measure PSF metrics
@@ -419,6 +439,8 @@ impl ImageAnalyzer {
             snr_db,
             snr_weight,
             psf_signal,
+            trail_r_squared,
+            possibly_trailed,
         })
     }
 }

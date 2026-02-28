@@ -47,9 +47,10 @@ FITS / XISF File
        |
        v
 +----------------------------+
-| Trail Rejection            |  Rayleigh test on position angles (2 theta)
+| Trail Detection            |  Rayleigh test on position angles (2 theta)
 | (Phase 1: image-level)     |  Dual-path: strong R^2 OR eccentricity-gated
-| -> zero result if trailing |
+| -> trail_r_squared         |  Advisory only — never rejects, always continues
+| -> possibly_trailed flag   |
 +----------------------------+
        |
        v
@@ -98,24 +99,27 @@ FITS / XISF File
 | SNR              | `snr.rs`          | Per-star and image-wide SNR computations      |
 | Orchestration    | `mod.rs`          | Builder API, trail rejection, pipeline wiring |
 
-## Trail Rejection
+## Trail Detection
 
-The pipeline has a two-phase strategy for rejecting trailed images:
+The pipeline has a two-phase strategy for handling trailed images:
 
 **Phase 1 — Image-level Rayleigh test** (in `mod.rs`, before PSF measurement):
 
 Detects directional coherence across all detected stars using circular statistics
-on position angles. If the position angles of all detected blobs point the same
-direction, the image is trailed and the pipeline returns a zero result (no stars).
+on position angles. Computes an R² statistic and advisory `possibly_trailed` flag.
+The pipeline **always continues** to PSF measurement regardless of the flag — the
+caller decides whether to reject based on `trail_r_squared` and `possibly_trailed`.
 
-Two rejection paths cover different regimes:
+Two detection paths cover different regimes:
 
 | Path | Condition | Catches |
 |------|-----------|---------|
-| A — Strong coherence | R^2 > 0.3 AND p < 0.01 | Oversampled trails (low-ecc knots, consistent theta) |
+| A — Strong coherence | R^2 > threshold AND p < 0.01 | Trails with consistent theta (low-ecc knots) |
 | B — Eccentricity-gated | median ecc > 0.6 AND p < 0.05 | Undersampled trails (elongated blobs) |
 
-See [Trail Rejection](trail-rejection.md) for the full algorithm and rationale.
+The Path A threshold defaults to 0.5 and is configurable via `with_trail_threshold()`.
+
+See [Trail Detection](trail-rejection.md) for the full algorithm and rationale.
 
 **Phase 2 — Per-star eccentricity filter** (after PSF measurement):
 

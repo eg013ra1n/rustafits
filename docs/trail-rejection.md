@@ -1,8 +1,13 @@
-# Trail Rejection (Rayleigh Test)
+# Trail Detection (Rayleigh Test)
 
 Image-level detection of satellite trails, tracking errors, and wind shake using
-circular statistics on star position angles. Rejects entire images where stars
-show coherent directional elongation.
+circular statistics on star position angles. Reports an advisory flag and raw R²
+statistic — the caller decides whether to reject.
+
+> **Changed in v0.4.5:** The Rayleigh test is now **advisory**. It no longer
+> rejects images (returns zero-result). Instead it always computes full metrics
+> and exposes `trail_r_squared` and `possibly_trailed` on `AnalysisResult`.
+> The R² threshold is configurable via `with_trail_threshold()` (default 0.5).
 
 ## The Problem
 
@@ -41,11 +46,12 @@ null hypothesis of uniform random angles.
 ### Minimum Star Count
 
 The test requires at least 5 detected stars. Below this, there are too few samples
-for meaningful circular statistics and the test is skipped.
+for meaningful circular statistics and the test is skipped (`trail_r_squared = 0.0`,
+`possibly_trailed = false`).
 
 ---
 
-## Dual-Path Rejection
+## Dual-Path Detection
 
 A single threshold does not work for all images because undersampled stars
 (FWHM < 3 px) produce grid-induced theta coherence — the pixel grid geometry
@@ -60,25 +66,31 @@ This creates a regime-dependent false positive problem:
 | Oversampled, round | Smooth, circular | Random (R^2 ~ 1/n) | No risk |
 | Oversampled, trailed | Smooth, elongated knots | Trail-coherent (R^2 > 0.5) | Missed by ecc gate |
 
-The solution is two rejection paths:
+The solution is two detection paths:
 
-### Path A — Strong Directional Coherence (R^2 > 0.3)
+### Path A — Strong Directional Coherence (R^2 > threshold)
 
 ```
-Reject if:  R^2 > 0.3  AND  p < 0.01
+Flag if:  R^2 > threshold  AND  p < 0.01
 ```
 
-Real satellite/tracking trails produce R^2 > 0.5 (strong coherence). Grid-induced
-coherence on undersampled round stars gives R^2 ~ 0.15, well below the 0.3 threshold.
+The threshold defaults to 0.5 and is configurable via `with_trail_threshold()`.
 
-This path catches **oversampled trails** where individual CCL knots have low
-eccentricity (~0.3-0.5) but consistent theta. Without this path, the eccentricity
-gate (Path B) would never fire and such trails would slip through.
+Real satellite/tracking trails produce R^2 > 0.7 (strong coherence). Grid-induced
+coherence on non-trailed stars varies by regime:
+- Undersampled round stars (FWHM ~ 2 px): R^2 ~ 0.15
+- Oversampled stars with field-angle effects (FWHM ~ 5 px): R^2 up to 0.40
+
+The default 0.5 threshold sits above both regimes while still catching real trails.
+
+This path catches **trails** where individual CCL knots have low eccentricity
+(~0.3-0.5) but consistent theta. Without this path, the eccentricity gate
+(Path B) would never fire and such trails would slip through.
 
 ### Path B — Eccentricity-Gated Rayleigh (median ecc > 0.6)
 
 ```
-Reject if:  median_eccentricity > 0.6  AND  p < 0.05
+Flag if:  median_eccentricity > 0.6  AND  p < 0.05
 ```
 
 For undersampled stars, stamp-based moments are noisy and theta has grid bias.
@@ -91,12 +103,47 @@ is clearly above the noise floor.
 ### Combined Decision
 
 ```
-reject = (R^2 > 0.3 AND p < 0.01)           -- Path A
-      OR (median_ecc > 0.6 AND p < 0.05)    -- Path B
+possibly_trailed = (R^2 > threshold AND p < 0.01)    -- Path A
+                OR (median_ecc > 0.6 AND p < 0.05)   -- Path B
 ```
 
 Both paths compute the same Rayleigh statistic from the same star list; they
 differ only in their activation criteria and p-value threshold.
+
+---
+
+## API Surface
+
+The Rayleigh test result is exposed via two fields on `AnalysisResult`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `trail_r_squared` | `f32` | Raw R² statistic. 0.0 = uniform, 1.0 = perfectly aligned. |
+| `possibly_trailed` | `bool` | True if either detection path fired. |
+
+The R² threshold for Path A is configurable:
+
+```rust
+let analyzer = ImageAnalyzer::new()
+    .with_trail_threshold(0.4);  // more aggressive (more false positives)
+```
+
+The `trail_r_squared` value is always computed regardless of the threshold setting,
+so callers can implement their own logic:
+
+```rust
+let result = ImageAnalyzer::new().analyze("frame.fits")?;
+
+// Use the built-in flag
+if result.possibly_trailed {
+    println!("Warning: possible trail (R²={:.3})", result.trail_r_squared);
+}
+
+// Or apply a custom threshold
+if result.trail_r_squared > 0.6 {
+    // reject with stricter threshold
+}
+```
 
 ---
 
@@ -106,28 +153,30 @@ differ only in their activation criteria and p-value threshold.
 
 ```
 Detected: 200 stars
-Median eccentricity: ~0.39
+Median eccentricity: ~0.48
 R^2: ~0.15 (grid-induced)
 p: ~0 (statistically significant but weak)
 
-Path A: R^2 = 0.15 < 0.3 --> does not fire
-Path B: median_ecc = 0.39 < 0.6 --> does not fire
+Path A: R^2 = 0.15 < 0.5 --> does not fire
+Path B: median_ecc = 0.48 < 0.6 --> does not fire
 
-Result: PASSES (correct — this is a good image)
+Result: possibly_trailed = false, trail_r_squared = 0.15
+        Full metrics computed normally.
 ```
 
 ### Good image, oversampled stars (FWHM ~ 5 px)
 
 ```
-Detected: 150 stars
-Median eccentricity: ~0.15
-R^2: ~0.01 (random theta)
-p: ~0.22
+Detected: 200 stars
+Median eccentricity: ~0.55
+R^2: ~0.37 (field-angle effects: coma, curvature)
+p: ~0
 
-Path A: R^2 = 0.01 < 0.3 --> does not fire
-Path B: median_ecc = 0.15 < 0.6 --> does not fire
+Path A: R^2 = 0.37 < 0.5 --> does not fire
+Path B: median_ecc = 0.55 < 0.6 --> does not fire
 
-Result: PASSES (correct)
+Result: possibly_trailed = false, trail_r_squared = 0.37
+        Full metrics computed normally.
 ```
 
 ### Trailed image, oversampled (tracking drift)
@@ -138,10 +187,11 @@ Median eccentricity: ~0.45
 R^2: ~0.70 (strong coherence — all stars elongated same direction)
 p: ~0 (exp(-70))
 
-Path A: R^2 = 0.70 > 0.3 AND p < 0.01 --> FIRES
+Path A: R^2 = 0.70 > 0.5 AND p < 0.01 --> FIRES
 Path B: median_ecc = 0.45 < 0.6 --> does not fire
 
-Result: REJECTED by Path A (correct — oversampled trail caught)
+Result: possibly_trailed = true, trail_r_squared = 0.70
+        Full metrics still computed — caller decides whether to reject.
 ```
 
 ### Trailed image, undersampled (wind shake)
@@ -149,29 +199,33 @@ Result: REJECTED by Path A (correct — oversampled trail caught)
 ```
 Detected: 80 stars
 Median eccentricity: ~0.72
-R^2: ~0.55
+R^2: ~0.65
 p: ~0
 
-Path A: R^2 = 0.55 > 0.3 --> FIRES
+Path A: R^2 = 0.65 > 0.5 --> FIRES
 Path B: median_ecc = 0.72 > 0.6 AND p < 0.05 --> ALSO FIRES
 
-Result: REJECTED by both paths (correct — obvious trail)
+Result: possibly_trailed = true, trail_r_squared = 0.65
+        Full metrics still computed.
 ```
 
 ---
 
-## Why R^2 = 0.3 as the Path A Threshold?
+## Why R^2 = 0.5 as the Default Threshold?
 
 The threshold needs to be:
-- **Above** grid-induced coherence (~0.15 for typical undersampled images)
-- **Below** real trail coherence (> 0.5 for even moderate trails)
+- **Above** non-trail coherence sources (grid effects, field-angle aberrations)
+- **Below** real trail coherence (> 0.7 for tracking/wind trails)
 
-The value 0.3 sits in the gap between these regimes. It corresponds to roughly 55%
-of stars having coherent theta, which is unlikely to occur from noise or grid effects
-alone but is easily achieved by a real tracking error.
+Non-trail coherence sources measured on real data:
+- Undersampled round stars (FWHM ~ 2 px): R^2 ~ 0.04-0.24 (grid-induced)
+- Oversampled stars with field-angle effects (FWHM ~ 5 px): R^2 ~ 0.32-0.40
+  (coma, field curvature create systematic elongation patterns that are NOT trailing)
 
-For reference, the expected R^2 under uniformity is 1/n (e.g., 0.005 for n=200),
-and grid-induced bias adds ~0.10-0.15 on top of that.
+The value 0.5 sits above both regimes. It corresponds to roughly 70% of stars
+having coherent theta, which only occurs with real tracking errors or wind shake.
+
+For reference, the expected R^2 under uniformity is 1/n (e.g., 0.005 for n=200).
 
 ---
 
@@ -207,7 +261,7 @@ knots, while the Gaussian fitter only fits theta for obviously elliptical stars.
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
 | Minimum stars | 5 | Below this, circular statistics unreliable |
-| Path A R^2 threshold | 0.3 | Above grid noise (~0.15), below real trails (>0.5) |
+| Path A R^2 threshold | 0.5 (default, configurable) | Above non-trail coherence (~0.40), below real trails (>0.7) |
 | Path A p threshold | 0.01 | Strict — high confidence required |
 | Path B ecc threshold | 0.6 | Above undersampled baseline (~0.3-0.4) |
 | Path B p threshold | 0.05 | Standard significance level |
