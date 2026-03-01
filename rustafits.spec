@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.4.5
+Version:        0.5.5
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,17 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Sun Mar 01 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.5.5-1
+- Add per-star PSF position angle (theta) to StarMetrics
+- Fix analysis pipeline panics on real-world FITS images
+- Add dual-path Rayleigh trail rejection for under- and oversampled stars
+- Make trail detection advisory: expose R² and possibly_trailed on AnalysisResult
+- Add green-channel interpolation and green-pixel-only PSF fitting for OSC
+- Add star annotation overlay with 3-tier API and CLI support
+- Add peak-based deblending for crowded-field star detection
+- Add single-read path for annotated image generation
+- Fix deblending regression on extended objects
+
 * Thu Feb 26 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.4.5-1
 - Add RGBA output support (with_rgba_output, channels field on ProcessedImage)
 - SSSE3 gray-to-RGB on x86_64 (replaces scalar fallback)

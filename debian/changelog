@@ -1,3 +1,17 @@
+rustafits (0.5.5-1) unstable; urgency=medium
+
+  * Add per-star PSF position angle (theta) to StarMetrics
+  * Fix analysis pipeline panics on real-world FITS images
+  * Add dual-path Rayleigh trail rejection for under- and oversampled stars
+  * Make trail detection advisory: expose R² and possibly_trailed on AnalysisResult
+  * Add green-channel interpolation and green-pixel-only PSF fitting for OSC
+  * Add star annotation overlay with 3-tier API and CLI support
+  * Add peak-based deblending for crowded-field star detection
+  * Add single-read path for annotated image generation
+  * Fix deblending regression on extended objects
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Sun, 01 Mar 2026 00:00:00 +0000
+
 rustafits (0.4.5-1) unstable; urgency=medium
 
   * Add RGBA output support (with_rgba_output, channels field on ProcessedImage)
