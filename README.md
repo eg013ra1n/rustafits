@@ -154,6 +154,28 @@ Three API tiers for different integration needs:
 | `create_annotation_layer()` | `Vec<u8>` (RGBA) | Transparent overlay for toggleable layer compositing |
 | `annotate_image()` | modifies `ProcessedImage` | Burn-in for CLI or one-shot use |
 
+**`compute_annotations(result, width, height, flip_vertical, config)`** — Transforms star positions from analysis coordinates to output image coordinates (handling debayer scaling, downscale, and vertical flip), computes ellipse semi-axes from `fwhm_x`/`fwhm_y`, and assigns colors. Returns `Vec<StarAnnotation>` where each entry contains `x`, `y`, `semi_major`, `semi_minor`, `theta`, `eccentricity`, `fwhm`, and `color` — everything needed to draw the ellipse in any rendering system.
+
+**`create_annotation_layer(result, width, height, flip_vertical, config)`** — Calls `compute_annotations()` internally, then rasterizes all ellipses and direction ticks onto a transparent RGBA buffer (same dimensions as the output image). Use as a compositable layer that can be toggled on/off without re-rendering the base image.
+
+**`annotate_image(image, result, config)`** — Calls `compute_annotations()` internally, then draws directly onto the `ProcessedImage.data` buffer (RGB or RGBA). Reads `image.flip_vertical` automatically. Simplest path — one call, image modified in place.
+
+**`ImageConverter::save_processed(image, path, quality)`** — Saves a `ProcessedImage` to disk as JPEG or PNG. Use after `annotate_image()` or any other post-processing on the pixel buffer.
+
+#### AnnotationConfig fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `color_scheme` | `Eccentricity` | `Eccentricity` (tracking/optics), `Fwhm` (focus), or `Uniform` (all green) |
+| `show_direction_tick` | `true` | Draw ticks along elongation axis (visible when ecc > 0.15) |
+| `min_radius` | `6.0` | Minimum ellipse semi-axis in output pixels |
+| `max_radius` | `60.0` | Maximum ellipse semi-axis in output pixels |
+| `line_width` | `2` | Line thickness: `1` = 1px, `2` = 3px cross, `3` = 5px diamond |
+| `ecc_good` | `0.5` | Eccentricity at or below this is green (good) |
+| `ecc_warn` | `0.6` | Eccentricity between good and warn is yellow; above is red |
+| `fwhm_good` | `1.3` | FWHM ratio (star/median) below this is green |
+| `fwhm_warn` | `2.0` | FWHM ratio between good and warn is yellow; above is red |
+
 See [Annotation Documentation](docs/annotation.md) for full API reference, integration examples, and coordinate transform details.
 
 ### Builder methods
