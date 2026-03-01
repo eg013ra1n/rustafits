@@ -228,7 +228,7 @@ pub(crate) fn detect_stars(
             peak_map.entry(l).or_default().push((px, py));
         } else {
             // Peak might be just off — check neighbors, add to first found label
-            for dy in -1i32..=1 {
+            'search: for dy in -1i32..=1 {
                 for dx in -1i32..=1 {
                     let nx = px as i32 + dx;
                     let ny = py as i32 + dy;
@@ -236,7 +236,7 @@ pub(crate) fn detect_stars(
                         let l2 = labels[ny as usize * width + nx as usize];
                         if l2 > 0 {
                             peak_map.entry(l2).or_default().push((px, py));
-                            break;
+                            break 'search;
                         }
                     }
                 }
@@ -259,13 +259,15 @@ pub(crate) fn detect_stars(
     let mut stars = Vec::new();
     for (label, pixels) in &components {
         let peaks = &peak_map[label];
-        if peaks.len() <= 1 {
-            // Single peak (or zero — shouldn't happen): process as-is
+        if peaks.len() <= 1 || pixels.len() > params.max_star_area {
+            // Single peak, or component too large to be merged stars: process as whole.
+            // Extended objects (comet comae, nebulae) create huge CCL blobs with many
+            // convolution peaks — deblending would produce false detections.
             if let Some(star) = process_component(pixels, data, width, height, background, bg_map, params) {
                 stars.push(star);
             }
         } else {
-            // Multi-peak: split by nearest peak (Voronoi tessellation)
+            // Multi-peak with reasonable per-peak size: split by nearest peak (Voronoi tessellation)
             let mut subs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); peaks.len()];
             for &(x, y) in pixels {
                 let nearest = peaks
@@ -662,5 +664,90 @@ mod tests {
                 sx, sy, closest
             );
         }
+    }
+
+    #[test]
+    fn test_no_deblend_extended_object() {
+        // Large extended Gaussian "coma" at center + 5 real point-source stars
+        // in the dark sky. The coma should NOT be deblended into false stars.
+        let width = 300;
+        let height = 300;
+        let background = 1000.0;
+        let noise = 30.0;
+
+        // Point-source stars well away from center
+        let star_defs = vec![
+            (30.0, 30.0, 5000.0, 1.5),
+            (270.0, 30.0, 6000.0, 1.5),
+            (30.0, 270.0, 4000.0, 1.5),
+            (270.0, 270.0, 7000.0, 1.5),
+            (150.0, 30.0, 5500.0, 1.5),
+        ];
+
+        let mut data = make_star_field(width, height, &star_defs, background, noise);
+
+        // Add a large extended coma (sigma=20) at the center — well above max_star_area
+        let coma_x = 150.0_f32;
+        let coma_y = 150.0_f32;
+        let coma_amp = 3000.0_f32;
+        let coma_sigma = 20.0_f32;
+        let coma_r = (4.0 * coma_sigma).ceil() as i32;
+        let inv_2s2 = 1.0 / (2.0 * coma_sigma * coma_sigma);
+        for dy in -coma_r..=coma_r {
+            for dx in -coma_r..=coma_r {
+                let px = coma_x as i32 + dx;
+                let py = coma_y as i32 + dy;
+                if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
+                    let ddx = px as f32 - coma_x;
+                    let ddy = py as f32 - coma_y;
+                    data[py as usize * width + px as usize] +=
+                        coma_amp * (-inv_2s2 * (ddx * ddx + ddy * ddy)).exp();
+                }
+            }
+        }
+
+        let params = DetectionParams {
+            detection_sigma: 5.0,
+            min_star_area: 5,
+            max_star_area: 2000,
+            saturation_limit: 0.95 * 65535.0,
+            max_stars: 200,
+        };
+
+        let stars = detect_stars(&data, width, height, background, noise, None, &params);
+
+        // All 5 real stars should be detected
+        for &(sx, sy, _, _) in &star_defs {
+            let closest = stars
+                .iter()
+                .map(|s| {
+                    let dx = s.x - sx;
+                    let dy = s.y - sy;
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .min_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap();
+            assert!(
+                closest < 2.0,
+                "Star at ({}, {}) not found within 2px (closest={})",
+                sx, sy, closest
+            );
+        }
+
+        // No false detections in the coma region (within 40px of center)
+        let coma_detections: Vec<_> = stars
+            .iter()
+            .filter(|s| {
+                let dx = s.x - coma_x;
+                let dy = s.y - coma_y;
+                (dx * dx + dy * dy).sqrt() < 40.0
+            })
+            .collect();
+        assert!(
+            coma_detections.is_empty(),
+            "Expected no detections in coma region, got {} (positions: {:?})",
+            coma_detections.len(),
+            coma_detections.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>()
+        );
     }
 }

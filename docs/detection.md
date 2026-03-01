@@ -82,6 +82,13 @@ independently for centroid, flux, and area.
 Single-peak components — the vast majority — pass through unchanged, so the
 deblending step adds negligible overhead in uncrowded images.
 
+An area guard prevents deblending of extended objects: if the component's
+total area exceeds `max_star_area`, deblending is skipped and the component
+is processed as a whole (and rejected by the area filter). This avoids
+Voronoi splitting of large blobs like comet comae, which would otherwise
+produce high-flux false detections that displace real stars from the top-N
+list.
+
 ---
 
 ## Stage 2: Connected Component Labeling
