@@ -47,7 +47,7 @@ let result = analyzer.analyze("light_001.fits")?;
 | `with_max_stars(usize)` | 200 | Keep only the brightest N stars. Clamped to minimum 1. |
 | `without_gaussian_fit()` | Gaussian fit enabled | Use fast windowed-moments instead of iterative Gaussian fitting for FWHM/eccentricity. Less accurate but faster. |
 | `with_background_mesh(usize)` | Global background | Enable mesh-grid background estimation with the given cell size in pixels. Handles uneven backgrounds and gradients. Cell size clamped to minimum 16. |
-| `without_debayer()` | Debayer enabled | Skip debayering for OSC images. Faster but less accurate — analysis runs on the raw Bayer mosaic. |
+| `without_debayer()` | Debayer enabled | Skip green-channel interpolation for OSC images. By default, OSC images get native-resolution green interpolation + green-pixel-only fitting. This flag disables both, running analysis directly on the raw Bayer mosaic (faster but less accurate). |
 | `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection (Path A). Lower = more aggressive. The raw `trail_r_squared` is always reported regardless of this setting. Clamped to 0.0-1.0. |
 | `with_thread_pool(Arc<ThreadPool>)` | Global rayon pool | Route all parallel work through a custom rayon thread pool. |
 
@@ -59,6 +59,7 @@ let result = analyzer.analyze("light_001.fits")?;
 - **Nebula regions** — lower `max_star_area` to avoid detecting bright nebula knots as stars.
 - **Speed over accuracy** — use `without_gaussian_fit()` and `without_debayer()`.
 - **Strong gradients** — enable `with_background_mesh(64)` (typical cell sizes: 32-128).
+- **OSC images** — green-channel interpolation and green-pixel-only fitting are applied automatically. No configuration needed. FWHM accuracy is within ~5% of PixInsight.
 
 ## Analyzing Raw Data
 

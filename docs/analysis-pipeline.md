@@ -21,13 +21,16 @@ FITS / XISF File
        |
        v
 +------------------+
-| Debayer (if OSC) |  Super-pixel: 2x2 Bayer -> 1 RGB pixel (half resolution)
+| Green Interp     |  OSC: native-resolution green-channel interpolation
+| (if OSC)         |  Green CFA pixels keep original values; R/B pixels get
+|                  |  distance-weighted average of green neighbors (3×3)
+|                  |  Also builds green_mask for measurement filtering
 +------------------+
        |
        v
 +------------------+
-| Extract Lum      |  L = 0.2126R + 0.7152G + 0.0722B  (ITU Rec.709)
-| (if RGB)         |  Mono images skip this step
+| Extract Lum      |  RGB (via analyze_data): L = 0.2126R + 0.7152G + 0.0722B
+| (if RGB)         |  Mono and OSC images skip this step
 +------------------+
        |
        v
@@ -58,7 +61,8 @@ FITS / XISF File
 | PSF Measurement (per star) |  Extract stamp around each star
 | -> FWHM (x, y, geometric) |  2D Gaussian fit (default) or windowed moments
 | -> Eccentricity            |  Moments-based theta (always)
-| -> HFR, theta              |
+| -> HFR, theta              |  OSC: only green CFA pixels fed to fitter
+|                            |  (eliminates interpolation broadening)
 +----------------------------+
        |
        v
@@ -129,13 +133,16 @@ artifacts that survived Phase 1.
 
 ## PixInsight Comparison
 
-| Metric              | PixInsight Tool            | Our Equivalent        | mono.fits |
-|---------------------|----------------------------|-----------------------|-----------|
-| FWHM                | FWHMEccentricity           | `median_fwhm`         | ~2.16 px  |
-| Eccentricity        | FWHMEccentricity           | `median_eccentricity` | ~0.35     |
-| Image SNR           | SNRViews (dB)              | `snr_db`              | ~27.7 dB  |
-| SNR Weight          | SubframeSelector           | `snr_weight`          | ~1.1      |
-| PSF Signal          | SubframeSelector           | `psf_signal`          | ~383      |
+| Metric              | PixInsight Tool            | Our Equivalent        | mono.fits | osc.fits  |
+|---------------------|----------------------------|-----------------------|-----------|-----------|
+| FWHM                | FWHMEccentricity           | `median_fwhm`         | ~2.14 px  | ~2.61 px  |
+| FWHM (PI)           | FWHMEccentricity           | —                     | ~2.16 px  | ~2.73 px  |
+| Eccentricity        | FWHMEccentricity           | `median_eccentricity` | ~0.35     | —         |
+| Image SNR           | SNRViews (dB)              | `snr_db`              | ~27.7 dB  | —         |
+| SNR Weight          | SubframeSelector           | `snr_weight`          | ~1.1      | —         |
+| PSF Signal          | SubframeSelector           | `psf_signal`          | ~383      | —         |
+
+FWHM accuracy: mono ~1% vs PixInsight, OSC ~5% vs PixInsight.
 
 See individual algorithm documents for full details:
 

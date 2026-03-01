@@ -29,6 +29,30 @@ Input: detected star (centroid, area), luminance image, background
   stamp[], stamp_width, stamp_height, relative centroid (cx, cy)
 ```
 
+## Green-Pixel-Only Fitting (OSC)
+
+For OSC (Bayer) images, the analysis pipeline uses green-channel interpolation to
+produce a native-resolution mono image. However, R/B pixel positions contain
+interpolated values — feeding these into the PSF fitter broadens the measured
+FWHM by ~6% because interpolation smooths the profile.
+
+To avoid this, a `green_mask` marks which pixels are real green CFA positions.
+During PSF measurement, only green pixels are used:
+
+**What's filtered (green-only):**
+- Gaussian fit pixel samples (`PixelSample` collection)
+- Windowed moments centroid refinement and second-moment summation
+- HFR intensity-weighted distance computation
+
+**What's NOT filtered (all pixels used):**
+- `estimate_sigma_halfmax` — uses bilinear interpolation along 8 radial rays
+  for initial sigma. Interpolated values are fine for this coarse estimate.
+
+**Pixel density:** A Bayer pattern has 50% green pixels. For a typical star with
+FWHM ~2.7 px, the fitting radius (~4σ ≈ 4.6 px) captures ~67 pixels total,
+of which ~33 are green. This is more than sufficient for the 7-parameter
+Gaussian fit (minimum 10 samples required).
+
 ## Half-Flux Radius (HFR)
 
 A non-parametric measure of star size: the intensity-weighted mean distance from centroid.
@@ -42,6 +66,9 @@ where:
   w_i = max(0, pixel_i - background)     intensity weight
   d_i = sqrt((x_i - cx)^2 + (y_i - cy)^2)   distance from centroid
 ```
+
+**OSC filtering:** When a `green_mask` is present, only green CFA pixels contribute
+to the HFR sum (see [Green-Pixel-Only Fitting](#green-pixel-only-fitting-osc)).
 
 **Interpretation:** For a Gaussian PSF with FWHM=F, HFR ~ 0.67 * FWHM/2 ~ 0.34*F.
 HFR is more robust than FWHM for non-Gaussian profiles (e.g. coma, defocused stars).
@@ -61,8 +88,9 @@ Star Stamp
     |
     v
 +-----------------------------+
-| Collect PixelSamples        |  (x, y, intensity) for all stamp pixels > 0
-| with background subtraction |
+| Collect PixelSamples        |  (x, y, intensity) for stamp pixels > 0
+| with background subtraction |  OSC: only green CFA pixels (via green_mask)
+|                             |  skips interpolated R/B positions
 +-----------------------------+
     |
     v
@@ -116,6 +144,7 @@ Star Stamp
 | Centroid Refinement (2 iter)|  Two-pass I-weighted centroid:
 |                             |    cx = sum(val * x) / sum(val)
 |                             |    cy = sum(val * y) / sum(val)
+|                             |  OSC: only green CFA pixels (via green_mask)
 +-----------------------------+
     |
     v
@@ -159,12 +188,20 @@ Star Stamp
 - Systematically overestimates FWHM (noise in wings inflates moments)
 - Less accurate eccentricity (no rotation model)
 
-### Method Comparison (mono.fits)
+### Method Comparison
+
+**mono.fits:**
 
 | Metric           | Gaussian Fit | Moments | PixInsight |
 |------------------|-------------|---------|------------|
-| Median FWHM      | 2.18 px     | 4.91 px | 2.16 px    |
+| Median FWHM      | 2.14 px     | 4.91 px | 2.16 px    |
 | Median Ecc       | 0.341       | 0.302   | 0.480      |
+
+**osc.fits (green-pixel-only fitting):**
+
+| Metric           | Gaussian Fit | PixInsight |
+|------------------|-------------|------------|
+| Median FWHM      | 2.61 px     | 2.73 px    |
 
 ---
 

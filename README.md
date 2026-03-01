@@ -11,6 +11,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
+- **Image Analysis**: Star detection, FWHM/HFR/eccentricity measurement, and SNR computation (PixInsight-comparable)
 
 ## Supported Formats
 
@@ -201,6 +202,13 @@ rustafits/
 │   │   ├── mod.rs          # Format dispatch
 │   │   ├── fits.rs         # FITS reader
 │   │   └── xisf.rs         # XISF reader (zlib/LZ4/Zstd)
+│   ├── analysis/
+│   │   ├── mod.rs            # Analyzer builder + pipeline orchestration
+│   │   ├── background.rs     # Background estimation (global + mesh-grid)
+│   │   ├── detection.rs      # Star detection (DAOFIND + CCL)
+│   │   ├── fitting.rs        # Levenberg-Marquardt Gaussian fitting
+│   │   ├── metrics.rs        # FWHM, eccentricity, HFR measurement
+│   │   └── snr.rs            # Per-star and image-wide SNR
 │   └── processing/
 │       ├── mod.rs           # Processing module
 │       ├── stretch.rs       # Auto-stretch (SIMD)

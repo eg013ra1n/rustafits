@@ -118,6 +118,14 @@ The damped normal equations are solved via **Cholesky decomposition** (the matri
 `H + lambda*diag(H)` is symmetric positive-definite). All arithmetic is in f64 for
 numerical stability.
 
+### Input Filtering (OSC)
+
+For OSC (Bayer) images, only green CFA pixels are provided as input samples.
+The caller filters the stamp using a `green_mask` before building the
+`PixelSample` vector. This eliminates ~6% PSF broadening from interpolated
+R/B positions while retaining ~50% of pixels — more than sufficient for the
+7-parameter fit. The fitting algorithm itself is unchanged.
+
 ### Validation
 
 The fit result is rejected (returns `None`) if:
