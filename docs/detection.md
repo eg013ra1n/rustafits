@@ -71,6 +71,17 @@ grid with cell size equal to the kernel radius. For each candidate peak, only ne
 grid cells need to be checked for suppression, giving O(n) instead of O(n^2) pairwise
 comparisons.
 
+### Peak-Based Deblending
+
+In crowded fields the low CCL threshold (1.5 * noise) can merge nearby stars into a
+single connected component. When a component contains multiple detected peaks the
+pipeline splits it by nearest-peak assignment: each pixel is assigned to the peak
+closest to it (Voronoi partitioning), and each resulting sub-component is processed
+independently for centroid, flux, and area.
+
+Single-peak components — the vast majority — pass through unchanged, so the
+deblending step adds negligible overhead in uncrowded images.
+
 ---
 
 ## Stage 2: Connected Component Labeling
@@ -99,7 +110,16 @@ Input: luminance image, peak positions, background, noise
        v
 +-------------------------------+
 | Link Peaks to Components      |  Each peak matched to its component via 3x3 neighborhood
+|                               |  Builds peak_map: label -> list of peak positions
 |                               |  Only components containing a detected peak are kept
++-------------------------------+
+       |
+       v
++-------------------------------+
+| Peak-Based Deblending         |  If component has multiple peaks:
+|                               |    assign each pixel to nearest peak (Voronoi)
+|                               |    process each sub-component independently
+|                               |  Single-peak components: unchanged
 +-------------------------------+
        |
        v

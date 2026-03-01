@@ -44,8 +44,8 @@ FITS / XISF File
        v
 +----------------------------+
 | Star Detection             |  DAOFIND matched filter + Connected Component Labeling
-| -> candidate list          |  Stamp-based theta & eccentricity per star
-| -> sorted by flux          |
+| -> candidate list          |  Peak-based deblending for multi-peak components
+| -> sorted by flux          |  Stamp-based theta & eccentricity per star
 +----------------------------+
        |
        v
