@@ -222,5 +222,6 @@ fn apply_stretch_and_finalize(
         height,
         is_color,
         channels: bpp as u8,
+        flip_vertical: meta.flip_vertical,
     })
 }

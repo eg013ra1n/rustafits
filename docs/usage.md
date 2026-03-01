@@ -147,3 +147,22 @@ let result = analyzer.analyze("light_001.fits")?;
 
 `ThreadPool` and `ThreadPoolBuilder` are re-exported from `rayon` by
 `rustafits`, so you don't need to add `rayon` as a direct dependency.
+
+## Star Annotation Overlay
+
+Analysis results can be visualized as color-coded ellipses on converted images.
+See the [Annotation Documentation](annotation.md) for the full API reference,
+including three tiers of integration (raw geometry, RGBA overlay layer, burn-in)
+and configurable color thresholds.
+
+Quick example:
+
+```rust
+use rustafits::{ImageConverter, ImageAnalyzer, annotate_image, AnnotationConfig};
+
+let mut image = ImageConverter::new().process("light.fits")?;
+let result = ImageAnalyzer::new().analyze("light.fits")?;
+
+annotate_image(&mut image, &result, &AnnotationConfig::default());
+ImageConverter::save_processed(&image, "annotated.jpg", 95)?;
+```

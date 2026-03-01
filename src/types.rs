@@ -37,6 +37,8 @@ pub struct ProcessedImage {
     pub is_color: bool,
     /// Number of channels in `data`: 3 = RGB, 4 = RGBA.
     pub channels: u8,
+    /// Whether the image was vertically flipped during processing.
+    pub flip_vertical: bool,
 }
 
 #[allow(dead_code)]

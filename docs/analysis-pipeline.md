@@ -152,3 +152,4 @@ See individual algorithm documents for full details:
 - [Gaussian Fitting](fitting.md)
 - [PSF Metrics (FWHM, Eccentricity, HFR)](metrics.md)
 - [SNR Computations](snr.md)
+- [Star Annotation Overlay](annotation.md)

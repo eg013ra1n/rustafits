@@ -12,6 +12,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
 - **Image Analysis**: Star detection, FWHM/HFR/eccentricity measurement, and SNR computation (PixInsight-comparable)
+- **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
 
 ## Supported Formats
 
@@ -59,6 +60,9 @@ rustafits large.fits preview.jpg --preview
 # Downscaled output
 rustafits large.fits preview.jpg --downscale 4
 
+# Star annotation overlay
+rustafits image.fits annotated.jpg --annotate --max-stars 500 --log
+
 # Options
 rustafits <input> <output> [OPTIONS]
   --downscale <N>   Downscale factor (default: 1)
@@ -69,6 +73,8 @@ rustafits <input> <output> [OPTIONS]
   --quality <Q>     JPEG quality 1-100 (default: 95)
   --no-debayer      Disable Bayer debayering
   --preview         2x2 binning for mono images
+  --annotate        Overlay star detection ellipses on the output
+  --max-stars <N>   Max stars for annotation analysis (default: 200)
   --log             Show detailed information
 ```
 
@@ -109,6 +115,46 @@ let image: ProcessedImage = ImageConverter::new()
 // image.channels - 3 (RGB) or 4 (RGBA)
 // image.is_color - true if debayered/RGB, false if mono (gray replicated to RGB)
 ```
+
+### Star annotation overlay
+
+Analyze an image for stars and draw color-coded ellipses showing PSF shape and quality:
+
+```rust
+use astroimage::{
+    ImageConverter, ImageAnalyzer,
+    annotate_image, AnnotationConfig, ColorScheme,
+};
+
+let mut image = ImageConverter::new().process("light.fits")?;
+let result = ImageAnalyzer::new()
+    .with_max_stars(500)
+    .analyze("light.fits")?;
+
+// Burn annotations with default settings (eccentricity color coding)
+annotate_image(&mut image, &result, &AnnotationConfig::default());
+
+// Or customize thresholds and color scheme
+let config = AnnotationConfig {
+    color_scheme: ColorScheme::Eccentricity,
+    ecc_good: 0.5,   // ≤ 0.5 → green
+    ecc_warn: 0.6,   // 0.51–0.6 → yellow, > 0.6 → red
+    ..AnnotationConfig::default()
+};
+annotate_image(&mut image, &result, &config);
+
+ImageConverter::save_processed(&image, "annotated.jpg", 95)?;
+```
+
+Three API tiers for different integration needs:
+
+| Function | Returns | Use Case |
+|----------|---------|----------|
+| `compute_annotations()` | `Vec<StarAnnotation>` | Raw geometry for custom rendering (Canvas2D, SwiftUI, SVG) |
+| `create_annotation_layer()` | `Vec<u8>` (RGBA) | Transparent overlay for toggleable layer compositing |
+| `annotate_image()` | modifies `ProcessedImage` | Burn-in for CLI or one-shot use |
+
+See [Annotation Documentation](docs/annotation.md) for full API reference, integration examples, and coordinate transform details.
 
 ### Builder methods
 
@@ -194,6 +240,7 @@ rustafits/
 ├── src/
 │   ├── lib.rs              # Library entry + public API
 │   ├── types.rs            # Core types (PixelData, ProcessedImage, etc.)
+│   ├── annotate.rs         # Star annotation overlay (3-tier API)
 │   ├── converter.rs        # ImageConverter builder
 │   ├── pipeline.rs         # Processing pipeline
 │   ├── output.rs           # JPEG/PNG file output

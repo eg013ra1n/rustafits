@@ -81,6 +81,16 @@ impl ImageConverter {
         .context("Image processing failed")
     }
 
+    /// Save a `ProcessedImage` to disk as JPEG or PNG.
+    pub fn save_processed<P: AsRef<Path>>(
+        image: &ProcessedImage,
+        output_path: P,
+        quality: u8,
+    ) -> Result<()> {
+        output::save_image(image, output_path.as_ref(), quality)
+            .context("Image save failed")
+    }
+
     /// Process a FITS/XISF image and save the result as JPEG or PNG.
     pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use astroimage::ImageConverter;
+use astroimage::{annotate_image, AnnotationConfig, ImageAnalyzer, ImageConverter};
 use std::env;
 use std::process;
 
@@ -17,6 +17,8 @@ fn print_usage(program: &str) {
     eprintln!("  --quality <Q>        JPEG quality 1-100 (default: 95)");
     eprintln!("  --no-debayer         Disable Bayer pattern debayering");
     eprintln!("  --preview            Enable preview mode (2x2 binning for mono, faster)");
+    eprintln!("  --annotate           Overlay star detection ellipses on the output image");
+    eprintln!("  --max-stars <N>      Max stars for annotation analysis (default: 200)");
     eprintln!("  --log                Show detailed conversion information");
     eprintln!();
     eprintln!("Examples:");
@@ -49,6 +51,8 @@ fn run() -> Result<()> {
     let mut quality = 95;
     let mut apply_debayer = true;
     let mut preview_mode = false;
+    let mut annotate = false;
+    let mut max_stars: usize = 200;
     let mut log_enabled = false;
 
     let mut i = 3;
@@ -85,6 +89,22 @@ fn run() -> Result<()> {
             "--preview" => {
                 preview_mode = true;
                 i += 1;
+            }
+            "--annotate" => {
+                annotate = true;
+                i += 1;
+            }
+            "--max-stars" => {
+                if i + 1 >= args.len() {
+                    return Err(anyhow::anyhow!("--max-stars requires a value"));
+                }
+                max_stars = args[i + 1]
+                    .parse::<usize>()
+                    .context("Invalid max-stars value")?;
+                if max_stars == 0 {
+                    return Err(anyhow::anyhow!("--max-stars must be >= 1"));
+                }
+                i += 2;
             }
             "--log" => {
                 log_enabled = true;
@@ -123,9 +143,33 @@ fn run() -> Result<()> {
         converter = converter.with_preview_mode();
     }
 
-    // Perform conversion
-    converter.convert(input_path, output_path)
-        .context("Conversion failed")?;
+    if annotate {
+        // Process image (get mutable ProcessedImage for annotation)
+        let mut image = converter.process(input_path)
+            .context("Image processing failed")?;
+
+        // Run analysis on the same input
+        let result = ImageAnalyzer::new()
+            .with_max_stars(max_stars)
+            .analyze(input_path)
+            .context("Analysis failed")?;
+
+        if log_enabled {
+            println!("Analysis: {} stars detected, median FWHM={:.2}, median ecc={:.3}",
+                result.stars.len(), result.median_fwhm, result.median_eccentricity);
+        }
+
+        // Annotate
+        annotate_image(&mut image, &result, &AnnotationConfig::default());
+
+        // Save
+        astroimage::ImageConverter::save_processed(&image, output_path, quality)
+            .context("Image save failed")?;
+    } else {
+        // Standard conversion
+        converter.convert(input_path, output_path)
+            .context("Conversion failed")?;
+    }
 
     if log_enabled {
         println!("Conversion successful!");
