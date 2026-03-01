@@ -144,14 +144,14 @@ fn run() -> Result<()> {
     }
 
     if annotate {
-        // Process image (get mutable ProcessedImage for annotation)
-        let mut image = converter.process(input_path)
-            .context("Image processing failed")?;
+        // Read raw pixels once, share between analyzer and converter
+        let (meta, pixels) = ImageConverter::read_raw(input_path)
+            .context("Failed to read image")?;
 
-        // Run analysis on the same input
+        // Analyze first (borrows pixels)
         let result = ImageAnalyzer::new()
             .with_max_stars(max_stars)
-            .analyze(input_path)
+            .analyze_raw(&meta, &pixels)
             .context("Analysis failed")?;
 
         if log_enabled {
@@ -159,11 +159,15 @@ fn run() -> Result<()> {
                 result.stars.len(), result.median_fwhm, result.median_eccentricity);
         }
 
+        // Process image (consumes pixels — borrow released above)
+        let mut image = converter.process_data(meta, pixels)
+            .context("Image processing failed")?;
+
         // Annotate
         annotate_image(&mut image, &result, &AnnotationConfig::default());
 
         // Save
-        astroimage::ImageConverter::save_processed(&image, output_path, quality)
+        ImageConverter::save_processed(&image, output_path, quality)
             .context("Image save failed")?;
     } else {
         // Standard conversion

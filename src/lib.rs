@@ -14,4 +14,4 @@ pub use annotate::{
 };
 pub use converter::ImageConverter;
 pub use rayon::{ThreadPool, ThreadPoolBuilder};
-pub use types::ProcessedImage;
+pub use types::{BayerPattern, ImageMetadata, PixelData, ProcessedImage};

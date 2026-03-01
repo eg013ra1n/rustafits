@@ -9,7 +9,14 @@ use crate::types::{BayerPattern, ImageMetadata, PixelData, ProcessConfig, Proces
 
 pub fn process_image(path: &Path, config: &ProcessConfig) -> Result<ProcessedImage> {
     let (meta, pixels) = formats::read_image(path)?;
+    process_image_data(meta, pixels, config)
+}
 
+pub fn process_image_data(
+    meta: ImageMetadata,
+    pixels: PixelData,
+    config: &ProcessConfig,
+) -> Result<ProcessedImage> {
     match pixels {
         PixelData::Uint16(data) => process_u16(data, meta, config),
         PixelData::Float32(data) => process_f32(data, meta, config),

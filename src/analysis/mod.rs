@@ -15,7 +15,7 @@ use crate::formats;
 use crate::processing::color::u16_to_f32;
 use crate::processing::debayer;
 use crate::processing::stretch::find_median;
-use crate::types::{BayerPattern, PixelData};
+use crate::types::{BayerPattern, ImageMetadata, PixelData};
 
 use detection::DetectionParams;
 
@@ -224,6 +224,49 @@ impl ImageAnalyzer {
             }),
             None => self.run_analysis(data, width, height, channels, None),
         }
+    }
+
+    /// Analyze pre-read raw pixel data (skips file I/O).
+    ///
+    /// Accepts `ImageMetadata` and borrows `PixelData`, handling u16→f32
+    /// conversion and green-channel interpolation for OSC images internally.
+    pub fn analyze_raw(
+        &self,
+        meta: &ImageMetadata,
+        pixels: &PixelData,
+    ) -> Result<AnalysisResult> {
+        match &self.thread_pool {
+            Some(pool) => pool.install(|| self.analyze_raw_impl(meta, pixels)),
+            None => self.analyze_raw_impl(meta, pixels),
+        }
+    }
+
+    fn analyze_raw_impl(
+        &self,
+        meta: &ImageMetadata,
+        pixels: &PixelData,
+    ) -> Result<AnalysisResult> {
+        let f32_data = match pixels {
+            PixelData::Float32(d) => std::borrow::Cow::Borrowed(d.as_slice()),
+            PixelData::Uint16(d) => std::borrow::Cow::Owned(u16_to_f32(d)),
+        };
+
+        let mut data = f32_data.into_owned();
+        let width = meta.width;
+        let height = meta.height;
+        let channels = meta.channels;
+
+        let green_mask = if self.config.apply_debayer
+            && meta.bayer_pattern != BayerPattern::None
+            && channels == 1
+        {
+            data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
+            Some(build_green_mask(width, height, meta.bayer_pattern))
+        } else {
+            None
+        };
+
+        self.run_analysis(&data, width, height, channels, green_mask.as_deref())
     }
 
     fn analyze_impl(&self, path: &Path) -> Result<AnalysisResult> {

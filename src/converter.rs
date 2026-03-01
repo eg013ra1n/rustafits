@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use crate::formats;
 use crate::output;
 use crate::pipeline;
-use crate::types::{ProcessConfig, ProcessedImage};
+use crate::types::{ImageMetadata, PixelData, ProcessConfig, ProcessedImage};
 
 pub struct ImageConverter {
     downscale: usize,
@@ -59,26 +60,48 @@ impl ImageConverter {
         self
     }
 
+    /// Read raw pixel data from a FITS/XISF file without any processing.
+    pub fn read_raw<P: AsRef<Path>>(path: P) -> Result<(ImageMetadata, PixelData)> {
+        formats::read_image(path.as_ref()).context("Failed to read image")
+    }
+
+    /// Process pre-read image data (skips file I/O).
+    pub fn process_data(
+        &self,
+        meta: ImageMetadata,
+        pixels: PixelData,
+    ) -> Result<ProcessedImage> {
+        let config = self.build_config();
+        match &self.thread_pool {
+            Some(pool) => pool.install(|| pipeline::process_image_data(meta, pixels, &config)),
+            None => pipeline::process_image_data(meta, pixels, &config),
+        }
+        .context("Image processing failed")
+    }
+
     /// Process a FITS/XISF image and return raw pixel data without writing to disk.
     ///
     /// Returns a `ProcessedImage` containing interleaved RGB u8 bytes,
     /// suitable for display in a GUI, web backend, or further processing.
     pub fn process<P: AsRef<Path>>(&self, input_path: P) -> Result<ProcessedImage> {
-        let config = ProcessConfig {
-            downscale_factor: self.downscale,
-            jpeg_quality: self.quality,
-            apply_debayer: self.apply_debayer,
-            preview_mode: self.preview_mode,
-            auto_stretch: true,
-            rgba_output: self.rgba_output,
-        };
-
+        let config = self.build_config();
         let path = input_path.as_ref();
         match &self.thread_pool {
             Some(pool) => pool.install(|| pipeline::process_image(path, &config)),
             None => pipeline::process_image(path, &config),
         }
         .context("Image processing failed")
+    }
+
+    fn build_config(&self) -> ProcessConfig {
+        ProcessConfig {
+            downscale_factor: self.downscale,
+            jpeg_quality: self.quality,
+            apply_debayer: self.apply_debayer,
+            preview_mode: self.preview_mode,
+            auto_stretch: true,
+            rgba_output: self.rgba_output,
+        }
     }
 
     /// Save a `ProcessedImage` to disk as JPEG or PNG.

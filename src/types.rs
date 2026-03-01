@@ -19,6 +19,7 @@ pub enum PixelData {
     Float32(Vec<f32>),
 }
 
+#[derive(Clone)]
 #[allow(dead_code)]
 pub struct ImageMetadata {
     pub width: usize,
