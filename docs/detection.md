@@ -123,10 +123,10 @@ Input: luminance image, peak positions, background, noise
        |
        v
 +-------------------------------+
-| Peak-Based Deblending         |  If component has multiple peaks:
+| Peak-Based Deblending         |  If multi-peak AND area ≤ max_star_area:
 |                               |    assign each pixel to nearest peak (Voronoi)
 |                               |    process each sub-component independently
-|                               |  Single-peak components: unchanged
+|                               |  Otherwise: process component as whole
 +-------------------------------+
        |
        v
