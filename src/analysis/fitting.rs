@@ -28,62 +28,47 @@ pub(crate) struct PixelSample {
     pub value: f64,
 }
 
-/// Fit 2D elliptical Gaussian. Uses Siril two-stage approach:
-/// Stage 1: axis-aligned (theta=0, 6 params).
-/// Stage 2: if significantly elliptical, unfreeze theta (7 params).
+/// Fit 2D elliptical Gaussian with 7 parameters (including theta).
+/// Caller provides per-axis sigma and theta initialisation from moments.
 pub(crate) fn fit_gaussian_2d(
     pixels: &[PixelSample],
     init_b: f64,
     init_a: f64,
     init_x0: f64,
     init_y0: f64,
-    init_sigma: f64,
+    init_sigma_x: f64,
+    init_sigma_y: f64,
+    init_theta: f64,
 ) -> Option<Gaussian2DResult> {
     if pixels.len() < 10 {
         return None;
     }
 
-    // Stage 1: axis-aligned (theta fixed at 0)
-    let mut params6 = [init_b, init_a, init_x0, init_y0, init_sigma, init_sigma];
-    let converged1 = lm_solve_2d(pixels, &mut params6, false);
+    let mut params = [init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta];
+    let converged = lm_solve_2d(pixels, &mut params, true);
 
-    if !converged1 && params6[4] < 0.3 {
+    let sigma_x = params[4].abs();
+    let sigma_y = params[5].abs();
+    if sigma_x < 0.3 || sigma_y < 0.3 || params[1] <= 0.0 {
         return None;
     }
 
-    let sx = params6[4].abs();
-    let sy = params6[5].abs();
-
-    // Stage 2: if notably elliptical, fit theta too
-    let ellipticity = (sx - sy).abs() / sx.max(sy);
-    let (final_params, converged);
-    if ellipticity > 0.1 {
-        let mut params7 = [params6[0], params6[1], params6[2], params6[3], sx, sy, 0.0];
-        converged = lm_solve_2d(pixels, &mut params7, true);
-        final_params = params7;
-    } else {
-        final_params = [params6[0], params6[1], params6[2], params6[3], sx, sy, 0.0];
-        converged = converged1;
-    }
-
-    let sigma_x = final_params[4].abs();
-    let sigma_y = final_params[5].abs();
-    if sigma_x < 0.3 || sigma_y < 0.3 || final_params[1] <= 0.0 {
-        return None;
+    // Normalize theta to [-π/2, π/2]
+    let mut theta = params[6] % std::f64::consts::PI;
+    if theta > std::f64::consts::FRAC_PI_2 {
+        theta -= std::f64::consts::PI;
+    } else if theta < -std::f64::consts::FRAC_PI_2 {
+        theta += std::f64::consts::PI;
     }
 
     Some(Gaussian2DResult {
-        b: final_params[0],
-        a: final_params[1],
-        x0: final_params[2],
-        y0: final_params[3],
+        b: params[0],
+        a: params[1],
+        x0: params[2],
+        y0: params[3],
         sigma_x,
         sigma_y,
-        theta: if final_params.len() == 7 {
-            final_params[6]
-        } else {
-            0.0
-        },
+        theta,
         converged,
     })
 }
@@ -306,7 +291,7 @@ mod tests {
             }
         }
 
-        let result = fit_gaussian_2d(&pixels, 100.0, 5000.0, 10.0, 10.0, 3.0).unwrap();
+        let result = fit_gaussian_2d(&pixels, 100.0, 5000.0, 10.0, 10.0, 3.0, 3.0, 0.0).unwrap();
         assert!(result.converged);
         assert!((result.sigma_x - 3.0).abs() < 0.1, "sx: {}", result.sigma_x);
         assert!((result.sigma_y - 3.0).abs() < 0.1, "sy: {}", result.sigma_y);
@@ -337,12 +322,60 @@ mod tests {
             }
         }
 
-        let result = fit_gaussian_2d(&pixels, 50.0, 8000.0, 12.0, 12.0, 3.0).unwrap();
+        let result = fit_gaussian_2d(&pixels, 50.0, 8000.0, 12.0, 12.0, 3.0, 3.0, 0.0).unwrap();
         assert!(result.converged);
         let min_s = result.sigma_x.min(result.sigma_y);
         let max_s = result.sigma_x.max(result.sigma_y);
         assert!((min_s - 2.0).abs() < 0.2, "min_sigma: {}", min_s);
         assert!((max_s - 5.0).abs() < 0.3, "max_sigma: {}", max_s);
+    }
+
+    #[test]
+    fn test_2d_gaussian_fit_elliptical_45deg() {
+        // Elongated star at 45 degrees — the exact failure case for two-stage fitting.
+        // sigma_x=2, sigma_y=5, theta=π/4
+        let size = 25;
+        let theta = std::f64::consts::FRAC_PI_4;
+        let (ct, st) = (theta.cos(), theta.sin());
+        let mut pixels = Vec::new();
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f64 - 12.0;
+                let dy = y as f64 - 12.0;
+                let u = dx * ct + dy * st;
+                let v = -dx * st + dy * ct;
+                let q = u * u / 4.0 + v * v / 25.0;
+                let val = 50.0 + 8000.0 * (-0.5 * q).exp();
+                pixels.push(PixelSample {
+                    x: x as f64,
+                    y: y as f64,
+                    value: val,
+                });
+            }
+        }
+
+        // Provide moments-based init: theta=π/4, per-axis sigmas close to truth
+        let result = fit_gaussian_2d(&pixels, 50.0, 8000.0, 12.0, 12.0, 2.0, 5.0, theta).unwrap();
+        assert!(result.converged, "should converge");
+        let min_s = result.sigma_x.min(result.sigma_y);
+        let max_s = result.sigma_x.max(result.sigma_y);
+        assert!(
+            (min_s - 2.0).abs() < 0.2,
+            "min_sigma: {} expected ~2.0",
+            min_s
+        );
+        assert!(
+            (max_s - 5.0).abs() < 0.3,
+            "max_sigma: {} expected ~5.0",
+            max_s
+        );
+        // Eccentricity: sqrt(1 - 4/25) ≈ 0.917
+        let ecc = (1.0 - (min_s * min_s) / (max_s * max_s)).max(0.0).sqrt();
+        assert!(
+            (ecc - 0.917).abs() < 0.05,
+            "eccentricity: {} expected ~0.917",
+            ecc
+        );
     }
 
     #[test]

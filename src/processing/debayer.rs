@@ -2,6 +2,71 @@ use rayon::prelude::*;
 
 use crate::types::BayerPattern;
 
+/// Green-channel interpolation for CFA analysis (matches Siril's `interpolate_nongreen`).
+///
+/// Produces a single-channel f32 image at **native resolution** where green CFA
+/// pixels keep their original values and non-green pixels (R, B) are replaced
+/// with a distance-weighted average of neighboring green pixels in a 3×3 window
+/// (cardinal weight = 1.0, diagonal weight = 1/√2).
+///
+/// This preserves the native pixel scale for PSF measurement — unlike super-pixel
+/// debayer which halves resolution and broadens the PSF via 2×2 box averaging.
+pub fn interpolate_green_f32(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    pattern: BayerPattern,
+) -> Vec<f32> {
+    let mut output = vec![0.0f32; width * height];
+
+    // In GBRG/GRBG, green is at positions where (row + col) is even.
+    // In RGGB/BGGR, green is at positions where (row + col) is odd.
+    let green_at_even_sum = matches!(pattern, BayerPattern::Gbrg | BayerPattern::Grbg);
+
+    let inv_sqrt2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    for y in 0..height {
+        for x in 0..width {
+            let parity = (x + y) & 1;
+            let is_green = if green_at_even_sum { parity == 0 } else { parity == 1 };
+
+            let idx = y * width + x;
+
+            if is_green {
+                output[idx] = input[idx];
+            } else {
+                // Distance-weighted average of green neighbors in 3×3 window
+                let mut sum = 0.0f32;
+                let mut wt = 0.0f32;
+
+                let y0 = if y > 0 { y - 1 } else { y };
+                let y1 = if y + 1 < height { y + 1 } else { y };
+                let x0 = if x > 0 { x - 1 } else { x };
+                let x1 = if x + 1 < width { x + 1 } else { x };
+
+                for ny in y0..=y1 {
+                    for nx in x0..=x1 {
+                        if ny == y && nx == x {
+                            continue;
+                        }
+                        let np = (nx + ny) & 1;
+                        let n_green = if green_at_even_sum { np == 0 } else { np == 1 };
+                        if n_green {
+                            let w = if nx == x || ny == y { 1.0 } else { inv_sqrt2 };
+                            sum += w * input[ny * width + nx];
+                            wt += w;
+                        }
+                    }
+                }
+
+                output[idx] = if wt > 0.0 { sum / wt } else { input[idx] };
+            }
+        }
+    }
+
+    output
+}
+
 /// Super-pixel 2x2 debayer for u16 input. Output is planar f32 RGB at half resolution.
 pub fn super_pixel_debayer_u16(
     input: &[u16],

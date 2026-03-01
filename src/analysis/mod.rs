@@ -120,7 +120,7 @@ impl ImageAnalyzer {
                 use_gaussian_fit: true,
                 background_mesh_size: None,
                 apply_debayer: true,
-                max_eccentricity: 0.5,
+                max_eccentricity: 1.0,
                 trail_r_squared_threshold: 0.5,
             },
             thread_pool: None,
@@ -220,9 +220,9 @@ impl ImageAnalyzer {
     ) -> Result<AnalysisResult> {
         match &self.thread_pool {
             Some(pool) => pool.install(|| {
-                self.run_analysis(data, width, height, channels)
+                self.run_analysis(data, width, height, channels, None)
             }),
-            None => self.run_analysis(data, width, height, channels),
+            None => self.run_analysis(data, width, height, channels, None),
         }
     }
 
@@ -237,21 +237,24 @@ impl ImageAnalyzer {
         };
 
         let mut data = f32_data;
-        let mut width = meta.width;
-        let mut height = meta.height;
-        let mut channels = meta.channels;
+        let width = meta.width;
+        let height = meta.height;
+        let channels = meta.channels;
 
-        // Debayer if needed
-        if self.config.apply_debayer && meta.bayer_pattern != BayerPattern::None && channels == 1 {
-            let (debayered, dw, dh) =
-                debayer::super_pixel_debayer_f32(&data, width, height, meta.bayer_pattern);
-            data = debayered;
-            width = dw;
-            height = dh;
-            channels = 3;
-        }
+        // Green-channel interpolation for OSC: native-resolution mono green image
+        // (matches Siril's interpolate_nongreen — no PSF broadening from 2×2 binning)
+        let green_mask = if self.config.apply_debayer
+            && meta.bayer_pattern != BayerPattern::None
+            && channels == 1
+        {
+            data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
+            // width, height, channels unchanged — native resolution mono green
+            Some(build_green_mask(width, height, meta.bayer_pattern))
+        } else {
+            None
+        };
 
-        self.run_analysis(&data, width, height, channels)
+        self.run_analysis(&data, width, height, channels, green_mask.as_deref())
     }
 
     fn run_analysis(
@@ -260,6 +263,7 @@ impl ImageAnalyzer {
         width: usize,
         height: usize,
         channels: usize,
+        green_mask: Option<&[bool]>,
     ) -> Result<AnalysisResult> {
         // Extract luminance if multi-channel
         let lum = if channels == 3 {
@@ -372,6 +376,7 @@ impl ImageAnalyzer {
             bg_result.background,
             bg_map_ref,
             self.config.use_gaussian_fit,
+            green_mask,
         );
 
         if measured.is_empty() {
@@ -449,6 +454,23 @@ impl Default for ImageAnalyzer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build a boolean mask marking green CFA pixel positions.
+///
+/// Returns a `Vec<bool>` of length `width * height` where `true` marks pixels
+/// that are at green positions in the Bayer pattern. For GBRG/GRBG green is
+/// at (row + col) even; for RGGB/BGGR green is at (row + col) odd.
+fn build_green_mask(width: usize, height: usize, pattern: BayerPattern) -> Vec<bool> {
+    let green_at_even = matches!(pattern, BayerPattern::Gbrg | BayerPattern::Grbg);
+    (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| {
+                let parity = (x + y) & 1;
+                if green_at_even { parity == 0 } else { parity == 1 }
+            })
+        })
+        .collect()
 }
 
 /// Extract luminance from planar RGB data: L = 0.2126R + 0.7152G + 0.0722B

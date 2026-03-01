@@ -272,6 +272,7 @@ pub(crate) fn detect_stars(
 
         // Compute peak and check saturation
         let mut peak = 0.0_f32;
+        let mut raw_peak = 0.0_f32;
         let mut sum_w = 0.0_f64;
         let mut sum_wx = 0.0_f64;
         let mut sum_wy = 0.0_f64;
@@ -284,10 +285,14 @@ pub(crate) fn detect_stars(
         let mut max_y = 0usize;
 
         for &(x, y) in pixels {
+            let raw = data[y * width + x];
             let bg = bg_map.map_or(background, |m| m[y * width + x]);
-            let val = data[y * width + x] - bg;
+            let val = raw - bg;
             if val > peak {
                 peak = val;
+            }
+            if raw > raw_peak {
+                raw_peak = raw;
             }
 
             // I² weighting for centroid
@@ -303,8 +308,8 @@ pub(crate) fn detect_stars(
             max_y = max_y.max(y);
         }
 
-        // Saturation check
-        if peak > params.saturation_limit {
+        // Saturation check — use raw (pre-background-subtracted) peak
+        if raw_peak > params.saturation_limit {
             continue;
         }
 
