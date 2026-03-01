@@ -323,7 +323,7 @@ fn bswap_u16(src: &[u8], dst: &mut [u16]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("ssse3") {
-            i = bswap_u16_ssse3(src, dst, i, n);
+            i = unsafe { bswap_u16_ssse3(src, dst, i, n) };
         }
     }
 
@@ -357,7 +357,7 @@ fn bswap_u16_xor(src: &[u8], dst: &mut [u16]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("ssse3") {
-            i = bswap_u16_xor_ssse3(src, dst, i, n);
+            i = unsafe { bswap_u16_xor_ssse3(src, dst, i, n) };
         }
     }
 
