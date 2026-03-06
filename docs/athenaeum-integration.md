@@ -77,6 +77,7 @@ let result = ImageAnalyzer::new()
 | `snr_weight` | `f32` | PixInsight-style SNR weight for stacking. |
 | `psf_signal` | `f32` | PSF signal strength: median(star_peaks) / noise. |
 | `trail_r_squared` | `f32` | Rayleigh R² for directional coherence. 0 = no trail, 1 = strong trail. |
+| `median_beta` | `Option<f32>` | Median Moffat β. `None` if Gaussian fitting was used. |
 | `possibly_trailed` | `bool` | Advisory trail flag (dual-path Rayleigh test). |
 
 ### Key `StarMetrics` Fields
@@ -92,6 +93,7 @@ let result = ImageAnalyzer::new()
 | `hfr` | `f32` | Half-flux radius (pixels). |
 | `peak` | `f32` | Background-subtracted peak (ADU). |
 | `flux` | `f32` | Total background-subtracted flux (ADU). |
+| `beta` | `Option<f32>` | Moffat β shape parameter. `None` if Gaussian fit. |
 
 ### Analyzer Builder Methods
 
@@ -107,6 +109,8 @@ let result = ImageAnalyzer::new()
 | `with_background_mesh(usize)` | global | Mesh-grid background with given cell size. |
 | `without_debayer()` | debayer on | Skip green-channel interpolation for OSC. |
 | `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection. |
+| `with_iterative_background(n)` | 0 (off) | Source-masked background re-estimation (n iterations). Requires `with_background_mesh`. |
+| `with_moffat_fit()` | off | Use Moffat PSF model instead of Gaussian. Reports `median_beta`. |
 | `with_thread_pool(pool)` | global | Route parallel work to a custom rayon pool. |
 
 ### Analyzing pre-loaded data
@@ -323,6 +327,9 @@ let image = ImageConverter::new()
 
 let result = ImageAnalyzer::new()
     .with_max_stars(1000)
+    .with_moffat_fit()               // Moffat PSF (better wing modeling)
+    .with_background_mesh(64)        // Local background estimation
+    .with_iterative_background(2)    // Source-masked refinement
     .with_thread_pool(pool.clone())
     .analyze("light_001.fits")?;
 
@@ -372,6 +379,7 @@ Add these to the subframe table alongside existing FWHM/eccentricity/SNR:
 | HFR | `median_hfr` | `{:.2}` | Half-flux radius |
 | PSF Signal | `psf_signal` | `{:.0}` | Signal strength |
 | SNR Weight | `snr_weight` | `{:.1}` | Stacking weight |
+| Moffat β | `median_beta` | `{:.2}` | Moffat shape param (with_moffat_fit only) |
 
 ### Annotation toggle in image viewer
 

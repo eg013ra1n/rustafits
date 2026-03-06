@@ -11,7 +11,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
-- **Image Analysis**: Star detection, FWHM/HFR/eccentricity measurement, and SNR computation (PixInsight-comparable)
+- **Image Analysis**: Star detection with matched-filter convolution, Gaussian and Moffat PSF fitting, FWHM/HFR/eccentricity measurement, and SNR computation
 - **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
 
 ## Supported Formats
@@ -84,7 +84,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustafits = "0.5"
+rustafits = "0.6"
 ```
 
 ### File output
@@ -274,8 +274,9 @@ rustafits/
 │   ├── analysis/
 │   │   ├── mod.rs            # Analyzer builder + pipeline orchestration
 │   │   ├── background.rs     # Background estimation (global + mesh-grid)
+│   │   ├── convolution.rs    # Separable matched-filter convolution
 │   │   ├── detection.rs      # Star detection (DAOFIND + CCL)
-│   │   ├── fitting.rs        # Levenberg-Marquardt Gaussian fitting
+│   │   ├── fitting.rs        # LM Gaussian & Moffat PSF fitting
 │   │   ├── metrics.rs        # FWHM, eccentricity, HFR measurement
 │   │   └── snr.rs            # Per-star and image-wide SNR
 │   └── processing/

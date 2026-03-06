@@ -1,3 +1,15 @@
+rustafits (0.6.0-1) unstable; urgency=medium
+
+  * Add 2D elliptical Moffat PSF fitting with automatic Gaussian fallback
+  * Add separable matched-filter convolution for star detection
+  * Add iterative source-masked background estimation
+  * Fix annotation ellipse orientation when optimizer converges with swapped axes
+  * Fix annotation theta not negated on vertical flip (FITS Y-up images)
+  * Canonicalize PSF fit output: fwhm_x >= fwhm_y, theta along major axis
+  * Improve background mesh estimation with bilinear interpolation
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Fri, 06 Mar 2026 00:00:00 +0000
+
 rustafits (0.5.5-1) unstable; urgency=medium
 
   * Add per-star PSF position angle (theta) to StarMetrics

@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.5.5
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,15 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Fri Mar 06 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.6.0-1
+- Add 2D elliptical Moffat PSF fitting with automatic Gaussian fallback
+- Add separable matched-filter convolution for star detection
+- Add iterative source-masked background estimation
+- Fix annotation ellipse orientation when optimizer converges with swapped axes
+- Fix annotation theta not negated on vertical flip (FITS Y-up images)
+- Canonicalize PSF fit output: fwhm_x >= fwhm_y, theta along major axis
+- Improve background mesh estimation with bilinear interpolation
+
 * Sun Mar 01 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.5.5-1
 - Add per-star PSF position angle (theta) to StarMetrics
 - Fix analysis pipeline panics on real-world FITS images
