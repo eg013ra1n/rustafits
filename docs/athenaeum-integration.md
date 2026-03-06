@@ -15,7 +15,7 @@ All three share a common thread pool via `with_thread_pool()`.
 ## 1. Image Conversion
 
 ```rust
-use rustafits::{ImageConverter, ProcessedImage};
+use astroimage::{ImageConverter, ProcessedImage};
 
 let image: ProcessedImage = ImageConverter::new()
     .with_downscale(2)
@@ -54,7 +54,7 @@ ImageConverter::save_processed(&image, "output.png", 0)?;  // quality ignored fo
 ## 2. Image Analysis
 
 ```rust
-use rustafits::ImageAnalyzer;
+use astroimage::ImageAnalyzer;
 
 let result = ImageAnalyzer::new()
     .with_max_stars(500)
@@ -133,7 +133,7 @@ Returns `Vec<StarAnnotation>` with transformed coordinates and ellipse parameter
 Use this when Athenaeum renders with its own drawing system (Canvas2D, SwiftUI, etc.).
 
 ```rust
-use rustafits::{compute_annotations, AnnotationConfig};
+use astroimage::{compute_annotations, AnnotationConfig};
 
 let annotations = compute_annotations(
     &result,
@@ -161,7 +161,7 @@ Returns a transparent RGBA buffer (same dimensions as output). Composite over th
 base image to toggle annotations on/off without re-rendering.
 
 ```rust
-use rustafits::create_annotation_layer;
+use astroimage::create_annotation_layer;
 
 let layer = create_annotation_layer(
     &result,
@@ -179,7 +179,7 @@ let layer = create_annotation_layer(
 Draws directly onto a `ProcessedImage`. Simplest path — modifies image in place.
 
 ```rust
-use rustafits::annotate_image;
+use astroimage::annotate_image;
 
 annotate_image(&mut image, &result, &AnnotationConfig::default());
 ImageConverter::save_processed(&image, "annotated.jpg", 95)?;
@@ -190,7 +190,7 @@ ImageConverter::save_processed(&image, "annotated.jpg", 95)?;
 All fields are public — override only what you need:
 
 ```rust
-use rustafits::{AnnotationConfig, ColorScheme};
+use astroimage::{AnnotationConfig, ColorScheme};
 
 let config = AnnotationConfig {
     color_scheme: ColorScheme::Eccentricity,
@@ -277,7 +277,7 @@ Share a single pool across all pipelines to prevent oversubscription:
 
 ```rust
 use std::sync::Arc;
-use rustafits::{ImageConverter, ImageAnalyzer, ThreadPoolBuilder};
+use astroimage::{ImageConverter, ImageAnalyzer, ThreadPoolBuilder};
 
 let pool = Arc::new(
     ThreadPoolBuilder::new()
@@ -300,7 +300,7 @@ Complete workflow: convert, analyze, and annotate with toggleable overlay.
 
 ```rust
 use std::sync::Arc;
-use rustafits::{
+use astroimage::{
     ImageConverter, ImageAnalyzer,
     compute_annotations, create_annotation_layer, annotate_image,
     AnnotationConfig, ColorScheme,
@@ -411,7 +411,7 @@ Each reveals different quality issues:
 All types and functions are re-exported from the crate root:
 
 ```rust
-use rustafits::{
+use astroimage::{
     // Conversion
     ImageConverter,
     ProcessedImage,
