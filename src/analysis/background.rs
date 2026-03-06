@@ -10,6 +10,9 @@ pub(crate) struct BackgroundResult {
     pub noise: f32,
     /// Per-pixel background map (only if mesh-grid mode was used).
     pub background_map: Option<Vec<f32>>,
+    /// Per-pixel noise map (bilinear interpolation of per-cell sigma).
+    /// Only present if mesh-grid mode was used.
+    pub noise_map: Option<Vec<f32>>,
 }
 
 /// Estimate background and noise using sigma-clipped statistics.
@@ -40,6 +43,7 @@ pub(crate) fn estimate_background(data: &[f32], width: usize, height: usize) -> 
             background: 0.0,
             noise: 1.0,
             background_map: None,
+            noise_map: None,
         };
     }
 
@@ -50,6 +54,7 @@ pub(crate) fn estimate_background(data: &[f32], width: usize, height: usize) -> 
         background: mode,
         noise: sigma.max(0.001),
         background_map: None,
+        noise_map: None,
     }
 }
 
@@ -166,43 +171,8 @@ pub(crate) fn estimate_background_mesh(
         }
     }
 
-    // Bilinear interpolation to full resolution (parallelized)
-    let mut bg_map = vec![0.0_f32; width * height];
-
-    if nx < 2 || ny < 2 {
-        // Too few cells for bilinear interpolation — fill with flat background
-        let flat_val = filtered_bg[0];
-        bg_map.fill(flat_val);
-    } else {
-        let half_cell = cell_size as f32 * 0.5;
-        let inv_cell = 1.0 / cell_size as f32;
-        let nx_clamp = nx as i32 - 2;
-
-        use rayon::prelude::*;
-        bg_map
-            .par_chunks_mut(width)
-            .enumerate()
-            .for_each(|(y, row)| {
-                let fy = (y as f32 - half_cell) * inv_cell;
-                let iy = (fy.floor() as i32).clamp(0, ny as i32 - 2) as usize;
-                let ty = (fy - iy as f32).clamp(0.0, 1.0);
-                let row0 = &filtered_bg[iy * nx..(iy + 1) * nx];
-                let row1 = &filtered_bg[(iy + 1) * nx..(iy + 2) * nx];
-                let ty_inv = 1.0 - ty;
-
-                for (x, dst) in row.iter_mut().enumerate() {
-                    let fx = (x as f32 - half_cell) * inv_cell;
-                    let ix = (fx.floor() as i32).clamp(0, nx_clamp) as usize;
-                    let tx = (fx - ix as f32).clamp(0.0, 1.0);
-                    let tx_inv = 1.0 - tx;
-
-                    *dst = row0[ix] * tx_inv * ty_inv
-                        + row0[ix + 1] * tx * ty_inv
-                        + row1[ix] * tx_inv * ty
-                        + row1[ix + 1] * tx * ty;
-                }
-            });
-    }
+    // Bicubic spline interpolation to full resolution (parallelized)
+    let bg_map = interpolate_grid_to_map(&filtered_bg, nx, ny, width, height, cell_size);
 
     // Global noise = median of cell sigmas
     let mut valid_sigmas: Vec<f32> = cell_sigma
@@ -222,10 +192,14 @@ pub(crate) fn estimate_background_mesh(
     let mut valid_bgs: Vec<f32> = (0..nx * ny).map(|i| filtered_bg[i]).collect();
     let background = find_median(&mut valid_bgs);
 
+    // Bilinear interpolation of per-cell noise to full resolution
+    let noise_map = interpolate_grid_to_map(&cell_sigma, nx, ny, width, height, cell_size);
+
     BackgroundResult {
         background,
         noise: noise.max(0.001),
         background_map: Some(bg_map),
+        noise_map: Some(noise_map),
     }
 }
 
@@ -273,10 +247,229 @@ fn sigma_clipped_stats(samples: &mut Vec<f32>, rounds: usize, kappa: f32) -> (f3
 
     let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
 
-    // Mode approximation (SExtractor formula)
-    let mode = 2.5 * median - 1.5 * mean;
+    // Mode approximation (SExtractor formula) with asymmetry fallback.
+    // When |mean - median| >= 0.3 * sigma, the distribution is too skewed
+    // (bright nebulosity, galaxy core) for the mode formula to be reliable.
+    let mode = if (mean - median).abs() < 0.3 * sigma {
+        2.5 * median - 1.5 * mean
+    } else {
+        median
+    };
 
     (mode, sigma.max(0.001))
+}
+
+/// Re-estimate background with source masking.
+///
+/// `source_mask`: boolean mask where `true` = source pixel (excluded from stats).
+/// Same logic as `estimate_background_mesh` but skips masked pixels in per-cell stats.
+pub(crate) fn estimate_background_mesh_masked(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    cell_size: usize,
+    source_mask: &[bool],
+) -> BackgroundResult {
+    let cell_size = cell_size.max(16);
+    let nx = (width + cell_size - 1) / cell_size;
+    let ny = (height + cell_size - 1) / cell_size;
+
+    let mut cell_bg = vec![0.0_f32; nx * ny];
+    let mut cell_sigma = vec![0.0_f32; nx * ny];
+    let mut cell_valid = vec![true; nx * ny];
+
+    for cy in 0..ny {
+        let y0 = cy * cell_size;
+        let y1 = (y0 + cell_size).min(height);
+        for cx in 0..nx {
+            let x0 = cx * cell_size;
+            let x1 = (x0 + cell_size).min(width);
+            let cell_idx = cy * nx + cx;
+
+            let mut samples = Vec::with_capacity((y1 - y0) * (x1 - x0));
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if source_mask[y * width + x] {
+                        continue; // skip source pixels
+                    }
+                    let val = data[y * width + x];
+                    if val.is_finite() {
+                        samples.push(val);
+                    }
+                }
+            }
+
+            if samples.len() < 10 {
+                cell_valid[cell_idx] = false;
+                continue;
+            }
+
+            let original_len = samples.len();
+            let (mode, sigma) = sigma_clipped_stats(&mut samples, 3, 3.0);
+
+            if samples.len() < (original_len * 7 / 10) {
+                cell_valid[cell_idx] = false;
+            }
+
+            cell_bg[cell_idx] = mode;
+            cell_sigma[cell_idx] = sigma;
+        }
+    }
+
+    // Fill invalid cells with nearest valid neighbor
+    for cy in 0..ny {
+        for cx in 0..nx {
+            let idx = cy * nx + cx;
+            if cell_valid[idx] {
+                continue;
+            }
+            let mut best_dist = usize::MAX;
+            let mut best_val = 0.0_f32;
+            let mut best_sig = 1.0_f32;
+            let max_r = nx.max(ny);
+            for r in 1..=max_r {
+                let mut found = false;
+                let y_lo = cy.saturating_sub(r);
+                let y_hi = (cy + r + 1).min(ny);
+                let x_lo = cx.saturating_sub(r);
+                let x_hi = (cx + r + 1).min(nx);
+                for sy in y_lo..y_hi {
+                    for sx in x_lo..x_hi {
+                        let sidx = sy * nx + sx;
+                        if cell_valid[sidx] {
+                            let d = cx.abs_diff(sx) + cy.abs_diff(sy);
+                            if d < best_dist {
+                                best_dist = d;
+                                best_val = cell_bg[sidx];
+                                best_sig = cell_sigma[sidx];
+                                found = true;
+                            }
+                        }
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+            cell_bg[idx] = best_val;
+            cell_sigma[idx] = best_sig;
+        }
+    }
+
+    // 3×3 median filter
+    let mut filtered_bg = cell_bg.clone();
+    let mut neighbors = [0.0_f32; 9];
+    for cy in 0..ny {
+        for cx in 0..nx {
+            let mut count = 0;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let sy = cy as i32 + dy;
+                    let sx = cx as i32 + dx;
+                    if sy >= 0 && sy < ny as i32 && sx >= 0 && sx < nx as i32 {
+                        neighbors[count] = cell_bg[sy as usize * nx + sx as usize];
+                        count += 1;
+                    }
+                }
+            }
+            filtered_bg[cy * nx + cx] = find_median(&mut neighbors[..count]);
+        }
+    }
+
+    // Bicubic spline interpolation to full resolution (parallelized)
+    let bg_map = interpolate_grid_to_map(&filtered_bg, nx, ny, width, height, cell_size);
+
+    // Global noise
+    let mut valid_sigmas: Vec<f32> = cell_sigma
+        .iter()
+        .zip(cell_valid.iter())
+        .filter(|(_, &v)| v)
+        .map(|(&s, _)| s)
+        .collect();
+
+    let noise = if valid_sigmas.is_empty() {
+        1.0
+    } else {
+        find_median(&mut valid_sigmas)
+    };
+
+    let mut valid_bgs: Vec<f32> = (0..nx * ny).map(|i| filtered_bg[i]).collect();
+    let background = find_median(&mut valid_bgs);
+
+    let noise_map = interpolate_grid_to_map(&cell_sigma, nx, ny, width, height, cell_size);
+
+    BackgroundResult {
+        background,
+        noise: noise.max(0.001),
+        background_map: Some(bg_map),
+        noise_map: Some(noise_map),
+    }
+}
+
+/// Catmull-Rom cubic weights for parameter t ∈ [0, 1].
+/// Returns weights for grid points at offsets [-1, 0, +1, +2] from the base cell.
+#[inline]
+fn cubic_weights(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    [
+        -0.5 * t3 + t2 - 0.5 * t,
+        1.5 * t3 - 2.5 * t2 + 1.0,
+        -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+        0.5 * t3 - 0.5 * t2,
+    ]
+}
+
+/// Bicubic (Catmull-Rom) spline interpolation of a cell grid to full-resolution pixel map.
+/// C¹-continuous, passes through grid values, no overshoot for monotone data.
+fn interpolate_grid_to_map(
+    grid: &[f32],
+    nx: usize,
+    ny: usize,
+    width: usize,
+    height: usize,
+    cell_size: usize,
+) -> Vec<f32> {
+    let mut map = vec![0.0_f32; width * height];
+
+    if nx < 2 || ny < 2 {
+        map.fill(grid[0]);
+        return map;
+    }
+
+    let half_cell = cell_size as f32 * 0.5;
+    let inv_cell = 1.0 / cell_size as f32;
+    let nx_i = nx as i32;
+    let ny_i = ny as i32;
+
+    use rayon::prelude::*;
+    map.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let fy = (y as f32 - half_cell) * inv_cell;
+            let iy = fy.floor() as i32;
+            let ty = (fy - iy as f32).clamp(0.0, 1.0);
+            let wy = cubic_weights(ty);
+
+            for (x, dst) in row.iter_mut().enumerate() {
+                let fx = (x as f32 - half_cell) * inv_cell;
+                let ix = fx.floor() as i32;
+                let tx = (fx - ix as f32).clamp(0.0, 1.0);
+                let wx = cubic_weights(tx);
+
+                let mut val = 0.0_f32;
+                for j in 0..4_i32 {
+                    let jy = (iy + j - 1).clamp(0, ny_i - 1) as usize;
+                    for i in 0..4_i32 {
+                        let jx = (ix + i - 1).clamp(0, nx_i - 1) as usize;
+                        val += wy[j as usize] * wx[i as usize] * grid[jy * nx + jx];
+                    }
+                }
+                *dst = val;
+            }
+        });
+
+    map
 }
 
 #[cfg(test)]

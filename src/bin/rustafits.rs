@@ -52,7 +52,7 @@ fn run() -> Result<()> {
     let mut apply_debayer = true;
     let mut preview_mode = false;
     let mut annotate = false;
-    let mut max_stars: usize = 200;
+    let mut max_stars: usize = 500;
     let mut log_enabled = false;
 
     let mut i = 3;
@@ -156,7 +156,7 @@ fn run() -> Result<()> {
 
         if log_enabled {
             println!("Analysis: {} stars detected, median FWHM={:.2}, median ecc={:.3}",
-                result.stars.len(), result.median_fwhm, result.median_eccentricity);
+                result.stars_detected, result.median_fwhm, result.median_eccentricity);
         }
 
         // Process image (consumes pixels — borrow released above)

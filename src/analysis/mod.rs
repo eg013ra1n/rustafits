@@ -1,6 +1,7 @@
 /// Image analysis: FWHM, eccentricity, SNR, PSF signal.
 
 mod background;
+mod convolution;
 mod detection;
 mod fitting;
 mod metrics;
@@ -45,6 +46,8 @@ pub struct StarMetrics {
     /// Orientation of the major axis (fwhm_x direction).
     /// 0.0 when Gaussian fit is disabled and star is nearly round.
     pub theta: f32,
+    /// Moffat β parameter (None if Gaussian/moments fit was used).
+    pub beta: Option<f32>,
 }
 
 /// Full analysis result for an image.
@@ -61,7 +64,7 @@ pub struct AnalysisResult {
     pub noise: f32,
     /// Actual detection threshold used (ADU above background).
     pub detection_threshold: f32,
-    /// Total stars detected before max_stars cap.
+    /// Total stars with valid PSF measurements (statistics computed from all).
     pub stars_detected: usize,
     /// Per-star metrics, sorted by flux descending, capped at max_stars.
     pub stars: Vec<StarMetrics>,
@@ -86,6 +89,13 @@ pub struct AnalysisResult {
     /// True if the image is likely trailed, based on the Rayleigh test.
     /// Uses configurable R² threshold (default 0.5) and eccentricity gate.
     pub possibly_trailed: bool,
+    /// Measured FWHM from adaptive two-pass detection (pixels).
+    /// This is the FWHM used for the final matched filter kernel.
+    /// If the first-pass FWHM was within 30% of 3.0, this equals 3.0.
+    pub measured_fwhm_kernel: f32,
+    /// Median Moffat β across all stars (None if Moffat fitting not used).
+    /// Typical range: 2.0-5.0 for real optics. Lower = broader wings.
+    pub median_beta: Option<f32>,
 }
 
 /// Builder configuration for analysis (internal).
@@ -94,12 +104,14 @@ pub struct AnalysisConfig {
     min_star_area: usize,
     max_star_area: usize,
     saturation_fraction: f32,
+    max_measure: Option<usize>,
     max_stars: usize,
     use_gaussian_fit: bool,
     background_mesh_size: Option<usize>,
     apply_debayer: bool,
-    max_eccentricity: f32,
     trail_r_squared_threshold: f32,
+    use_moffat_fit: bool,
+    iterative_background: usize,
 }
 
 /// Image analyzer with builder pattern.
@@ -116,12 +128,14 @@ impl ImageAnalyzer {
                 min_star_area: 5,
                 max_star_area: 2000,
                 saturation_fraction: 0.95,
+                max_measure: None,
                 max_stars: 200,
                 use_gaussian_fit: true,
                 background_mesh_size: None,
                 apply_debayer: true,
-                max_eccentricity: 1.0,
                 trail_r_squared_threshold: 0.5,
+                use_moffat_fit: false,
+                iterative_background: 1,
             },
             thread_pool: None,
         }
@@ -151,9 +165,23 @@ impl ImageAnalyzer {
         self
     }
 
-    /// Analyze only the brightest N stars.
+    /// Limit the number of stars measured for PSF fitting.
+    /// Brightest N detected stars are measured; rest are skipped.
+    /// Statistics are computed from all measured stars.
+    /// Default: None (measure all). E.g. 5000 for faster dense fields.
+    pub fn with_max_measure(mut self, n: usize) -> Self {
+        self.config.max_measure = Some(n.max(100));
+        self
+    }
+
+    /// Keep only the brightest N stars in the returned result.
     pub fn with_max_stars(mut self, n: usize) -> Self {
-        self.config.max_stars = n.max(1);
+        let n = n.max(1);
+        // Clamp to max_measure if set
+        self.config.max_stars = match self.config.max_measure {
+            Some(mm) => n.min(mm),
+            None => n,
+        };
         self
     }
 
@@ -175,18 +203,27 @@ impl ImageAnalyzer {
         self
     }
 
-    /// Reject stars with eccentricity above this threshold (filters elongated objects/trails).
-    /// Default: 0.5. Set to 1.0 to disable.
-    pub fn with_max_eccentricity(mut self, ecc: f32) -> Self {
-        self.config.max_eccentricity = ecc.clamp(0.0, 1.0);
-        self
-    }
-
     /// Set the R² threshold for trail detection.
     /// Images with Rayleigh R² above this are flagged as possibly trailed.
     /// Default: 0.5. Lower values are more aggressive (more false positives).
     pub fn with_trail_threshold(mut self, threshold: f32) -> Self {
         self.config.trail_r_squared_threshold = threshold.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Enable iterative source-masked background estimation.
+    /// After initial detection, source pixels are masked and background is re-estimated.
+    /// Default: 1 (no iteration). Set to 2-3 for images with many bright sources.
+    /// Requires `with_background_mesh` to be set (no-op with global background).
+    pub fn with_iterative_background(mut self, iterations: usize) -> Self {
+        self.config.iterative_background = iterations.max(1);
+        self
+    }
+
+    /// Use Moffat PSF fitting instead of Gaussian for more accurate wing modeling.
+    /// Falls back to Gaussian on non-convergence. Reports per-star β values.
+    pub fn with_moffat_fit(mut self) -> Self {
+        self.config.use_moffat_fit = true;
         self
     }
 
@@ -315,35 +352,105 @@ impl ImageAnalyzer {
             data[..width * height].to_vec()
         };
 
-        // Background estimation
-        let bg_result = if let Some(cell_size) = self.config.background_mesh_size {
-            background::estimate_background_mesh(&lum, width, height, cell_size)
-        } else {
-            background::estimate_background(&lum, width, height)
-        };
-
-        let bg_map_ref = bg_result.background_map.as_deref();
-
-        // Star detection
+        // Star detection parameters
         let det_params = DetectionParams {
             detection_sigma: self.config.detection_sigma,
             min_star_area: self.config.min_star_area,
             max_star_area: self.config.max_star_area,
             saturation_limit: self.config.saturation_fraction * 65535.0,
-            max_stars: self.config.max_stars,
         };
 
-        let detected = detection::detect_stars(
-            &lum,
-            width,
-            height,
-            bg_result.background,
-            bg_result.noise,
-            bg_map_ref,
-            &det_params,
-        );
+        // Iterative background estimation + detection loop
+        let n_iterations = if self.config.background_mesh_size.is_some() {
+            self.config.iterative_background
+        } else {
+            1 // no iteration without mesh background
+        };
 
-        let stars_detected = detected.len();
+        let mut bg_result = if let Some(cell_size) = self.config.background_mesh_size {
+            background::estimate_background_mesh(&lum, width, height, cell_size)
+        } else {
+            background::estimate_background(&lum, width, height)
+        };
+
+        let mut detected;
+        let final_fwhm;
+
+        // First detection pass (always runs)
+        {
+            let bg_map_ref = bg_result.background_map.as_deref();
+            let noise_map_ref = bg_result.noise_map.as_deref();
+            let initial_fwhm = 3.0_f32;
+            let pass1 = detection::detect_stars(
+                &lum, width, height,
+                bg_result.background, bg_result.noise,
+                bg_map_ref, noise_map_ref, &det_params, initial_fwhm,
+            );
+
+            let measured_kernel_fwhm = estimate_fwhm_from_stars(
+                &lum, width, height, &pass1, bg_result.background, bg_map_ref,
+            );
+
+            if measured_kernel_fwhm > 0.0
+                && ((measured_kernel_fwhm - initial_fwhm) / initial_fwhm).abs() > 0.30
+            {
+                detected = detection::detect_stars(
+                    &lum, width, height,
+                    bg_result.background, bg_result.noise,
+                    bg_map_ref, noise_map_ref, &det_params, measured_kernel_fwhm,
+                );
+                final_fwhm = measured_kernel_fwhm;
+            } else {
+                detected = pass1;
+                final_fwhm = initial_fwhm;
+            }
+        }
+
+        // Iterative source-masked background re-estimation (iterations 2..n)
+        if let Some(cell_size) = self.config.background_mesh_size {
+            for _ in 1..n_iterations {
+                if detected.is_empty() {
+                    break;
+                }
+
+                // Build source mask: circle of r = 2.5 × FWHM around each star
+                let mask_radius = (2.5 * final_fwhm).ceil() as i32;
+                let mask_r_sq = (mask_radius * mask_radius) as f32;
+                let mut source_mask = vec![false; width * height];
+                for star in &detected {
+                    let cx = star.x.round() as i32;
+                    let cy = star.y.round() as i32;
+                    for dy in -mask_radius..=mask_radius {
+                        let py = cy + dy;
+                        if py < 0 || py >= height as i32 { continue; }
+                        for dx in -mask_radius..=mask_radius {
+                            let px = cx + dx;
+                            if px < 0 || px >= width as i32 { continue; }
+                            if (dx * dx + dy * dy) as f32 <= mask_r_sq {
+                                source_mask[py as usize * width + px as usize] = true;
+                            }
+                        }
+                    }
+                }
+
+                // Re-estimate background excluding masked pixels
+                bg_result = background::estimate_background_mesh_masked(
+                    &lum, width, height, cell_size, &source_mask,
+                );
+
+                // Re-detect with updated background and noise map
+                let bg_map_ref = bg_result.background_map.as_deref();
+                let noise_map_ref = bg_result.noise_map.as_deref();
+                detected = detection::detect_stars(
+                    &lum, width, height,
+                    bg_result.background, bg_result.noise,
+                    bg_map_ref, noise_map_ref, &det_params, final_fwhm,
+                );
+            }
+        }
+
+        let bg_map_ref = bg_result.background_map.as_deref();
+
         let detection_threshold = self.config.detection_sigma * bg_result.noise;
 
         // ── Phase 1: Image-level trailing detection (Rayleigh test) ─────
@@ -384,7 +491,11 @@ impl ImageAnalyzer {
             (0.0, false)
         };
 
-        let zero_result = || {
+        let snr_db = snr::compute_snr_db(&lum, bg_result.noise);
+        let snr_weight = snr::compute_snr_weight(&lum, bg_result.background, bg_result.noise);
+
+        // Helper for zero-star results
+        let make_zero_result = |stars_detected: usize| {
             Ok(AnalysisResult {
                 width,
                 height,
@@ -398,19 +509,27 @@ impl ImageAnalyzer {
                 median_eccentricity: 0.0,
                 median_snr: 0.0,
                 median_hfr: 0.0,
-                snr_db: snr::compute_snr_db(&lum, bg_result.noise),
-                snr_weight: snr::compute_snr_weight(&lum, bg_result.background, bg_result.noise),
+                snr_db,
+                snr_weight,
                 psf_signal: 0.0,
                 trail_r_squared,
                 possibly_trailed,
+                measured_fwhm_kernel: final_fwhm,
+                median_beta: None,
             })
         };
 
-        if stars_detected == 0 {
-            return zero_result();
+        if detected.is_empty() {
+            return make_zero_result(0);
         }
 
-        // Measure PSF metrics
+        // Optional early cap: limit stars measured for speed
+        // (detected are already sorted by flux descending)
+        if let Some(max_m) = self.config.max_measure {
+            detected.truncate(max_m);
+        }
+
+        // Measure PSF metrics on all (possibly capped) detected stars
         let mut measured = metrics::measure_stars(
             &lum,
             width,
@@ -419,28 +538,25 @@ impl ImageAnalyzer {
             bg_result.background,
             bg_map_ref,
             self.config.use_gaussian_fit,
+            self.config.use_moffat_fit,
             green_mask,
         );
 
         if measured.is_empty() {
-            return zero_result();
+            return make_zero_result(0);
         }
 
-        // ── Phase 2: Per-star eccentricity filter (after measurement) ───
-        measured.retain(|s| s.eccentricity <= self.config.max_eccentricity);
+        // True count of stars with valid PSF measurements
+        let stars_detected = measured.len();
 
-        if measured.is_empty() {
-            return zero_result();
-        }
-
-        // Compute median FWHM for aperture sizing
+        // Compute statistics from ALL measured stars (no filtering, no cap)
         let mut fwhm_vals: Vec<f32> = measured.iter().map(|s| s.fwhm).collect();
         let median_fwhm = find_median(&mut fwhm_vals);
 
-        // Per-star SNR
+        // Per-star SNR on ALL measured stars
         snr::compute_star_snr(&lum, width, height, &mut measured, median_fwhm);
 
-        // Summary statistics
+        // Summary statistics from full population
         let mut ecc_vals: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
         let mut snr_vals: Vec<f32> = measured.iter().map(|s| s.snr).collect();
         let mut hfr_vals: Vec<f32> = measured.iter().map(|s| s.hfr).collect();
@@ -449,9 +565,22 @@ impl ImageAnalyzer {
         let median_snr = find_median(&mut snr_vals);
         let median_hfr = find_median(&mut hfr_vals);
 
-        let snr_db = snr::compute_snr_db(&lum, bg_result.noise);
-        let snr_weight = snr::compute_snr_weight(&lum, bg_result.background, bg_result.noise);
         let psf_signal = snr::compute_psf_signal(&measured, bg_result.noise);
+
+        // Compute median beta if Moffat fitting was used
+        let median_beta = if self.config.use_moffat_fit {
+            let mut beta_vals: Vec<f32> = measured.iter().filter_map(|s| s.beta).collect();
+            if beta_vals.is_empty() {
+                None
+            } else {
+                Some(find_median(&mut beta_vals))
+            }
+        } else {
+            None
+        };
+
+        // Late cap: truncate to max_stars AFTER all statistics are computed
+        measured.truncate(self.config.max_stars);
 
         // Convert to public StarMetrics
         let stars: Vec<StarMetrics> = measured
@@ -468,6 +597,7 @@ impl ImageAnalyzer {
                 snr: m.snr,
                 hfr: m.hfr,
                 theta: m.theta,
+                beta: m.beta,
             })
             .collect();
 
@@ -489,6 +619,8 @@ impl ImageAnalyzer {
             psf_signal,
             trail_r_squared,
             possibly_trailed,
+            measured_fwhm_kernel: final_fwhm,
+            median_beta,
         })
     }
 }
@@ -497,6 +629,62 @@ impl Default for ImageAnalyzer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Estimate FWHM from the brightest detected stars by extracting stamps
+/// and using `estimate_sigma_halfmax`. Returns median FWHM, or 0.0 if
+/// fewer than 3 stars yield valid measurements.
+fn estimate_fwhm_from_stars(
+    lum: &[f32],
+    width: usize,
+    height: usize,
+    stars: &[detection::DetectedStar],
+    background: f32,
+    bg_map: Option<&[f32]>,
+) -> f32 {
+    // Take top 20 brightest (already sorted by flux descending)
+    let top_n = stars.len().min(20);
+    if top_n < 3 {
+        return 0.0;
+    }
+
+    let mut fwhm_vals = Vec::with_capacity(top_n);
+    for star in &stars[..top_n] {
+        let stamp_radius = 12_usize; // enough for FWHM up to ~10px
+        let cx = star.x.round() as i32;
+        let cy = star.y.round() as i32;
+        let sr = stamp_radius as i32;
+        if cx - sr <= 0 || cy - sr <= 0
+            || cx + sr >= width as i32 - 1
+            || cy + sr >= height as i32 - 1
+        {
+            continue;
+        }
+        let x0 = (cx - sr) as usize;
+        let y0 = (cy - sr) as usize;
+        let x1 = (cx + sr) as usize;
+        let y1 = (cy + sr) as usize;
+        let stamp_w = x1 - x0 + 1;
+        let mut stamp = Vec::with_capacity(stamp_w * (y1 - y0 + 1));
+        for sy in y0..=y1 {
+            for sx in x0..=x1 {
+                let bg = bg_map.map_or(background, |m| m[sy * width + sx]);
+                stamp.push(lum[sy * width + sx] - bg);
+            }
+        }
+        let rel_cx = star.x - x0 as f32;
+        let rel_cy = star.y - y0 as f32;
+        let sigma = metrics::estimate_sigma_halfmax(&stamp, stamp_w, rel_cx, rel_cy);
+        let fwhm = sigma * 2.3548;
+        if fwhm > 1.0 && fwhm < 20.0 {
+            fwhm_vals.push(fwhm);
+        }
+    }
+
+    if fwhm_vals.len() < 3 {
+        return 0.0;
+    }
+    find_median(&mut fwhm_vals)
 }
 
 /// Build a boolean mask marking green CFA pixel positions.

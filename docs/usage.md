@@ -95,7 +95,7 @@ be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
 | `background` | `f32` | Global background level in ADU. |
 | `noise` | `f32` | Background noise sigma in ADU. |
 | `detection_threshold` | `f32` | Actual detection threshold used (ADU above background). |
-| `stars_detected` | `usize` | Total stars found before the `max_stars` cap. |
+| `stars_detected` | `usize` | Total stars with valid PSF measurements (statistics computed from all). |
 | `stars` | `Vec<StarMetrics>` | Per-star metrics, sorted by flux descending, capped at `max_stars`. |
 | `median_fwhm` | `f32` | Median FWHM across all measured stars (pixels). Good seeing: 2-3 px. |
 | `median_eccentricity` | `f32` | Median eccentricity. 0 = perfectly round. Values > 0.5 suggest tracking issues. |

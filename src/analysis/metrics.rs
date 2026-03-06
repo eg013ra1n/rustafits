@@ -1,7 +1,7 @@
 /// PSF metrics: windowed moments, optional 2D Gaussian fit, HFR.
 
 use super::detection::DetectedStar;
-use super::fitting::{fit_gaussian_2d, PixelSample};
+use super::fitting::{fit_gaussian_2d, fit_moffat_2d, PixelSample};
 
 /// Fully measured star with all metrics.
 pub(crate) struct MeasuredStar {
@@ -18,6 +18,8 @@ pub(crate) struct MeasuredStar {
     pub snr: f32,
     /// PSF position angle in radians, counter-clockwise from +X axis.
     pub theta: f32,
+    /// Moffat β parameter (None if Gaussian fit was used).
+    pub beta: Option<f32>,
 }
 
 const FWHM_FACTOR: f32 = 2.3548;
@@ -29,6 +31,7 @@ const FWHM_FACTOR: f32 = 2.3548;
 /// `background`: global background level.
 /// `bg_map`: optional per-pixel background map.
 /// `use_gaussian_fit`: if true, use full 2D Gaussian fit instead of windowed moments.
+/// `use_moffat`: if true, try Moffat fit first, falling back to Gaussian on failure.
 pub(crate) fn measure_stars(
     data: &[f32],
     width: usize,
@@ -37,6 +40,7 @@ pub(crate) fn measure_stars(
     background: f32,
     bg_map: Option<&[f32]>,
     use_gaussian_fit: bool,
+    use_moffat: bool,
     green_mask: Option<&[bool]>,
 ) -> Vec<MeasuredStar> {
     use rayon::prelude::*;
@@ -44,7 +48,7 @@ pub(crate) fn measure_stars(
     stars
         .par_iter()
         .filter_map(|star| {
-            measure_single_star(data, width, height, star, background, bg_map, use_gaussian_fit, green_mask)
+            measure_single_star(data, width, height, star, background, bg_map, use_gaussian_fit, use_moffat, green_mask)
         })
         .collect()
 }
@@ -57,6 +61,7 @@ fn measure_single_star(
     background: f32,
     bg_map: Option<&[f32]>,
     use_gaussian_fit: bool,
+    use_moffat: bool,
     green_mask: Option<&[bool]>,
 ) -> Option<MeasuredStar> {
     // Estimate sigma from the star's area: area ≈ π*(2σ)² for a Gaussian at low_threshold
@@ -119,6 +124,12 @@ fn measure_single_star(
     // Compute HFR within the star vicinity (not the entire stamp)
     let hfr = compute_hfr(&stamp, stamp_w, rel_cx, rel_cy, hfr_radius, stamp_mask_ref);
 
+    if use_moffat {
+        // Try Moffat first, fall back to Gaussian
+        if let Some(result) = measure_with_moffat_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref) {
+            return Some(result);
+        }
+    }
     if use_gaussian_fit {
         // Full 2D Gaussian fit
         measure_with_gaussian_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref)
@@ -276,6 +287,7 @@ fn measure_with_moments(
         hfr,
         snr: 0.0,
         theta: theta as f32,
+        beta: None,
     })
 }
 
@@ -434,13 +446,25 @@ fn measure_with_gaussian_fit(
         return None;
     }
 
-    let fwhm_x = FWHM_FACTOR as f64 * result.sigma_x;
-    let fwhm_y = FWHM_FACTOR as f64 * result.sigma_y;
+    // Canonicalize: ensure fwhm_x >= fwhm_y with theta along the major axis.
+    // The LM optimizer can converge with sigma_x < sigma_y (equivalent PSF,
+    // just relabeled axes), so we swap and rotate theta by π/2 if needed.
+    let (fwhm_x, fwhm_y, theta) = if result.sigma_x >= result.sigma_y {
+        (
+            FWHM_FACTOR as f64 * result.sigma_x,
+            FWHM_FACTOR as f64 * result.sigma_y,
+            result.theta,
+        )
+    } else {
+        (
+            FWHM_FACTOR as f64 * result.sigma_y,
+            FWHM_FACTOR as f64 * result.sigma_x,
+            result.theta + std::f64::consts::FRAC_PI_2,
+        )
+    };
     let fwhm = (fwhm_x * fwhm_y).sqrt();
 
-    let min_s = result.sigma_x.min(result.sigma_y);
-    let max_s = result.sigma_x.max(result.sigma_y);
-    let eccentricity = (1.0 - (min_s * min_s) / (max_s * max_s)).max(0.0).sqrt();
+    let eccentricity = (1.0 - (fwhm_y * fwhm_y) / (fwhm_x * fwhm_x)).max(0.0).sqrt();
 
     Some(MeasuredStar {
         x: (result.x0 + x0 as f64) as f32,
@@ -453,7 +477,131 @@ fn measure_with_gaussian_fit(
         eccentricity: eccentricity as f32,
         hfr,
         snr: 0.0,
-        theta: result.theta as f32,
+        theta: theta as f32,
+        beta: None,
+    })
+}
+
+/// Measure using full 2D elliptical Moffat fit.
+/// Falls back to None (caller will try Gaussian) on non-convergence.
+fn measure_with_moffat_fit(
+    stamp: &[f32],
+    stamp_w: usize,
+    stamp_h: usize,
+    init_cx: f32,
+    init_cy: f32,
+    init_sigma: f32,
+    star: &DetectedStar,
+    hfr: f32,
+    x0: usize,
+    y0: usize,
+    stamp_mask: Option<&[bool]>,
+) -> Option<MeasuredStar> {
+    let fitting_radius = 5.0_f64.max(4.0 * init_sigma as f64);
+    let fitting_radius_sq = fitting_radius * fitting_radius;
+    let cx64 = init_cx as f64;
+    let cy64 = init_cy as f64;
+
+    let pixels: Vec<PixelSample> = (0..stamp_h)
+        .flat_map(|sy| {
+            (0..stamp_w).filter_map(move |sx| {
+                if let Some(mask) = stamp_mask {
+                    if !mask[sy * stamp_w + sx] { return None; }
+                }
+                let dx = sx as f64 - cx64;
+                let dy = sy as f64 - cy64;
+                if dx * dx + dy * dy <= fitting_radius_sq {
+                    Some(PixelSample {
+                        x: sx as f64,
+                        y: sy as f64,
+                        value: stamp[sy * stamp_w + sx] as f64,
+                    })
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    // Background from annulus
+    let bg_inner_sq = fitting_radius_sq;
+    let bg_outer = fitting_radius + 3.0;
+    let bg_outer_sq = bg_outer * bg_outer;
+    let mut annulus_vals = Vec::new();
+    for sy in 0..stamp_h {
+        for sx in 0..stamp_w {
+            let dx = sx as f64 - cx64;
+            let dy = sy as f64 - cy64;
+            let r_sq = dx * dx + dy * dy;
+            if r_sq > bg_inner_sq && r_sq <= bg_outer_sq {
+                annulus_vals.push(stamp[sy * stamp_w + sx] as f64);
+            }
+        }
+    }
+    annulus_vals.sort_by(|a, b| a.total_cmp(b));
+    let init_bg = if annulus_vals.is_empty() {
+        let mut edge_vals = Vec::new();
+        for sx in 0..stamp_w {
+            edge_vals.push(stamp[sx] as f64);
+            edge_vals.push(stamp[(stamp_h - 1) * stamp_w + sx] as f64);
+        }
+        for sy in 1..stamp_h - 1 {
+            edge_vals.push(stamp[sy * stamp_w] as f64);
+            edge_vals.push(stamp[sy * stamp_w + stamp_w - 1] as f64);
+        }
+        edge_vals.sort_by(|a, b| a.total_cmp(b));
+        if edge_vals.is_empty() { 0.0 } else { edge_vals[edge_vals.len() / 2] }
+    } else {
+        annulus_vals[annulus_vals.len() / 2]
+    };
+
+    let (mom_theta, mom_major, mom_minor) = moments_ellipse(stamp, stamp_w, init_cx, init_cy);
+    let scale = init_sigma as f64 / (mom_major * mom_minor).sqrt().max(0.1);
+    let init_sx = (mom_major * scale).max(0.5);
+    let init_sy = (mom_minor * scale).max(0.5);
+
+    let result = fit_moffat_2d(
+        &pixels,
+        init_bg,
+        star.peak as f64 - init_bg,
+        init_cx as f64,
+        init_cy as f64,
+        init_sx,
+        init_sy,
+        mom_theta,
+    )?;
+
+    // Reject divergent fits
+    let max_alpha = (init_sigma as f64) * 5.0;
+    if result.alpha_x > max_alpha || result.alpha_y > max_alpha
+        || result.alpha_x <= 0.0 || result.alpha_y <= 0.0
+    {
+        return None;
+    }
+
+    // Canonicalize: ensure fwhm_x >= fwhm_y with theta along the major axis.
+    let (fwhm_x, fwhm_y, theta) = if result.alpha_x >= result.alpha_y {
+        (result.fwhm_x(), result.fwhm_y(), result.theta)
+    } else {
+        (result.fwhm_y(), result.fwhm_x(), result.theta + std::f64::consts::FRAC_PI_2)
+    };
+    let fwhm = (fwhm_x * fwhm_y).sqrt();
+
+    let eccentricity = (1.0 - (fwhm_y * fwhm_y) / (fwhm_x * fwhm_x)).max(0.0).sqrt();
+
+    Some(MeasuredStar {
+        x: (result.x0 + x0 as f64) as f32,
+        y: (result.y0 + y0 as f64) as f32,
+        peak: star.peak,
+        flux: star.flux,
+        fwhm_x: fwhm_x as f32,
+        fwhm_y: fwhm_y as f32,
+        fwhm: fwhm as f32,
+        eccentricity: eccentricity as f32,
+        hfr,
+        snr: 0.0,
+        theta: theta as f32,
+        beta: Some(result.beta as f32),
     })
 }
 
@@ -465,7 +613,7 @@ fn measure_with_gaussian_fit(
 /// averages those distances. Converts half-max radius to sigma via `r / sqrt(2 * ln(2))`.
 ///
 /// Falls back to capped second-moment estimate if fewer than 4 directions cross half-max.
-fn estimate_sigma_halfmax(stamp: &[f32], stamp_w: usize, cx: f32, cy: f32) -> f32 {
+pub(crate) fn estimate_sigma_halfmax(stamp: &[f32], stamp_w: usize, cx: f32, cy: f32) -> f32 {
     let stamp_h = stamp.len() / stamp_w;
 
     // Local background from annulus at r=4..8 pixels from centroid.
@@ -729,6 +877,53 @@ mod tests {
             moments_result.fwhm,
             fit_result.fwhm,
             diff_pct
+        );
+    }
+
+    #[test]
+    fn test_gaussian_fit_canonical_axis_ordering() {
+        // Generate a star whose major axis is along theta=π/4.
+        // sigma_x=2 < sigma_y=5 in the raw model, so the optimizer may
+        // converge with sigma_x < sigma_y. After canonicalization, the output
+        // must always have fwhm_x >= fwhm_y with theta rotated to match.
+        let size = 41;
+        let sx = 2.0_f32; // minor spread along theta
+        let sy = 5.0_f32; // major spread perp to theta
+        let theta = std::f32::consts::FRAC_PI_4;
+        let stamp = make_gaussian_stamp(size, 20.0, 20.0, 5000.0, sx, sy, theta);
+        let star = DetectedStar {
+            x: 20.0,
+            y: 20.0,
+            peak: 5000.0,
+            flux: 50000.0,
+            area: 80,
+            theta: 0.0,
+            eccentricity: 0.0,
+        };
+
+        let init_sigma = (sx * sy).sqrt();
+        let result =
+            measure_with_gaussian_fit(&stamp, size, size, 20.0, 20.0, init_sigma, &star, 4.0, 0, 0, None)
+                .unwrap();
+
+        // fwhm_x must be >= fwhm_y (canonical ordering)
+        assert!(
+            result.fwhm_x >= result.fwhm_y,
+            "fwhm_x ({}) must be >= fwhm_y ({}) after canonicalization",
+            result.fwhm_x, result.fwhm_y
+        );
+
+        // The major axis direction (theta) should point along the larger spread.
+        // The input has sigma_y=5 perpendicular to theta=π/4, so the canonical
+        // major axis should be at theta + π/2 = 3π/4, or equivalently -π/4.
+        // Allow equivalence modulo π (ellipse is symmetric).
+        let expected_major_theta = theta + std::f32::consts::FRAC_PI_2;
+        let diff = ((result.theta - expected_major_theta) % std::f32::consts::PI).abs();
+        let diff = diff.min(std::f32::consts::PI - diff);
+        assert!(
+            diff < 0.15,
+            "theta {} expected ~{} (mod π), diff={}",
+            result.theta, expected_major_theta, diff
         );
     }
 

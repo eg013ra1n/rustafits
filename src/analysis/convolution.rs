@@ -1,0 +1,361 @@
+/// Separable Gaussian convolution with SIMD dispatch.
+///
+/// A 2D Gaussian is separable into two 1D passes: horizontal then vertical.
+/// For kernel half-width K, this is O(W×H×2K) vs O(W×H×K²) for naive 2D.
+///
+/// SIMD dispatch: AVX2 (8 px FMA), SSE2 (4 px FMA), NEON (4 px vfma).
+
+use rayon::prelude::*;
+
+/// Generate a zero-sum 1D Gaussian kernel.
+///
+/// Returns `(kernel, kernel_energy_sq)` where kernel has length `2*radius+1`,
+/// is zero-mean (DAOFIND-style), and `kernel_energy_sq = Σ k²`.
+pub(crate) fn generate_1d_kernel(sigma: f32) -> (Vec<f32>, f32) {
+    let radius = (2.0 * sigma).ceil() as usize;
+    let ksize = 2 * radius + 1;
+    let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
+
+    let mut kernel = Vec::with_capacity(ksize);
+    let mut ksum = 0.0_f32;
+    for i in 0..ksize {
+        let d = i as f32 - radius as f32;
+        let g = (-inv_2s2 * d * d).exp();
+        kernel.push(g);
+        ksum += g;
+    }
+
+    // Subtract mean to make zero-sum
+    let kmean = ksum / ksize as f32;
+    let mut energy_sq = 0.0_f32;
+    for v in kernel.iter_mut() {
+        *v -= kmean;
+        energy_sq += *v * *v;
+    }
+
+    (kernel, energy_sq)
+}
+
+/// Separable convolution: horizontal pass, then vertical pass.
+///
+/// Output is written to `output` (must be `width * height` elements).
+/// The effective kernel_energy_sq for the 2D separable kernel is
+/// `h_energy * v_energy` (returned by caller from two `generate_1d_kernel` calls,
+/// but since both are the same kernel, it's `energy_sq²`).
+///
+/// Pixels within `radius` of the border are left as 0.0.
+pub(crate) fn separable_convolve(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    kernel: &[f32],
+    output: &mut [f32],
+) {
+    let radius = kernel.len() / 2;
+
+    // Temporary buffer for horizontal pass result
+    let mut hpass = vec![0.0_f32; width * height];
+
+    // Horizontal pass (parallelize over rows)
+    hpass
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let src_row = &data[y * width..(y + 1) * width];
+            convolve_row_1d(src_row, kernel, radius, row);
+        });
+
+    // Vertical pass (parallelize over rows)
+    output
+        .par_chunks_mut(width) // We'll use a different parallel strategy
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            if y < radius || y >= height - radius {
+                return;
+            }
+            convolve_vertical_row(&hpass, width, height, kernel, radius, y, out_row);
+        });
+}
+
+/// Convolve a single row with a 1D kernel. SIMD dispatch with scalar fallback.
+#[inline]
+fn convolve_row_1d(src: &[f32], kernel: &[f32], radius: usize, dst: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { convolve_row_avx2(src, kernel, radius, dst) };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { convolve_row_neon(src, kernel, radius, dst) };
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let width = src.len();
+        let ksize = kernel.len();
+        for x in radius..(width - radius) {
+            let mut sum = 0.0_f32;
+            for k in 0..ksize {
+                sum += src[x + k - radius] * kernel[k];
+            }
+            dst[x] = sum;
+        }
+    }
+}
+
+/// Convolve a single output row vertically by gathering from hpass columns.
+#[inline]
+fn convolve_vertical_row(
+    hpass: &[f32],
+    width: usize,
+    _height: usize,
+    kernel: &[f32],
+    radius: usize,
+    y: usize,
+    dst: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { convolve_vertical_row_avx2(hpass, width, kernel, radius, y, dst) };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { convolve_vertical_row_neon(hpass, width, kernel, radius, y, dst) };
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let ksize = kernel.len();
+        for x in radius..(width - radius) {
+            let mut sum = 0.0_f32;
+            for k in 0..ksize {
+                let iy = y + k - radius;
+                sum += hpass[iy * width + x] * kernel[k];
+            }
+            dst[x] = sum;
+        }
+    }
+}
+
+// ── AVX2 implementations ────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn convolve_row_avx2(src: &[f32], kernel: &[f32], radius: usize, dst: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    let width = src.len();
+    let ksize = kernel.len();
+    let end = width - radius;
+    let mut x = radius;
+
+    // Process 8 pixels at a time
+    while x + 8 <= end {
+        let mut acc = _mm256_setzero_ps();
+        for k in 0..ksize {
+            let kval = _mm256_set1_ps(kernel[k]);
+            let src_ptr = src.as_ptr().add(x + k - radius);
+            let pixels = _mm256_loadu_ps(src_ptr);
+            acc = _mm256_fmadd_ps(pixels, kval, acc);
+        }
+        _mm256_storeu_ps(dst.as_mut_ptr().add(x), acc);
+        x += 8;
+    }
+
+    // Scalar tail
+    while x < end {
+        let mut sum = 0.0_f32;
+        for k in 0..ksize {
+            sum += src[x + k - radius] * kernel[k];
+        }
+        dst[x] = sum;
+        x += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn convolve_vertical_row_avx2(
+    hpass: &[f32],
+    width: usize,
+    kernel: &[f32],
+    radius: usize,
+    y: usize,
+    dst: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let ksize = kernel.len();
+    let end = width - radius;
+    let mut x = radius;
+
+    while x + 8 <= end {
+        let mut acc = _mm256_setzero_ps();
+        for k in 0..ksize {
+            let iy = y + k - radius;
+            let kval = _mm256_set1_ps(kernel[k]);
+            let src_ptr = hpass.as_ptr().add(iy * width + x);
+            let pixels = _mm256_loadu_ps(src_ptr);
+            acc = _mm256_fmadd_ps(pixels, kval, acc);
+        }
+        _mm256_storeu_ps(dst.as_mut_ptr().add(x), acc);
+        x += 8;
+    }
+
+    while x < end {
+        let mut sum = 0.0_f32;
+        for k in 0..ksize {
+            let iy = y + k - radius;
+            sum += hpass[iy * width + x] * kernel[k];
+        }
+        dst[x] = sum;
+        x += 1;
+    }
+}
+
+// ── NEON implementations ────────────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn convolve_row_neon(src: &[f32], kernel: &[f32], radius: usize, dst: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    let width = src.len();
+    let ksize = kernel.len();
+    let end = width - radius;
+    let mut x = radius;
+
+    while x + 4 <= end {
+        let mut acc = vdupq_n_f32(0.0);
+        for k in 0..ksize {
+            let kval = vdupq_n_f32(kernel[k]);
+            let pixels = vld1q_f32(src.as_ptr().add(x + k - radius));
+            acc = vfmaq_f32(acc, pixels, kval);
+        }
+        vst1q_f32(dst.as_mut_ptr().add(x), acc);
+        x += 4;
+    }
+
+    while x < end {
+        let mut sum = 0.0_f32;
+        for k in 0..ksize {
+            sum += src[x + k - radius] * kernel[k];
+        }
+        dst[x] = sum;
+        x += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn convolve_vertical_row_neon(
+    hpass: &[f32],
+    width: usize,
+    kernel: &[f32],
+    radius: usize,
+    y: usize,
+    dst: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    let ksize = kernel.len();
+    let end = width - radius;
+    let mut x = radius;
+
+    while x + 4 <= end {
+        let mut acc = vdupq_n_f32(0.0);
+        for k in 0..ksize {
+            let iy = y + k - radius;
+            let kval = vdupq_n_f32(kernel[k]);
+            let pixels = vld1q_f32(hpass.as_ptr().add(iy * width + x));
+            acc = vfmaq_f32(acc, pixels, kval);
+        }
+        vst1q_f32(dst.as_mut_ptr().add(x), acc);
+        x += 4;
+    }
+
+    while x < end {
+        let mut sum = 0.0_f32;
+        for k in 0..ksize {
+            let iy = y + k - radius;
+            sum += hpass[iy * width + x] * kernel[k];
+        }
+        dst[x] = sum;
+        x += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_1d_kernel_zero_sum() {
+        let (kernel, energy) = generate_1d_kernel(1.5);
+        let sum: f32 = kernel.iter().sum();
+        assert!(sum.abs() < 1e-5, "Kernel sum {} should be ~0", sum);
+        assert!(energy > 0.0, "Energy should be positive");
+    }
+
+    #[test]
+    fn test_separable_detects_point_source() {
+        // Verify separable convolution finds a point source at the correct location
+        // and suppresses flat background (zero-sum property).
+        let width = 100;
+        let height = 100;
+        let sigma = 1.5_f32;
+
+        // Point source on flat background
+        let mut data = vec![1000.0_f32; width * height];
+        data[50 * width + 50] += 5000.0;
+
+        let (kernel_1d, _) = generate_1d_kernel(sigma);
+        let radius = kernel_1d.len() / 2;
+        let mut output = vec![0.0_f32; width * height];
+        separable_convolve(&data, width, height, &kernel_1d, &mut output);
+
+        // Peak should be at (50, 50)
+        let peak_val = output.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let peak_idx = output.iter().position(|&v| v == peak_val).unwrap();
+        assert_eq!(peak_idx, 50 * width + 50, "Peak should be at (50, 50)");
+        assert!(peak_val > 100.0, "Peak response should be strongly positive");
+
+        // Away from the point source, response should be near zero (flat bg suppressed)
+        let far_val = output[20 * width + 20];
+        assert!(
+            far_val.abs() < 1.0,
+            "Far from source, response {} should be ~0",
+            far_val
+        );
+    }
+
+    #[test]
+    fn test_separable_flat_image_zero_output() {
+        // A flat image convolved with a zero-sum kernel should produce ~0
+        let width = 50;
+        let height = 50;
+        let data = vec![1000.0_f32; width * height];
+        let (kernel, _) = generate_1d_kernel(1.5);
+        let mut output = vec![0.0_f32; width * height];
+        separable_convolve(&data, width, height, &kernel, &mut output);
+
+        let radius = kernel.len() / 2;
+        for y in radius..(height - radius) {
+            for x in radius..(width - radius) {
+                assert!(
+                    output[y * width + x].abs() < 0.1,
+                    "Flat image at ({},{}) = {} should be ~0",
+                    x, y, output[y * width + x]
+                );
+            }
+        }
+    }
+}

@@ -103,24 +103,23 @@ pub fn compute_annotations(
             };
 
             // Semi-axes: scale FWHM to output, multiply by 2.5 for visibility, then clamp.
-            // Use the larger of (fwhm_x, fwhm_y) as major and smaller as minor,
-            // preserving the axis ratio so elongation is clearly visible.
-            let (raw_a, raw_b) = if star.fwhm_x >= star.fwhm_y {
-                (star.fwhm_x * scale_x, star.fwhm_y * scale_y)
-            } else {
-                (star.fwhm_y * scale_y, star.fwhm_x * scale_x)
-            };
+            // metrics.rs guarantees fwhm_x >= fwhm_y with theta along major axis.
+            let raw_a = star.fwhm_x * scale_x;
+            let raw_b = star.fwhm_y * scale_y;
             let semi_major = (raw_a * 2.5).clamp(config.min_radius, config.max_radius);
             let semi_minor = (raw_b * 2.5).clamp(config.min_radius, config.max_radius);
 
             let color = star_color(config, star.eccentricity, star.fwhm, result.median_fwhm);
+
+            // Y-flip reflects through the horizontal axis, negating the angle.
+            let theta = if flip_vertical { -star.theta } else { star.theta };
 
             StarAnnotation {
                 x: x_out,
                 y: y_out,
                 semi_major,
                 semi_minor,
-                theta: star.theta,
+                theta,
                 eccentricity: star.eccentricity,
                 fwhm: star.fwhm,
                 color,
@@ -459,6 +458,8 @@ mod tests {
             psf_signal: 50.0,
             trail_r_squared: 0.0,
             possibly_trailed: false,
+            measured_fwhm_kernel: 3.0,
+            median_beta: None,
             stars,
         }
     }
@@ -475,6 +476,7 @@ mod tests {
             snr: 50.0,
             hfr: fwhm * 0.6,
             theta: 0.0,
+            beta: None,
         }
     }
 
@@ -546,6 +548,36 @@ mod tests {
         // Check that some alpha values are 255 (drawn pixels)
         let drawn = layer.chunks_exact(4).filter(|px| px[3] == 255).count();
         assert!(drawn > 0, "Expected some drawn pixels in layer");
+    }
+
+    #[test]
+    fn test_flip_vertical_negates_theta() {
+        let theta = std::f32::consts::FRAC_PI_6; // 30°
+        let star = StarMetrics {
+            x: 50.0,
+            y: 25.0,
+            peak: 1000.0,
+            flux: 5000.0,
+            fwhm_x: 8.0,
+            fwhm_y: 4.0,
+            fwhm: 5.66,
+            eccentricity: 0.87,
+            snr: 50.0,
+            hfr: 3.0,
+            theta,
+            beta: None,
+        };
+        let result = dummy_result(vec![star]);
+        let config = AnnotationConfig::default();
+
+        let anns_no_flip = compute_annotations(&result, 100, 100, false, &config);
+        let anns_flipped = compute_annotations(&result, 100, 100, true, &config);
+
+        assert!((anns_no_flip[0].theta - theta).abs() < 1e-6,
+            "without flip, theta should be unchanged");
+        assert!((anns_flipped[0].theta - (-theta)).abs() < 1e-6,
+            "with flip, theta should be negated: got {} expected {}",
+            anns_flipped[0].theta, -theta);
     }
 
     #[test]

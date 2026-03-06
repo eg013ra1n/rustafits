@@ -101,36 +101,37 @@ Star Stamp
     |
     v
 +-----------------------------+
-| Convert to FWHM             |
-|   FWHM_x = 2.3548 * sigma_x|
-|   FWHM_y = 2.3548 * sigma_y|
-|   FWHM = sqrt(Fx * Fy)     |  geometric mean
+| Canonicalize & Convert      |  Ensure fwhm_x >= fwhm_y, theta along major:
+|                             |
+|   if sigma_x >= sigma_y:   |
+|     FWHM_x = 2.3548 * sx   |
+|     FWHM_y = 2.3548 * sy   |
+|     theta  = theta          |
+|   else:                     |
+|     FWHM_x = 2.3548 * sy   |  swap axes
+|     FWHM_y = 2.3548 * sx   |
+|     theta  = theta + pi/2  |  rotate to match
+|                             |
+|   FWHM = sqrt(Fx * Fy)     |  geometric mean (invariant)
 +-----------------------------+
     |
     v
 +-----------------------------+
 | Eccentricity                |
-|   min_s = min(sx, sy)       |
-|   max_s = max(sx, sy)       |
-|   e = sqrt(1 - min^2/max^2) |
-+-----------------------------+
-    |
-    v
-+-----------------------------+
-| Theta (moments-based)       |  Always from I-weighted second moments,
-|                             |  NOT from the Gaussian fitter's theta.
-|                             |  See note below.
+|   e = sqrt(1 - Fy^2/Fx^2)  |  fwhm_x is guaranteed major
 +-----------------------------+
 ```
 
 **Accuracy:** Matches PixInsight FWHMEccentricity within ~2% on typical data.
 
-**Note on theta:** The position angle is always computed from intensity-weighted
-second-order moments over the stamp, even when using Gaussian fitting for FWHM.
-The Gaussian fitter only fits theta for stars with ellipticity > 0.1 and may
-return 0 for round sources. The moments-based theta is defined for all shapes
-and carries directional signal even for barely-elongated trail knots — this is
-critical for the Rayleigh trail rejection test to work on oversampled trails.
+**Note on axis canonicalization:** The LM optimizer has a degeneracy — the pair
+(sigma_x, sigma_y, theta) produces an identical PSF to (sigma_y, sigma_x,
+theta + π/2). For nearly-round stars the theta gradient vanishes and the
+optimizer freely drifts across the degeneracy ridge. The canonicalization step
+ensures a consistent invariant (fwhm_x ≥ fwhm_y, theta along major axis) for
+all downstream consumers (annotation ellipses, direction ticks). The same
+canonicalization applies to Moffat fits. The moments path already produces
+canonical output because eigenvalues are sorted by construction.
 
 ### Method 2: Windowed Moments (Fast Path)
 

@@ -24,7 +24,6 @@ pub(crate) struct DetectionParams {
     pub min_star_area: usize,
     pub max_star_area: usize,
     pub saturation_limit: f32,
-    pub max_stars: usize,
 }
 
 impl Default for DetectionParams {
@@ -34,7 +33,6 @@ impl Default for DetectionParams {
             min_star_area: 5,
             max_star_area: 2000,
             saturation_limit: 0.95 * 65535.0,
-            max_stars: 200,
         }
     }
 }
@@ -45,6 +43,8 @@ impl Default for DetectionParams {
 /// `background`: global background level.
 /// `noise`: background noise sigma.
 /// `bg_map`: optional per-pixel background map (from mesh-grid estimation).
+/// `noise_map`: optional per-pixel noise map for adaptive thresholds.
+/// `fwhm`: estimated FWHM for matched filter kernel (pixels).
 pub(crate) fn detect_stars(
     data: &[f32],
     width: usize,
@@ -52,62 +52,38 @@ pub(crate) fn detect_stars(
     background: f32,
     noise: f32,
     bg_map: Option<&[f32]>,
+    noise_map: Option<&[f32]>,
     params: &DetectionParams,
+    fwhm: f32,
 ) -> Vec<DetectedStar> {
-    // Stage 1: Gaussian convolution + peak detection
-    let estimated_fwhm = 3.0_f32; // Default initial estimate
-    let sigma = estimated_fwhm / 2.3548;
-    let radius = (2.0 * sigma).ceil() as usize;
-    let ksize = 2 * radius + 1;
+    // Stage 1: Separable Gaussian convolution + peak detection
+    let sigma = fwhm / 2.3548;
+    let (kernel_1d, energy_1d) = super::convolution::generate_1d_kernel(sigma);
+    let radius = kernel_1d.len() / 2;
 
-    // Generate zero-sum Gaussian kernel (DAOFIND key insight)
-    let mut kernel = vec![0.0_f32; ksize * ksize];
-    let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
-    let mut ksum = 0.0_f32;
-    for ky in 0..ksize {
-        for kx in 0..ksize {
-            let dy = ky as f32 - radius as f32;
-            let dx = kx as f32 - radius as f32;
-            let g = (-inv_2s2 * (dx * dx + dy * dy)).exp();
-            kernel[ky * ksize + kx] = g;
-            ksum += g;
-        }
-    }
-    // Subtract mean to make zero-sum
-    let kmean = ksum / (ksize * ksize) as f32;
-    let mut kernel_energy_sq = 0.0_f32;
-    for v in kernel.iter_mut() {
-        *v -= kmean;
-        kernel_energy_sq += *v * *v;
-    }
+    // Separable kernel energy: the 2D kernel K(x,y) = h(x)×v(y), so
+    // Σ K² = (Σ h²) × (Σ v²) = energy_1d² (same kernel both axes).
+    let kernel_energy_sq = energy_1d * energy_1d;
 
     // Convolution threshold: detection_sigma × noise × sqrt(Σ K²)
     let threshold = params.detection_sigma * noise * kernel_energy_sq.sqrt();
 
-    // Convolve image with kernel and find local maxima
+    // Separable convolution (SIMD-accelerated horizontal + vertical passes)
     let mut conv = vec![0.0_f32; width * height];
-    for y in radius..(height - radius) {
-        for x in radius..(width - radius) {
-            let mut sum = 0.0_f32;
-            for ky in 0..ksize {
-                let iy = y + ky - radius;
-                let row_off = iy * width;
-                let k_row_off = ky * ksize;
-                for kx in 0..ksize {
-                    let ix = x + kx - radius;
-                    sum += data[row_off + ix] * kernel[k_row_off + kx];
-                }
-            }
-            conv[y * width + x] = sum;
-        }
-    }
+    super::convolution::separable_convolve(data, width, height, &kernel_1d, &mut conv);
 
     // Peak detection: conv > threshold AND conv > all 8 neighbors
+    // When noise_map is available, use local adaptive threshold per pixel.
     let mut peaks: Vec<(usize, usize, f32)> = Vec::new();
     for y in (radius + 1)..(height - radius - 1) {
         for x in (radius + 1)..(width - radius - 1) {
             let c = conv[y * width + x];
-            if c <= threshold {
+            let local_threshold = if let Some(nm) = noise_map {
+                params.detection_sigma * nm[y * width + x] * kernel_energy_sq.sqrt()
+            } else {
+                threshold
+            };
+            if c <= local_threshold {
                 continue;
             }
             // 8-neighbor comparison
@@ -170,7 +146,7 @@ pub(crate) fn detect_stars(
     }
 
     // Stage 2: CCL with Union-Find on thresholded original image
-    let low_threshold = 1.5 * noise; // Lower threshold to capture star wings
+    let low_threshold_global = 1.5 * noise; // Lower threshold to capture star wings
 
     // Build binary mask and label via two-pass CCL
     let mut labels = vec![0u32; width * height];
@@ -182,6 +158,11 @@ pub(crate) fn detect_stars(
         for x in 0..width {
             let bg = bg_map.map_or(background, |m| m[y * width + x]);
             let val = data[y * width + x] - bg;
+            let low_threshold = if let Some(nm) = noise_map {
+                1.5 * nm[y * width + x]
+            } else {
+                low_threshold_global
+            };
             if !val.is_finite() || val <= low_threshold {
                 continue;
             }
@@ -290,9 +271,8 @@ pub(crate) fn detect_stars(
         }
     }
 
-    // Sort by flux descending, keep top max_stars
+    // Sort by flux descending (useful for two-pass FWHM estimation on top-20 brightest)
     stars.sort_by(|a, b| b.flux.total_cmp(&a.flux));
-    stars.truncate(params.max_stars);
 
     stars
 }
@@ -370,7 +350,7 @@ fn process_component(
     let bbox_w = (max_x - min_x + 1) as f32;
     let bbox_h = (max_y - min_y + 1) as f32;
     let aspect = bbox_w.max(bbox_h) / bbox_w.min(bbox_h);
-    if aspect > 3.0 {
+    if aspect > 8.0 {
         return None;
     }
 
@@ -527,10 +507,9 @@ mod tests {
             min_star_area: 5,
             max_star_area: 2000,
             saturation_limit: 0.95 * 65535.0,
-            max_stars: 200,
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, &params);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
 
         // Should detect all 5 stars
         assert!(
@@ -595,7 +574,7 @@ mod tests {
             ..DetectionParams::default()
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, &params);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
 
         // Should detect the real star but not the hot pixel
         assert!(
@@ -635,10 +614,9 @@ mod tests {
             min_star_area: 3,
             max_star_area: 2000,
             saturation_limit: 0.95 * 65535.0,
-            max_stars: 200,
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, &params);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
 
         assert!(
             stars.len() >= 2,
@@ -711,10 +689,9 @@ mod tests {
             min_star_area: 5,
             max_star_area: 2000,
             saturation_limit: 0.95 * 65535.0,
-            max_stars: 200,
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, &params);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
 
         // All 5 real stars should be detected
         for &(sx, sy, _, _) in &star_defs {

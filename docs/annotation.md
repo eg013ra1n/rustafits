@@ -190,7 +190,14 @@ scale_y = output_height / result.height
 
 x_out = star.x * scale_x
 y_out = star.y * scale_y          (or flipped if flip_vertical)
+theta = -star.theta               (negated if flip_vertical, else unchanged)
 ```
+
+When `flip_vertical` is true (FITS images are Y-up, output is Y-down), the
+Y-axis reflection reverses the handedness of the coordinate system. Angles
+measured counter-clockwise from +X become clockwise, so theta is negated to
+keep the annotation ellipse and direction ticks aligned with the actual star
+elongation in the output image.
 
 `ProcessedImage` carries a `flip_vertical` field set during processing. The
 `annotate_image()` function reads it automatically. For `compute_annotations()`

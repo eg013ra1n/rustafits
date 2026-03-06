@@ -135,15 +135,27 @@ The fit result is rejected (returns `None`) if:
 
 ### FWHM and Eccentricity from Fit
 
-```
-FWHM_x = 2.3548 * sigma_x
-FWHM_y = 2.3548 * sigma_y
-FWHM   = sqrt(FWHM_x * FWHM_y)     (geometric mean)
+The LM optimizer can converge with sigma_x < sigma_y (the PSF is identical with
+swapped axes and theta rotated by π/2). The metrics layer canonicalizes the output
+so that **fwhm_x ≥ fwhm_y** and **theta points along the major axis**:
 
-min_s  = min(sigma_x, sigma_y)
-max_s  = max(sigma_x, sigma_y)
-eccentricity = sqrt(1 - min_s^2 / max_s^2)
 ```
+if sigma_x >= sigma_y:
+    FWHM_x = 2.3548 * sigma_x        (major)
+    FWHM_y = 2.3548 * sigma_y        (minor)
+    theta  = theta                    (unchanged)
+else:
+    FWHM_x = 2.3548 * sigma_y        (major — was the y-axis)
+    FWHM_y = 2.3548 * sigma_x        (minor — was the x-axis)
+    theta  = theta + π/2             (rotated to match new major)
+
+FWHM   = sqrt(FWHM_x * FWHM_y)      (geometric mean, invariant to swap)
+
+eccentricity = sqrt(1 - FWHM_y^2 / FWHM_x^2)
+```
+
+The same canonicalization applies to Moffat fits (alpha_x/alpha_y instead of
+sigma_x/sigma_y).
 
 ---
 

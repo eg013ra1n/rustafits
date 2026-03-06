@@ -229,21 +229,6 @@ For reference, the expected R^2 under uniformity is 1/n (e.g., 0.005 for n=200).
 
 ---
 
-## Phase 2: Per-Star Eccentricity Filter
-
-After PSF measurement (downstream of the Rayleigh test), individual stars with
-eccentricity above `max_eccentricity` (default 0.5) are removed from the final
-result. This catches:
-
-- Individual trailed stars in an otherwise good image
-- Cosmic rays that survived the 3:1 aspect ratio filter
-- Optical artifacts at field edges (coma, astigmatism)
-
-This is configured via `ImageAnalyzer::with_max_eccentricity()`. Set to 1.0 to
-disable.
-
----
-
 ## Position Angle (Theta) Source
 
 The theta values used in the Rayleigh test come from stamp-based intensity-weighted
@@ -265,4 +250,3 @@ knots, while the Gaussian fitter only fits theta for obviously elliptical stars.
 | Path A p threshold | 0.01 | Strict — high confidence required |
 | Path B ecc threshold | 0.6 | Above undersampled baseline (~0.3-0.4) |
 | Path B p threshold | 0.05 | Standard significance level |
-| Phase 2 max ecc | 0.5 (default) | Per-star filter, configurable |

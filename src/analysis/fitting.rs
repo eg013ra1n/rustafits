@@ -269,6 +269,261 @@ fn cholesky_solve(mat: &[f64], rhs: &[f64], np: usize) -> Option<Vec<f64>> {
     Some(x)
 }
 
+// ── Moffat PSF fitting ──────────────────────────────────────────────────────
+//
+// Elliptical Moffat: M(x,y) = B + A × (1 + Q(x,y))^(-β)
+// Q(x,y) = (u/α_x)² + (v/α_y)²   (rotated coordinates)
+// FWHM = 2α√(2^(1/β) - 1)
+//
+// 8 parameters: [B, A, x0, y0, alpha_x, alpha_y, theta, beta]
+
+/// Result of 2D elliptical Moffat fit.
+#[allow(dead_code)]
+pub(crate) struct Moffat2DResult {
+    pub b: f64,
+    pub a: f64,
+    pub x0: f64,
+    pub y0: f64,
+    pub alpha_x: f64,
+    pub alpha_y: f64,
+    pub theta: f64,
+    pub beta: f64,
+    pub converged: bool,
+}
+
+impl Moffat2DResult {
+    /// Compute FWHM along each axis from Moffat parameters.
+    /// FWHM = 2α√(2^(1/β) - 1)
+    pub fn fwhm_x(&self) -> f64 {
+        2.0 * self.alpha_x * (2.0_f64.powf(1.0 / self.beta) - 1.0).sqrt()
+    }
+    pub fn fwhm_y(&self) -> f64 {
+        2.0 * self.alpha_y * (2.0_f64.powf(1.0 / self.beta) - 1.0).sqrt()
+    }
+}
+
+/// Fit 2D elliptical Moffat with 8 parameters.
+///
+/// Initial alpha values are derived from Gaussian sigma: α = σ × √(2^(1/β₀) - 1) / √(2 ln 2)
+/// where β₀ = 3.0 (typical for well-corrected optics).
+pub(crate) fn fit_moffat_2d(
+    pixels: &[PixelSample],
+    init_b: f64,
+    init_a: f64,
+    init_x0: f64,
+    init_y0: f64,
+    init_sigma_x: f64,
+    init_sigma_y: f64,
+    init_theta: f64,
+) -> Option<Moffat2DResult> {
+    if pixels.len() < 12 {
+        return None;
+    }
+
+    // Convert Gaussian sigma to Moffat alpha with β=3.0 initial guess
+    // For Gaussian: FWHM = 2.3548 σ
+    // For Moffat:   FWHM = 2α√(2^(1/β) - 1)
+    // So α = FWHM / (2√(2^(1/β) - 1)) = 2.3548 σ / (2√(2^(1/3) - 1))
+    let beta_init = 3.0_f64;
+    let moffat_scale = (2.0_f64.powf(1.0 / beta_init) - 1.0).sqrt();
+    let alpha_x = init_sigma_x * 2.3548 / (2.0 * moffat_scale);
+    let alpha_y = init_sigma_y * 2.3548 / (2.0 * moffat_scale);
+
+    let mut params = [init_b, init_a, init_x0, init_y0, alpha_x, alpha_y, init_theta, beta_init];
+    let converged = lm_solve_moffat(pixels, &mut params);
+
+    let alpha_x = params[4].abs();
+    let alpha_y = params[5].abs();
+    let beta = params[7];
+
+    // Reject non-physical results
+    if alpha_x < 0.3 || alpha_y < 0.3 || params[1] <= 0.0
+        || beta < 1.0 || beta > 20.0
+    {
+        return None;
+    }
+
+    // Normalize theta to [-π/2, π/2]
+    let mut theta = params[6] % std::f64::consts::PI;
+    if theta > std::f64::consts::FRAC_PI_2 {
+        theta -= std::f64::consts::PI;
+    } else if theta < -std::f64::consts::FRAC_PI_2 {
+        theta += std::f64::consts::PI;
+    }
+
+    Some(Moffat2DResult {
+        b: params[0],
+        a: params[1],
+        x0: params[2],
+        y0: params[3],
+        alpha_x,
+        alpha_y,
+        theta,
+        beta,
+        converged,
+    })
+}
+
+/// LM solver for 2D Moffat with 8 parameters.
+fn lm_solve_moffat(pixels: &[PixelSample], params: &mut [f64]) -> bool {
+    const NP: usize = 8;
+    let mut lambda = 1e-3_f64;
+    let mut nu = 2.0_f64;
+    let mut best_cost = residual_cost_moffat(pixels, params);
+    let mut converged = false;
+
+    let mut jtj = vec![0.0_f64; NP * NP];
+    let mut jtr = vec![0.0_f64; NP];
+    let mut j = [0.0_f64; NP];
+    let mut mat = vec![0.0_f64; NP * NP];
+    let mut new_params = [0.0_f64; NP];
+
+    for _ in 0..MAX_ITER {
+        jtj.fill(0.0);
+        jtr.fill(0.0);
+
+        let theta = params[6];
+        let (cos_t, sin_t) = (theta.cos(), theta.sin());
+        let ax = params[4];
+        let ay = params[5];
+        let beta = params[7];
+        let inv_ax2 = 1.0 / (ax * ax);
+        let inv_ay2 = 1.0 / (ay * ay);
+
+        for px in pixels {
+            let dx = px.x - params[2];
+            let dy = px.y - params[3];
+            let u = dx * cos_t + dy * sin_t;
+            let v = -dx * sin_t + dy * cos_t;
+            let q = u * u * inv_ax2 + v * v * inv_ay2;
+            let base = 1.0 + q;
+            let power = base.powf(-beta);
+            let model = params[0] + params[1] * power;
+            let r = px.value - model;
+
+            // Jacobian of M(x,y) = B + A × (1+Q)^(-β)
+            j[0] = 1.0; // dM/dB
+            j[1] = power; // dM/dA
+
+            // d/dQ[(1+Q)^(-β)] = -β(1+Q)^(-β-1)
+            let dpower_dq = -beta * base.powf(-beta - 1.0);
+            let a_dpq = params[1] * dpower_dq;
+
+            // dQ/dx0 = -2u*cos(t)/ax² + 2v*sin(t)/ay²
+            let dq_dx0 = -2.0 * (cos_t * u * inv_ax2 - sin_t * v * inv_ay2);
+            j[2] = a_dpq * dq_dx0;
+
+            // dQ/dy0 = -2u*sin(t)/ax² - 2v*cos(t)/ay²
+            let dq_dy0 = -2.0 * (sin_t * u * inv_ax2 + cos_t * v * inv_ay2);
+            j[3] = a_dpq * dq_dy0;
+
+            // dQ/dalpha_x = -2u²/ax³
+            j[4] = a_dpq * (-2.0 * u * u / (ax * ax * ax));
+
+            // dQ/dalpha_y = -2v²/ay³
+            j[5] = a_dpq * (-2.0 * v * v / (ay * ay * ay));
+
+            // dQ/dtheta = 2uv(1/ay² - 1/ax²)  (same as Gaussian)
+            let dq_dtheta = 2.0 * u * v * (inv_ay2 - inv_ax2);
+            j[6] = a_dpq * dq_dtheta;
+
+            // dM/dbeta = A × (1+Q)^(-β) × (-ln(1+Q))
+            j[7] = params[1] * power * (-base.ln());
+
+            for p in 0..NP {
+                jtr[p] += j[p] * r;
+                for q in p..NP {
+                    jtj[p * NP + q] += j[p] * j[q];
+                }
+            }
+        }
+
+        // Fill symmetric lower triangle
+        for p in 0..NP {
+            for q in 0..p {
+                jtj[p * NP + q] = jtj[q * NP + p];
+            }
+        }
+
+        // Damped normal equations
+        mat.copy_from_slice(&jtj);
+        for p in 0..NP {
+            mat[p * NP + p] += lambda * jtj[p * NP + p].max(1e-12);
+        }
+
+        let delta = match cholesky_solve(&mat, &jtr, NP) {
+            Some(d) => d,
+            None => break,
+        };
+
+        new_params.copy_from_slice(params);
+        for p in 0..NP {
+            new_params[p] += delta[p];
+        }
+        // Keep alphas positive
+        if new_params[4] <= 0.0 { new_params[4] = params[4] * 0.5; }
+        if new_params[5] <= 0.0 { new_params[5] = params[5] * 0.5; }
+        // Keep beta in reasonable range
+        if new_params[7] < 0.5 { new_params[7] = 0.5; }
+        if new_params[7] > 25.0 { new_params[7] = 25.0; }
+
+        let new_cost = residual_cost_moffat(pixels, &new_params);
+
+        let predicted: f64 = delta
+            .iter()
+            .enumerate()
+            .map(|(i, d)| d * (lambda * jtj[i * NP + i].max(1e-12) * d + jtr[i]))
+            .sum();
+
+        if predicted > 0.0 {
+            let rho = (best_cost - new_cost) / predicted;
+            if rho > 0.0 {
+                params.copy_from_slice(&new_params);
+                best_cost = new_cost;
+                lambda *= (1.0_f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3));
+                nu = 2.0;
+            } else {
+                lambda *= nu;
+                nu *= 2.0;
+            }
+        } else {
+            lambda *= nu;
+            nu *= 2.0;
+        }
+
+        let param_norm = params.iter().map(|p| p * p).sum::<f64>().sqrt();
+        let delta_norm = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+        if delta_norm / param_norm.max(1e-12) < CONV_TOL {
+            converged = true;
+            break;
+        }
+    }
+
+    converged
+}
+
+fn residual_cost_moffat(pixels: &[PixelSample], params: &[f64]) -> f64 {
+    let theta = params[6];
+    let (cos_t, sin_t) = (theta.cos(), theta.sin());
+    let inv_ax2 = 1.0 / (params[4] * params[4]);
+    let inv_ay2 = 1.0 / (params[5] * params[5]);
+    let beta = params[7];
+
+    pixels
+        .iter()
+        .map(|px| {
+            let dx = px.x - params[2];
+            let dy = px.y - params[3];
+            let u = dx * cos_t + dy * sin_t;
+            let v = -dx * sin_t + dy * cos_t;
+            let q = u * u * inv_ax2 + v * v * inv_ay2;
+            let model = params[0] + params[1] * (1.0 + q).powf(-beta);
+            let r = px.value - model;
+            r * r
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +630,75 @@ mod tests {
             (ecc - 0.917).abs() < 0.05,
             "eccentricity: {} expected ~0.917",
             ecc
+        );
+    }
+
+    #[test]
+    fn test_moffat_isotropic() {
+        // Generate isotropic Moffat: B=100, A=5000, x0=15, y0=15, alpha=3, beta=3
+        let size = 31;
+        let alpha = 3.0_f64;
+        let beta = 3.0_f64;
+        let mut pixels = Vec::new();
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f64 - 15.0;
+                let dy = y as f64 - 15.0;
+                let r2 = dx * dx + dy * dy;
+                let v = 100.0 + 5000.0 * (1.0 + r2 / (alpha * alpha)).powf(-beta);
+                pixels.push(PixelSample {
+                    x: x as f64,
+                    y: y as f64,
+                    value: v,
+                });
+            }
+        }
+
+        // Init from Gaussian sigma ≈ FWHM / 2.3548, where Moffat FWHM = 2α√(2^(1/β)-1)
+        let moffat_fwhm = 2.0 * alpha * (2.0_f64.powf(1.0 / beta) - 1.0).sqrt();
+        let init_sigma = moffat_fwhm / 2.3548;
+        let result = fit_moffat_2d(&pixels, 100.0, 5000.0, 15.0, 15.0, init_sigma, init_sigma, 0.0).unwrap();
+
+        assert!(result.converged, "should converge");
+        assert!((result.alpha_x - alpha).abs() < 0.3, "alpha_x: {} expected ~{}", result.alpha_x, alpha);
+        assert!((result.alpha_y - alpha).abs() < 0.3, "alpha_y: {} expected ~{}", result.alpha_y, alpha);
+        assert!((result.beta - beta).abs() < 0.5, "beta: {} expected ~{}", result.beta, beta);
+        assert!((result.x0 - 15.0).abs() < 0.1, "x0: {}", result.x0);
+        assert!((result.y0 - 15.0).abs() < 0.1, "y0: {}", result.y0);
+    }
+
+    #[test]
+    fn test_moffat_fwhm_vs_gaussian() {
+        // A Moffat profile should yield ~5-15% smaller FWHM than a Gaussian fit
+        // to the same data, since Moffat models the wings better.
+        let size = 41;
+        let alpha = 4.0_f64;
+        let beta = 2.5_f64;
+        let mut pixels = Vec::new();
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f64 - 20.0;
+                let dy = y as f64 - 20.0;
+                let r2 = dx * dx + dy * dy;
+                let v = 50.0 + 8000.0 * (1.0 + r2 / (alpha * alpha)).powf(-beta);
+                pixels.push(PixelSample { x: x as f64, y: y as f64, value: v });
+            }
+        }
+
+        let true_fwhm = 2.0 * alpha * (2.0_f64.powf(1.0 / beta) - 1.0).sqrt();
+        let init_sigma = true_fwhm / 2.3548;
+
+        let gauss = fit_gaussian_2d(&pixels, 50.0, 8000.0, 20.0, 20.0, init_sigma, init_sigma, 0.0).unwrap();
+        let moffat = fit_moffat_2d(&pixels, 50.0, 8000.0, 20.0, 20.0, init_sigma, init_sigma, 0.0).unwrap();
+
+        let gauss_fwhm = 2.3548 * (gauss.sigma_x * gauss.sigma_y).sqrt();
+        let moffat_fwhm = (moffat.fwhm_x() * moffat.fwhm_y()).sqrt();
+
+        // Moffat should recover true FWHM more accurately
+        assert!(
+            (moffat_fwhm - true_fwhm).abs() < (gauss_fwhm - true_fwhm).abs(),
+            "Moffat FWHM {:.3} should be closer to true {:.3} than Gaussian {:.3}",
+            moffat_fwhm, true_fwhm, gauss_fwhm
         );
     }
 

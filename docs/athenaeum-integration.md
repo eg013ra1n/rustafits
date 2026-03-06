@@ -68,7 +68,7 @@ let result = ImageAnalyzer::new()
 |-------|------|-------------|
 | `width`, `height` | `usize` | Image dimensions (native resolution). |
 | `stars` | `Vec<StarMetrics>` | Per-star metrics, sorted by flux descending. |
-| `stars_detected` | `usize` | Total stars found before max_stars cap. |
+| `stars_detected` | `usize` | Total stars with valid PSF measurements. |
 | `median_fwhm` | `f32` | Median FWHM (pixels). Good seeing: 2-3 px. |
 | `median_eccentricity` | `f32` | Median eccentricity. 0 = round, >0.5 = elongated. |
 | `median_snr` | `f32` | Median per-star SNR. |
@@ -101,11 +101,11 @@ let result = ImageAnalyzer::new()
 | `with_min_star_area(usize)` | 5 | Min connected-component area (filters hot pixels). |
 | `with_max_star_area(usize)` | 2000 | Max area (filters galaxies/nebulae). |
 | `with_saturation_fraction(f32)` | 0.95 | Reject stars above this fraction of 65535. |
-| `with_max_stars(usize)` | 200 | Keep only the brightest N stars. |
+| `with_max_measure(usize)` | None (all) | Limit PSF fitting to brightest N detected stars. |
+| `with_max_stars(usize)` | 200 | Keep only the brightest N stars in returned result. |
 | `without_gaussian_fit()` | Gaussian on | Use fast moments instead of Gaussian fit. |
 | `with_background_mesh(usize)` | global | Mesh-grid background with given cell size. |
 | `without_debayer()` | debayer on | Skip green-channel interpolation for OSC. |
-| `with_max_eccentricity(f32)` | 1.0 | Reject stars above this eccentricity. |
 | `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection. |
 | `with_thread_pool(pool)` | global | Route parallel work to a custom rayon pool. |
 
