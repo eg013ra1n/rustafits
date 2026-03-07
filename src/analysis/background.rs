@@ -1,9 +1,10 @@
 /// Background estimation: sigma-clipped statistics and optional mesh-grid spatial background.
 
 use crate::processing::stretch::find_median;
+use super::convolution::b3_spline_smooth;
 
 /// Result of background estimation.
-pub(crate) struct BackgroundResult {
+pub struct BackgroundResult {
     /// Global background level (ADU).
     pub background: f32,
     /// Background noise estimate (sigma, ADU).
@@ -17,7 +18,7 @@ pub(crate) struct BackgroundResult {
 
 /// Estimate background and noise using sigma-clipped statistics.
 /// Subsamples to ~500k pixels, runs 3 rounds of 3-sigma clipping.
-pub(crate) fn estimate_background(data: &[f32], width: usize, height: usize) -> BackgroundResult {
+pub fn estimate_background(data: &[f32], width: usize, height: usize) -> BackgroundResult {
     let total = width * height;
     let target_samples = 500_000usize;
     let stride = ((total as f64 / target_samples as f64).sqrt() as usize).max(1);
@@ -59,7 +60,7 @@ pub(crate) fn estimate_background(data: &[f32], width: usize, height: usize) -> 
 }
 
 /// Estimate background with SExtractor-style mesh grid for spatially varying backgrounds.
-pub(crate) fn estimate_background_mesh(
+pub fn estimate_background_mesh(
     data: &[f32],
     width: usize,
     height: usize,
@@ -203,6 +204,70 @@ pub(crate) fn estimate_background_mesh(
     }
 }
 
+/// Noise from the first wavelet coefficient layer (MRS method).
+///
+/// Computes `w1 = data - b3_spline_smooth(data)`, then estimates sigma from
+/// `1.4826 * MAD(w1)`. This isolates the finest-scale (noise) fluctuations,
+/// separating them from nebulosity and gradients that bias the plain MAD estimator.
+///
+/// `noise_layers`: number of à trous layers (1 is sufficient for noise estimation).
+/// For layers > 1, each subsequent smooth uses a dilated kernel (spacing 2^layer),
+/// but layer 1 alone is adequate for noise estimation.
+pub fn estimate_noise_mrs(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    noise_layers: usize,
+) -> f32 {
+    if noise_layers == 0 || data.is_empty() {
+        return 0.001;
+    }
+
+    let total = width * height;
+    let mut smoothed = vec![0.0_f32; total];
+
+    // Layer 1: standard B3-spline smooth (spacing=1)
+    b3_spline_smooth(data, width, height, &mut smoothed);
+
+    // For noise_layers > 1, iterate: smooth the smoothed image with dilated kernel.
+    // Each layer removes progressively larger-scale structure.
+    // Currently only layer 1 is needed for PI-matching noise.
+    // (Future: implement dilated à trous for layers 2+)
+
+    // Compute wavelet coefficients: w1 = data - smoothed
+    // Subsample for speed (~500k pixels, same approach as estimate_background)
+    let target_samples = 500_000usize;
+    let stride = ((total as f64 / target_samples as f64).sqrt() as usize).max(1);
+
+    let border = 2;
+    let mut w1_samples = Vec::with_capacity(target_samples);
+    let mut y = border;
+    while y < height.saturating_sub(border) {
+        let mut x = border;
+        while x < width.saturating_sub(border) {
+            let idx = y * width + x;
+            let coeff = data[idx] - smoothed[idx];
+            if coeff.is_finite() {
+                w1_samples.push(coeff);
+            }
+            x += stride;
+        }
+        y += stride;
+    }
+
+    if w1_samples.len() < 100 {
+        return 0.001;
+    }
+
+    // MAD-based sigma: 1.4826 * median(|w1 - median(w1)|)
+    let median_w1 = find_median(&mut w1_samples);
+    let mut abs_devs: Vec<f32> = w1_samples.iter().map(|&x| (x - median_w1).abs()).collect();
+    let mad = find_median(&mut abs_devs);
+    let sigma = 1.4826 * mad;
+
+    sigma.max(0.001)
+}
+
 /// Iterative sigma-clipped statistics. Returns (mode, sigma_MAD).
 /// Mode = 2.5*median - 1.5*mean (SExtractor formula).
 /// Modifies the slice in-place (quickselect requirement).
@@ -263,7 +328,7 @@ fn sigma_clipped_stats(samples: &mut Vec<f32>, rounds: usize, kappa: f32) -> (f3
 ///
 /// `source_mask`: boolean mask where `true` = source pixel (excluded from stats).
 /// Same logic as `estimate_background_mesh` but skips masked pixels in per-cell stats.
-pub(crate) fn estimate_background_mesh_masked(
+pub fn estimate_background_mesh_masked(
     data: &[f32],
     width: usize,
     height: usize,

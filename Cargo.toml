@@ -1,6 +1,6 @@
 [package]
 name = "rustafits"
-version = "0.6.0"
+version = "0.6.4"
 edition = "2021"
 authors = ["Vilen Sharifov <vilen.sharifov@gmail.com>"]
 description = "High-performance FITS to JPEG converter for astronomical images with auto-stretch and Bayer debayering"
@@ -19,6 +19,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "rustafits"
 path = "src/bin/rustafits.rs"
+
+[[bin]]
+name = "rustafits-debug"
+path = "src/bin/debug.rs"
+required-features = ["debug-pipeline"]
+
+[features]
+debug-pipeline = []
 
 [dependencies]
 anyhow = "1.0"

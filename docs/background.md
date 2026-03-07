@@ -1,6 +1,8 @@
 # Background Estimation
 
-Two methods are available: global (default) and mesh-grid (for images with gradients).
+Two background methods are available: global (default) and mesh-grid (for images with
+gradients). Two noise estimation methods are available: sigma-clipped MAD (default) and
+MRS wavelet (for nebula-rich fields).
 
 ## Global Background Estimation
 
@@ -174,13 +176,102 @@ fields where bright stars bias the per-cell background estimate.
 
 ---
 
+## MRS Wavelet Noise Estimation
+
+The standard sigma-clipped MAD noise estimator works well for clean backgrounds, but
+on nebula-rich fields (M42, NGC 7000, etc.) it overestimates noise by 30-40% because
+it conflates nebulosity with background fluctuations. The MRS (Multiscale Residual
+Spectrum) wavelet method isolates the finest-scale fluctuations using the à trous
+(with holes) wavelet transform.
+
+### Algorithm
+
+```
+Input: luminance image
+       |
+       v
++-------------------------------+
+| B3-Spline Smooth              |  Separable 5-tap kernel: [1/16, 1/4, 3/8, 1/4, 1/16]
+|                               |  DC-preserving (coefficients sum to 1)
+|                               |  Reflected boundary conditions
+|                               |  Parallelized per row with rayon
++-------------------------------+
+       |
+       v
++-------------------------------+
+| Wavelet Coefficients          |  w1[i] = data[i] - smoothed[i]
+|                               |  First wavelet layer: finest-scale structure
+|                               |  Contains noise + point sources, NOT nebulosity
++-------------------------------+
+       |
+       v
++-------------------------------+
+| Subsample (~500k pixels)      |  Skip 2px border, stride to ~500k samples
+|                               |  Same approach as global background estimation
++-------------------------------+
+       |
+       v
++-------------------------------+
+| MAD-based Sigma               |  median_w1 = median(w1_samples)
+|                               |  MAD = median(|w1 - median_w1|)
+|                               |  sigma = 1.4826 * MAD
++-------------------------------+
+       |
+       v
+  noise estimate (ADU), floor clamped to 0.001
+```
+
+### Why B3-Spline?
+
+The B3-spline kernel `[1/16, 1/4, 3/8, 1/4, 1/16]` is the standard smoothing function
+in the à trous wavelet transform. It is:
+
+- **DC-preserving**: coefficients sum to exactly 1.0, so constant signals pass through unchanged
+- **Separable**: the 2D smooth decomposes into horizontal + vertical 1D passes
+- **Compact**: only 5 taps, so the smooth is fast even without SIMD
+- **Smooth**: sufficient support to separate noise (1-2 px scale) from signal (stars, nebulae)
+
+The first wavelet layer (`w1 = data - smoothed`) captures structure at the 1-2 pixel
+scale — exactly where Poisson/read noise lives. Nebulosity, gradients, and extended
+objects have much larger spatial scales and are almost entirely removed by the subtraction.
+
+### When to Use
+
+| Scenario | MAD (default) | MRS wavelet |
+|----------|---------------|-------------|
+| Clean background (dark, sparse field) | Accurate | Accurate (no difference) |
+| Mild nebulosity | Slightly overestimates | Accurate |
+| Strong nebulosity (M42, emission regions) | Overestimates 30-40% | Accurate |
+| Gradient-only (vignetting, LP) | Handled by mesh-grid | No advantage over mesh-grid MAD |
+
+Enable via: `ImageAnalyzer::new().with_mrs_noise(1)`
+
+The `noise_layers` parameter specifies how many à trous layers to compute. Layer 1 is
+sufficient for noise estimation. Higher layers (2+) would remove progressively larger-scale
+structure, but are not needed in practice.
+
+### Constants
+
+| Parameter        | Value     | Rationale                            |
+|------------------|-----------|--------------------------------------|
+| B3-spline kernel | [1/16, 1/4, 3/8, 1/4, 1/16] | Standard à trous smoothing function |
+| Kernel radius    | 2 px      | 5-tap separable convolution          |
+| Boundary         | Reflected | Avoids edge discontinuities          |
+| Target samples   | 500,000   | Balance speed vs. statistical power  |
+| Border exclusion | 2 px      | Avoid edge artifacts                 |
+| MAD scale factor | 1.4826    | Gaussian consistency factor          |
+| Minimum noise    | 0.001     | Prevent division by zero             |
+
+---
+
 ## Comparison with Professional Tools
 
 | Feature | SExtractor/SEP | photutils | rustafits |
 |---------|---------------|-----------|-----------|
 | Mode estimator | 2.5m - 1.5mu | Pluggable (SExtractor, biweight, MMM) | 2.5m - 1.5mu |
 | Asymmetry fallback | Yes (0.3sigma) | Depends on estimator | Yes (0.3sigma) |
-| Noise estimator | Clipped sigma | MAD or biweight scale | MAD (1.4826 * MAD) |
+| Noise estimator | Clipped sigma | MAD or biweight scale | MAD or MRS wavelet (configurable) |
+| Wavelet noise | — | — | B3-spline à trous (1 layer) |
 | Grid filtering | 3x3 median | Configurable median | 3x3 median |
 | Interpolation | Bicubic spline | Bicubic spline (scipy zoom) | Catmull-Rom bicubic |
 | Source masking | No (single pass) | Manual mask input | Iterative (auto-mask) |

@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.6.0
+Version:        0.6.4
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,13 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Sun Mar 08 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.6.4-1
+- Add MRS wavelet noise estimation (B3-spline à trous transform)
+- Add fixed-beta Moffat PSF fitting (7 free parameters)
+- Add configurable distortion pre-filter (with_max_distortion)
+- Add compare subcommand to debug CLI for bulk metric comparison
+- Update documentation for all new algorithms and settings
+
 * Fri Mar 06 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.6.0-1
 - Add 2D elliptical Moffat PSF fitting with automatic Gaussian fallback
 - Add separable matched-filter convolution for star detection

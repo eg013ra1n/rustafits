@@ -11,7 +11,7 @@ use rayon::prelude::*;
 ///
 /// Returns `(kernel, kernel_energy_sq)` where kernel has length `2*radius+1`,
 /// is zero-mean (DAOFIND-style), and `kernel_energy_sq = Σ k²`.
-pub(crate) fn generate_1d_kernel(sigma: f32) -> (Vec<f32>, f32) {
+pub fn generate_1d_kernel(sigma: f32) -> (Vec<f32>, f32) {
     let radius = (2.0 * sigma).ceil() as usize;
     let ksize = 2 * radius + 1;
     let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
@@ -44,7 +44,7 @@ pub(crate) fn generate_1d_kernel(sigma: f32) -> (Vec<f32>, f32) {
 /// but since both are the same kernel, it's `energy_sq²`).
 ///
 /// Pixels within `radius` of the border are left as 0.0.
-pub(crate) fn separable_convolve(
+pub fn separable_convolve(
     data: &[f32],
     width: usize,
     height: usize,
@@ -293,6 +293,69 @@ unsafe fn convolve_vertical_row_neon(
     }
 }
 
+/// Separable B3-spline smoothing (DC-preserving).
+///
+/// Kernel: [1/16, 1/4, 3/8, 1/4, 1/16], radius=2.
+/// Uses reflected boundary for border pixels.
+/// This is the first layer of the à trous wavelet transform used for
+/// MRS (Multiscale Residual Spectrum) noise estimation.
+pub fn b3_spline_smooth(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    output: &mut [f32],
+) {
+    const K: [f32; 5] = [1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0];
+
+    let mut hpass = vec![0.0_f32; width * height];
+
+    // Horizontal pass with reflected boundary
+    hpass
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let src = &data[y * width..(y + 1) * width];
+            for x in 0..width {
+                let mut sum = 0.0_f32;
+                for (ki, &kv) in K.iter().enumerate() {
+                    let sx = x as i32 + ki as i32 - 2;
+                    // Reflect at boundaries
+                    let sx = if sx < 0 {
+                        -sx
+                    } else if sx >= width as i32 {
+                        2 * width as i32 - 2 - sx
+                    } else {
+                        sx
+                    } as usize;
+                    sum += src[sx] * kv;
+                }
+                row[x] = sum;
+            }
+        });
+
+    // Vertical pass with reflected boundary
+    output
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let mut sum = 0.0_f32;
+                for (ki, &kv) in K.iter().enumerate() {
+                    let sy = y as i32 + ki as i32 - 2;
+                    let sy = if sy < 0 {
+                        -sy
+                    } else if sy >= height as i32 {
+                        2 * height as i32 - 2 - sy
+                    } else {
+                        sy
+                    } as usize;
+                    sum += hpass[sy * width + x] * kv;
+                }
+                row[x] = sum;
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +397,53 @@ mod tests {
             far_val.abs() < 1.0,
             "Far from source, response {} should be ~0",
             far_val
+        );
+    }
+
+    #[test]
+    fn test_b3_spline_flat_image_preserved() {
+        // A flat image should be unchanged after B3 spline smoothing (DC-preserving)
+        let width = 50;
+        let height = 50;
+        let val = 1000.0_f32;
+        let data = vec![val; width * height];
+        let mut output = vec![0.0_f32; width * height];
+        b3_spline_smooth(&data, width, height, &mut output);
+
+        for y in 0..height {
+            for x in 0..width {
+                assert!(
+                    (output[y * width + x] - val).abs() < 0.01,
+                    "Flat image at ({},{}) = {} should be ~{}",
+                    x, y, output[y * width + x], val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_b3_spline_smooths_noise() {
+        // B3 spline should reduce high-frequency noise while preserving large-scale structure
+        let width = 100;
+        let height = 100;
+        let mut data = vec![1000.0_f32; width * height];
+
+        // Add a point source
+        data[50 * width + 50] += 5000.0;
+
+        let mut output = vec![0.0_f32; width * height];
+        b3_spline_smooth(&data, width, height, &mut output);
+
+        // The point source should be spread out (peak lower than original)
+        assert!(
+            output[50 * width + 50] < data[50 * width + 50],
+            "Peak should be smoothed: {} < {}",
+            output[50 * width + 50], data[50 * width + 50]
+        );
+        // But still present
+        assert!(
+            output[50 * width + 50] > 1000.0,
+            "Peak should still be above background"
         );
     }
 

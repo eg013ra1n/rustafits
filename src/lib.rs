@@ -1,6 +1,12 @@
+#[cfg(feature = "debug-pipeline")]
+pub mod analysis;
+#[cfg(not(feature = "debug-pipeline"))]
 mod analysis;
 mod annotate;
 mod converter;
+#[cfg(feature = "debug-pipeline")]
+pub mod formats;
+#[cfg(not(feature = "debug-pipeline"))]
 mod formats;
 mod output;
 mod pipeline;

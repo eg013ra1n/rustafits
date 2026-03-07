@@ -1,7 +1,7 @@
 /// Star detection: DAOFIND-inspired matched filter + connected component labeling.
 
 /// A detected star candidate before metric computation.
-pub(crate) struct DetectedStar {
+pub struct DetectedStar {
     /// Intensity-weighted centroid X (subpixel).
     pub x: f32,
     /// Intensity-weighted centroid Y (subpixel).
@@ -19,7 +19,7 @@ pub(crate) struct DetectedStar {
 }
 
 /// Detection parameters.
-pub(crate) struct DetectionParams {
+pub struct DetectionParams {
     pub detection_sigma: f32,
     pub min_star_area: usize,
     pub max_star_area: usize,
@@ -45,7 +45,7 @@ impl Default for DetectionParams {
 /// `bg_map`: optional per-pixel background map (from mesh-grid estimation).
 /// `noise_map`: optional per-pixel noise map for adaptive thresholds.
 /// `fwhm`: estimated FWHM for matched filter kernel (pixels).
-pub(crate) fn detect_stars(
+pub fn detect_stars(
     data: &[f32],
     width: usize,
     height: usize,
@@ -350,7 +350,7 @@ fn process_component(
     let bbox_w = (max_x - min_x + 1) as f32;
     let bbox_h = (max_y - min_y + 1) as f32;
     let aspect = bbox_w.max(bbox_h) / bbox_w.min(bbox_h);
-    if aspect > 8.0 {
+    if aspect > 4.0 {
         return None;
     }
 

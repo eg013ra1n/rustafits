@@ -1,10 +1,10 @@
 /// PSF metrics: windowed moments, optional 2D Gaussian fit, HFR.
 
 use super::detection::DetectedStar;
-use super::fitting::{fit_gaussian_2d, fit_moffat_2d, PixelSample};
+use super::fitting::{fit_gaussian_2d, fit_moffat_2d, fit_moffat_2d_fixed_beta, PixelSample};
 
 /// Fully measured star with all metrics.
-pub(crate) struct MeasuredStar {
+pub struct MeasuredStar {
     pub x: f32,
     pub y: f32,
     pub peak: f32,
@@ -32,7 +32,8 @@ const FWHM_FACTOR: f32 = 2.3548;
 /// `bg_map`: optional per-pixel background map.
 /// `use_gaussian_fit`: if true, use full 2D Gaussian fit instead of windowed moments.
 /// `use_moffat`: if true, try Moffat fit first, falling back to Gaussian on failure.
-pub(crate) fn measure_stars(
+/// `fixed_beta`: if Some, fix Moffat beta to this value (PI uses 4.0).
+pub fn measure_stars(
     data: &[f32],
     width: usize,
     height: usize,
@@ -42,13 +43,14 @@ pub(crate) fn measure_stars(
     use_gaussian_fit: bool,
     use_moffat: bool,
     green_mask: Option<&[bool]>,
+    fixed_beta: Option<f64>,
 ) -> Vec<MeasuredStar> {
     use rayon::prelude::*;
 
     stars
         .par_iter()
         .filter_map(|star| {
-            measure_single_star(data, width, height, star, background, bg_map, use_gaussian_fit, use_moffat, green_mask)
+            measure_single_star(data, width, height, star, background, bg_map, use_gaussian_fit, use_moffat, green_mask, fixed_beta)
         })
         .collect()
 }
@@ -63,6 +65,7 @@ fn measure_single_star(
     use_gaussian_fit: bool,
     use_moffat: bool,
     green_mask: Option<&[bool]>,
+    fixed_beta: Option<f64>,
 ) -> Option<MeasuredStar> {
     // Estimate sigma from the star's area: area ≈ π*(2σ)² for a Gaussian at low_threshold
     let estimated_sigma = (star.area as f32 / std::f32::consts::PI).sqrt() * 0.5;
@@ -126,7 +129,7 @@ fn measure_single_star(
 
     if use_moffat {
         // Try Moffat first, fall back to Gaussian
-        if let Some(result) = measure_with_moffat_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref) {
+        if let Some(result) = measure_with_moffat_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref, fixed_beta) {
             return Some(result);
         }
     }
@@ -496,6 +499,7 @@ fn measure_with_moffat_fit(
     x0: usize,
     y0: usize,
     stamp_mask: Option<&[bool]>,
+    fixed_beta: Option<f64>,
 ) -> Option<MeasuredStar> {
     let fitting_radius = 5.0_f64.max(4.0 * init_sigma as f64);
     let fitting_radius_sq = fitting_radius * fitting_radius;
@@ -560,16 +564,30 @@ fn measure_with_moffat_fit(
     let init_sx = (mom_major * scale).max(0.5);
     let init_sy = (mom_minor * scale).max(0.5);
 
-    let result = fit_moffat_2d(
-        &pixels,
-        init_bg,
-        star.peak as f64 - init_bg,
-        init_cx as f64,
-        init_cy as f64,
-        init_sx,
-        init_sy,
-        mom_theta,
-    )?;
+    let result = if let Some(beta) = fixed_beta {
+        fit_moffat_2d_fixed_beta(
+            &pixels,
+            init_bg,
+            star.peak as f64 - init_bg,
+            init_cx as f64,
+            init_cy as f64,
+            init_sx,
+            init_sy,
+            mom_theta,
+            beta,
+        )?
+    } else {
+        fit_moffat_2d(
+            &pixels,
+            init_bg,
+            star.peak as f64 - init_bg,
+            init_cx as f64,
+            init_cy as f64,
+            init_sx,
+            init_sy,
+            mom_theta,
+        )?
+    };
 
     // Reject divergent fits
     let max_alpha = (init_sigma as f64) * 5.0;
@@ -613,7 +631,7 @@ fn measure_with_moffat_fit(
 /// averages those distances. Converts half-max radius to sigma via `r / sqrt(2 * ln(2))`.
 ///
 /// Falls back to capped second-moment estimate if fewer than 4 directions cross half-max.
-pub(crate) fn estimate_sigma_halfmax(stamp: &[f32], stamp_w: usize, cx: f32, cy: f32) -> f32 {
+pub fn estimate_sigma_halfmax(stamp: &[f32], stamp_w: usize, cx: f32, cy: f32) -> f32 {
     let stamp_h = stamp.len() / stamp_w;
 
     // Local background from annulus at r=4..8 pixels from centroid.

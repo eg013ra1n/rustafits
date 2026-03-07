@@ -57,9 +57,13 @@ ImageConverter::save_processed(&image, "output.png", 0)?;  // quality ignored fo
 use astroimage::ImageAnalyzer;
 
 let result = ImageAnalyzer::new()
+    .with_background_mesh(64)        // Always use for production
     .with_max_stars(500)
     .with_thread_pool(pool.clone())
     .analyze("light.fits")?;
+
+// Defaults: Moffat fitting ON, iterative background ON (1 iter),
+// Gaussian fit ON (fallback), detection sigma 5.0
 ```
 
 ### Key `AnalysisResult` Fields
@@ -109,9 +113,85 @@ let result = ImageAnalyzer::new()
 | `with_background_mesh(usize)` | global | Mesh-grid background with given cell size. |
 | `without_debayer()` | debayer on | Skip green-channel interpolation for OSC. |
 | `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection. |
-| `with_iterative_background(n)` | 0 (off) | Source-masked background re-estimation (n iterations). Requires `with_background_mesh`. |
-| `with_moffat_fit()` | off | Use Moffat PSF model instead of Gaussian. Reports `median_beta`. |
+| `with_iterative_background(n)` | 1 | Source-masked background re-estimation (n iterations). Requires `with_background_mesh`. |
+| `with_moffat_fit()` | **on** | Use Moffat PSF model (better wing modeling). Reports `median_beta`. |
+| `without_moffat_fit()` | — | Disable Moffat fitting; use Gaussian only. |
+| `with_mrs_noise(usize)` | 0 (off) | MRS wavelet noise layers. Use 1 for nebula-rich fields. |
+| `with_moffat_beta(f32)` | None (free) | Fix Moffat beta to a constant (PI uses 4.0). |
+| `with_max_distortion(f32)` | None (off) | Reject stars with detection eccentricity above threshold. |
 | `with_thread_pool(pool)` | global | Route parallel work to a custom rayon pool. |
+
+### Recommended Settings
+
+The defaults are tuned for general-purpose analysis. For production use in Athenaeum,
+always set `with_background_mesh(64)` — it handles gradients, vignetting, and
+nebulosity that the global estimator cannot.
+
+```rust
+// Recommended production configuration
+let result = ImageAnalyzer::new()
+    .with_background_mesh(64)        // Local background — handles gradients/nebulosity
+    .with_max_stars(500)             // Return top 500 for annotation
+    .with_thread_pool(pool.clone())
+    .analyze("light.fits")?;
+```
+
+This uses the defaults: Moffat fitting (on), iterative background (1 iteration),
+Gaussian fit (on as fallback), detection sigma 5.0. These defaults are well-tested
+across all image types (mono, OSC, dense fields, nebulae).
+
+### PixInsight-Compatible Settings
+
+To produce metrics comparable to PixInsight SubframeSelector v1.9.2, apply these
+settings. Based on file-by-file comparison of 77 M42 frames (300s + 30s exposures):
+
+```rust
+let result = ImageAnalyzer::new()
+    .with_background_mesh(64)        // Required for all configurations
+    .with_mrs_noise(1)               // MRS wavelet noise (PI uses wavelet noise)
+    .with_moffat_beta(4.0)           // PI fixes beta=4
+    .with_max_distortion(0.6)        // PI rejects ecc > 0.6 before fitting
+    .with_max_stars(500)
+    .with_thread_pool(pool.clone())
+    .analyze("light.fits")?;
+```
+
+#### Expected accuracy vs PixInsight (file-by-file, 77 frames)
+
+| Metric | Setting | Accuracy vs PI | Notes |
+|--------|---------|----------------|-------|
+| **FWHM** | defaults | +1.1% median bias | Excellent match |
+| **FWHM** | PI-compat | +0.4% median bias | Near-perfect |
+| **Eccentricity** | defaults | −0.056 offset, R²=0.98 | Systematic methodology difference (see below) |
+| **Eccentricity** | PI-compat | −0.074 offset, R²=0.97 | max-distortion filter lowers ecc further |
+| **Noise** | defaults (MAD) | 1.0× PI | Already close on most images |
+| **Noise** | `with_mrs_noise(1)` | 0.92× PI | Better on nebula-rich fields |
+| **Star count** | defaults | 3.5× PI | We detect more faint stars |
+| **Star count** | PI-compat | 2.1× PI | max-distortion reduces count |
+
+#### Eccentricity methodology note
+
+Our eccentricity comes from the **Moffat/Gaussian fit** axis ratio: `e = sqrt(1 − (b/a)²)`.
+PixInsight likely uses **image moments** for eccentricity, which gives systematically
+higher values (mean offset ~+0.06). The frame-to-frame correlation is excellent
+(R²=0.97), meaning relative rankings are correct — only the absolute scale differs.
+
+The regression is: `PI_ecc ≈ 1.19 × our_ecc − 0.003`.
+
+If Athenaeum displays eccentricity alongside PI values, consider noting this
+calibration difference, or applying the linear correction for display purposes.
+
+#### When to use each setting
+
+| Setting | Use when |
+|---------|----------|
+| `with_mrs_noise(1)` | Nebula-rich fields (M42, NGC 7000, etc.). Prevents nebulosity from inflating noise estimate. Not needed for sparse star fields. |
+| `with_moffat_beta(4.0)` | Comparing FWHM with PI. Improves FWHM accuracy from +1.1% to +0.4%. No meaningful effect on eccentricity. |
+| `with_max_distortion(0.6)` | Reducing star count toward PI levels. Removes elongated candidates before fitting. Lowers median eccentricity (not always desirable). |
+
+For general-purpose Athenaeum use (not comparing with PI), the defaults without
+these three options give the best overall results: accurate FWHM, stable eccentricity,
+and higher star counts for better field coverage.
 
 ### Analyzing pre-loaded data
 
@@ -325,11 +405,13 @@ let image = ImageConverter::new()
     .with_thread_pool(pool.clone())
     .process("light_001.fits")?;
 
+// Recommended production settings:
+// - Moffat fit is ON by default (no need to call with_moffat_fit())
+// - Iterative background is ON by default (1 iteration)
+// - with_background_mesh(64) is the only required addition
 let result = ImageAnalyzer::new()
-    .with_max_stars(1000)
-    .with_moffat_fit()               // Moffat PSF (better wing modeling)
-    .with_background_mesh(64)        // Local background estimation
-    .with_iterative_background(2)    // Source-masked refinement
+    .with_background_mesh(64)        // Local background — always use this
+    .with_max_stars(500)             // Return top 500 stars for annotation
     .with_thread_pool(pool.clone())
     .analyze("light_001.fits")?;
 
@@ -342,6 +424,9 @@ println!("Stars: {}  FWHM: {:.2}  Ecc: {:.3}  SNR: {:.1} dB  HFR: {:.2}  R²: {:
     result.median_hfr,
     result.trail_r_squared,
 );
+if let Some(beta) = result.median_beta {
+    println!("  Moffat β: {:.2}", beta);
+}
 
 // Option A: Get raw geometry for native UI rendering
 let annotations = compute_annotations(
@@ -363,23 +448,55 @@ annotate_image(&mut export_image, &result, &config);
 ImageConverter::save_processed(&export_image, "annotated.jpg", 95)?;
 ```
 
+### PixInsight-compatible variant
+
+Use this when Athenaeum needs to display metrics alongside PixInsight values,
+or when users expect PI-matching numbers:
+
+```rust
+let result = ImageAnalyzer::new()
+    .with_background_mesh(64)
+    .with_mrs_noise(1)               // Wavelet noise — better on nebulae
+    .with_moffat_beta(4.0)           // Fixed beta=4 — matches PI FWHM closely
+    .with_max_distortion(0.6)        // Reject ecc>0.6 — reduces star count toward PI
+    .with_max_stars(500)
+    .with_thread_pool(pool.clone())
+    .analyze("light_001.fits")?;
+
+// FWHM will be within ~0.4% of PI SubframeSelector
+// Eccentricity will be ~0.07 lower than PI (methodology difference)
+// Noise will be ~8% lower than PI on nebula-rich fields
+// Star count will be ~2x PI (we detect more faint stars)
+```
+
 ---
 
 ## 7. Integration Recommendations
 
 ### Subframe inspector columns
 
-Add these to the subframe table alongside existing FWHM/eccentricity/SNR:
+Core metrics — always available:
 
 | Column | Field | Format | Notes |
 |--------|-------|--------|-------|
-| Trail R² | `trail_r_squared` | `{:.3}` | Continuous quality indicator |
+| FWHM | `median_fwhm` | `{:.2}` | Median FWHM in pixels. Good seeing: 2-3 px |
+| Eccentricity | `median_eccentricity` | `{:.3}` | Median eccentricity. 0=round, >0.5=elongated |
+| SNR (dB) | `snr_db` | `{:.1}` | Image-wide signal-to-noise ratio |
+| HFR | `median_hfr` | `{:.2}` | Half-flux radius in pixels |
+| Stars | `stars.len()` | integer | Stars returned (capped at `max_stars`) |
+| Stars Detected | `stars_detected` | integer | Total stars with valid PSF fits |
+| Moffat β | `median_beta` | `{:.2}` | Moffat shape param. Typical: 2-5. Always present with defaults |
+| Background | `background` | `{:.0}` | Global background level (ADU) |
+| Noise | `noise` | `{:.1}` | Background noise sigma (ADU) |
+
+Additional quality indicators:
+
+| Column | Field | Format | Notes |
+|--------|-------|--------|-------|
+| Trail R² | `trail_r_squared` | `{:.3}` | 0 = no trail, >0.5 = suspicious, >0.7 = strong |
 | Trailed | `possibly_trailed` | icon/badge | Warning, not auto-reject |
-| Stars | `stars.len()` | integer | Detected star count |
-| HFR | `median_hfr` | `{:.2}` | Half-flux radius |
-| PSF Signal | `psf_signal` | `{:.0}` | Signal strength |
-| SNR Weight | `snr_weight` | `{:.1}` | Stacking weight |
-| Moffat β | `median_beta` | `{:.2}` | Moffat shape param (with_moffat_fit only) |
+| PSF Signal | `psf_signal` | `{:.0}` | median(star_peaks) / noise |
+| SNR Weight | `snr_weight` | `{:.1}` | PixInsight-style weight for stacking |
 
 ### Annotation toggle in image viewer
 
@@ -394,6 +511,7 @@ Add these to the subframe table alongside existing FWHM/eccentricity/SNR:
 
 Let users switch between `Eccentricity`, `Fwhm`, and `Uniform` in the viewer.
 Each reveals different quality issues:
+
 - **Eccentricity** — tracking, tilt, coma, curvature
 - **FWHM** — focus, field curvature, seeing variation
 - **Uniform** — just show star positions

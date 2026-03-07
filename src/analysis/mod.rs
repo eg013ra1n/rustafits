@@ -1,11 +1,37 @@
 /// Image analysis: FWHM, eccentricity, SNR, PSF signal.
 
+#[cfg(feature = "debug-pipeline")]
+pub mod background;
+#[cfg(not(feature = "debug-pipeline"))]
 mod background;
+
+#[cfg(feature = "debug-pipeline")]
+pub mod convolution;
+#[cfg(not(feature = "debug-pipeline"))]
 mod convolution;
+
+#[cfg(feature = "debug-pipeline")]
+pub mod detection;
+#[cfg(not(feature = "debug-pipeline"))]
 mod detection;
+
+#[cfg(feature = "debug-pipeline")]
+pub mod fitting;
+#[cfg(not(feature = "debug-pipeline"))]
 mod fitting;
+
+#[cfg(feature = "debug-pipeline")]
+pub mod metrics;
+#[cfg(not(feature = "debug-pipeline"))]
 mod metrics;
+
+#[cfg(feature = "debug-pipeline")]
+pub mod snr;
+#[cfg(not(feature = "debug-pipeline"))]
 mod snr;
+
+#[cfg(feature = "debug-pipeline")]
+pub mod render;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -76,9 +102,9 @@ pub struct AnalysisResult {
     pub median_snr: f32,
     /// Median half-flux radius (pixels).
     pub median_hfr: f32,
-    /// Image-wide SNR in decibels: 20 × log10(mean_signal / noise). Comparable to PixInsight SNRViews.
+    /// Image-wide SNR in decibels: 20 × log10(mean_signal / noise).
     pub snr_db: f32,
-    /// PixInsight-style SNR weight: (MeanDev / noise)².
+    /// SNR weight for frame ranking: (MeanDev / noise)².
     pub snr_weight: f32,
     /// PSF signal: median(star_peaks) / noise.
     pub psf_signal: f32,
@@ -112,6 +138,12 @@ pub struct AnalysisConfig {
     trail_r_squared_threshold: f32,
     use_moffat_fit: bool,
     iterative_background: usize,
+    /// MRS wavelet noise layers: 0 = legacy MAD (default), 1+ = MRS wavelet.
+    noise_layers: usize,
+    /// Fixed Moffat beta: None = free (default), Some(b) = fixed.
+    moffat_beta: Option<f32>,
+    /// Maximum distortion (eccentricity) filter: None = no filter (default).
+    max_distortion: Option<f32>,
 }
 
 /// Image analyzer with builder pattern.
@@ -134,8 +166,11 @@ impl ImageAnalyzer {
                 background_mesh_size: None,
                 apply_debayer: true,
                 trail_r_squared_threshold: 0.5,
-                use_moffat_fit: false,
+                use_moffat_fit: true,
                 iterative_background: 1,
+                noise_layers: 0,
+                moffat_beta: None,
+                max_distortion: None,
             },
             thread_pool: None,
         }
@@ -220,10 +255,43 @@ impl ImageAnalyzer {
         self
     }
 
+    /// Enable MRS (Multiresolution Support) wavelet noise estimation.
+    /// Uses à trous B3-spline wavelet to isolate noise from nebulosity/gradients.
+    /// `layers`: number of wavelet layers (1 is sufficient).
+    /// Default: 0 (sigma-clipped MAD).
+    pub fn with_mrs_noise(mut self, layers: usize) -> Self {
+        self.config.noise_layers = layers;
+        self
+    }
+
+    /// Fix Moffat beta to a constant value during PSF fitting.
+    /// Removes the beta/axis-ratio tradeoff, improving FWHM stability.
+    /// Typical value: 4.0 (well-corrected optics).
+    /// Default: None (free beta).
+    pub fn with_moffat_beta(mut self, beta: f32) -> Self {
+        self.config.moffat_beta = Some(beta);
+        self
+    }
+
+    /// Reject detected stars with eccentricity above this threshold before measurement.
+    /// Pre-filters elongated candidates (optical ghosts, diffraction spikes, edge effects).
+    /// Typical value: 0.6. Default: None (no filter).
+    pub fn with_max_distortion(mut self, ecc: f32) -> Self {
+        self.config.max_distortion = Some(ecc.clamp(0.0, 1.0));
+        self
+    }
+
     /// Use Moffat PSF fitting instead of Gaussian for more accurate wing modeling.
     /// Falls back to Gaussian on non-convergence. Reports per-star β values.
+    /// This is the default since v0.7.0.
     pub fn with_moffat_fit(mut self) -> Self {
         self.config.use_moffat_fit = true;
+        self
+    }
+
+    /// Disable Moffat PSF fitting; use Gaussian fit instead.
+    pub fn without_moffat_fit(mut self) -> Self {
+        self.config.use_moffat_fit = false;
         self
     }
 
@@ -373,6 +441,13 @@ impl ImageAnalyzer {
             background::estimate_background(&lum, width, height)
         };
 
+        // MRS wavelet noise override
+        if self.config.noise_layers > 0 {
+            bg_result.noise = background::estimate_noise_mrs(
+                &lum, width, height, self.config.noise_layers,
+            ).max(0.001);
+        }
+
         let mut detected;
         let final_fwhm;
 
@@ -391,15 +466,18 @@ impl ImageAnalyzer {
                 &lum, width, height, &pass1, bg_result.background, bg_map_ref,
             );
 
-            if measured_kernel_fwhm > 0.0
-                && ((measured_kernel_fwhm - initial_fwhm) / initial_fwhm).abs() > 0.30
+            // Cap second-pass kernel to 2× initial to prevent runaway cascade
+            let capped_kernel_fwhm = measured_kernel_fwhm.min(initial_fwhm * 2.0);
+
+            if capped_kernel_fwhm > 0.0
+                && ((capped_kernel_fwhm - initial_fwhm) / initial_fwhm).abs() > 0.30
             {
                 detected = detection::detect_stars(
                     &lum, width, height,
                     bg_result.background, bg_result.noise,
-                    bg_map_ref, noise_map_ref, &det_params, measured_kernel_fwhm,
+                    bg_map_ref, noise_map_ref, &det_params, capped_kernel_fwhm,
                 );
-                final_fwhm = measured_kernel_fwhm;
+                final_fwhm = capped_kernel_fwhm;
             } else {
                 detected = pass1;
                 final_fwhm = initial_fwhm;
@@ -437,6 +515,13 @@ impl ImageAnalyzer {
                 bg_result = background::estimate_background_mesh_masked(
                     &lum, width, height, cell_size, &source_mask,
                 );
+
+                // Re-apply MRS noise override
+                if self.config.noise_layers > 0 {
+                    bg_result.noise = background::estimate_noise_mrs(
+                        &lum, width, height, self.config.noise_layers,
+                    ).max(0.001);
+                }
 
                 // Re-detect with updated background and noise map
                 let bg_map_ref = bg_result.background_map.as_deref();
@@ -529,6 +614,11 @@ impl ImageAnalyzer {
             detected.truncate(max_m);
         }
 
+        // Eccentricity pre-filter: reject elongated candidates before measurement
+        if let Some(max_ecc) = self.config.max_distortion {
+            detected.retain(|s| s.eccentricity <= max_ecc);
+        }
+
         // Measure PSF metrics on all (possibly capped) detected stars
         let mut measured = metrics::measure_stars(
             &lum,
@@ -540,6 +630,7 @@ impl ImageAnalyzer {
             self.config.use_gaussian_fit,
             self.config.use_moffat_fit,
             green_mask,
+            self.config.moffat_beta.map(|b| b as f64),
         );
 
         if measured.is_empty() {
@@ -550,20 +641,21 @@ impl ImageAnalyzer {
         let stars_detected = measured.len();
 
         // Compute statistics from ALL measured stars (no filtering, no cap)
-        let mut fwhm_vals: Vec<f32> = measured.iter().map(|s| s.fwhm).collect();
-        let median_fwhm = find_median(&mut fwhm_vals);
+        // Use sigma-clipped median (2-iter, 3σ MAD) for FWHM, ecc, HFR to reject outliers
+        let fwhm_vals: Vec<f32> = measured.iter().map(|s| s.fwhm).collect();
+        let median_fwhm = sigma_clipped_median(&fwhm_vals);
 
         // Per-star SNR on ALL measured stars
         snr::compute_star_snr(&lum, width, height, &mut measured, median_fwhm);
 
         // Summary statistics from full population
-        let mut ecc_vals: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
+        let ecc_vals: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
         let mut snr_vals: Vec<f32> = measured.iter().map(|s| s.snr).collect();
-        let mut hfr_vals: Vec<f32> = measured.iter().map(|s| s.hfr).collect();
+        let hfr_vals: Vec<f32> = measured.iter().map(|s| s.hfr).collect();
 
-        let median_eccentricity = find_median(&mut ecc_vals);
-        let median_snr = find_median(&mut snr_vals);
-        let median_hfr = find_median(&mut hfr_vals);
+        let median_eccentricity = sigma_clipped_median(&ecc_vals);
+        let median_snr = find_median(&mut snr_vals); // SNR left unclipped
+        let median_hfr = sigma_clipped_median(&hfr_vals);
 
         let psf_signal = snr::compute_psf_signal(&measured, bg_result.noise);
 
@@ -631,10 +723,43 @@ impl Default for ImageAnalyzer {
     }
 }
 
+/// Sigma-clipped median: 2-iteration, 3σ MAD-based clipping.
+///
+/// Standard in SExtractor/DAOPHOT for robust statistics:
+///   MAD = median(|x_i − median|)
+///   σ_MAD = 1.4826 × MAD
+///   reject: |x − median| > 3 × σ_MAD
+///
+/// Returns plain median if fewer than 3 values remain after clipping.
+pub fn sigma_clipped_median(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut v: Vec<f32> = values.to_vec();
+    for _ in 0..2 {
+        if v.len() < 3 {
+            break;
+        }
+        let med = find_median(&mut v);
+        let mut abs_devs: Vec<f32> = v.iter().map(|&x| (x - med).abs()).collect();
+        let mad = find_median(&mut abs_devs);
+        let sigma_mad = 1.4826 * mad;
+        if sigma_mad < 1e-10 {
+            break; // all values identical
+        }
+        let clip = 3.0 * sigma_mad;
+        v.retain(|&x| (x - med).abs() <= clip);
+    }
+    if v.is_empty() {
+        return find_median(&mut values.to_vec());
+    }
+    find_median(&mut v)
+}
+
 /// Estimate FWHM from the brightest detected stars by extracting stamps
 /// and using `estimate_sigma_halfmax`. Returns median FWHM, or 0.0 if
 /// fewer than 3 stars yield valid measurements.
-fn estimate_fwhm_from_stars(
+pub fn estimate_fwhm_from_stars(
     lum: &[f32],
     width: usize,
     height: usize,
@@ -642,14 +767,25 @@ fn estimate_fwhm_from_stars(
     background: f32,
     bg_map: Option<&[f32]>,
 ) -> f32 {
-    // Take top 20 brightest (already sorted by flux descending)
-    let top_n = stars.len().min(20);
-    if top_n < 3 {
+    // Scan top 50 brightest (already sorted by flux descending), select up to 20
+    // with low eccentricity (≤ 0.7) to avoid elongated non-stellar objects
+    // poisoning the kernel estimate.
+    let scan_n = stars.len().min(50);
+    if scan_n < 3 {
         return 0.0;
     }
 
-    let mut fwhm_vals = Vec::with_capacity(top_n);
-    for star in &stars[..top_n] {
+    let round_stars: Vec<&detection::DetectedStar> = stars[..scan_n]
+        .iter()
+        .filter(|s| s.eccentricity <= 0.7)
+        .take(20)
+        .collect();
+    if round_stars.len() < 3 {
+        return 0.0;
+    }
+
+    let mut fwhm_vals = Vec::with_capacity(round_stars.len());
+    for star in &round_stars {
         let stamp_radius = 12_usize; // enough for FWHM up to ~10px
         let cx = star.x.round() as i32;
         let cy = star.y.round() as i32;
@@ -705,7 +841,7 @@ fn build_green_mask(width: usize, height: usize, pattern: BayerPattern) -> Vec<b
 }
 
 /// Extract luminance from planar RGB data: L = 0.2126R + 0.7152G + 0.0722B
-fn extract_luminance(data: &[f32], width: usize, height: usize) -> Vec<f32> {
+pub fn extract_luminance(data: &[f32], width: usize, height: usize) -> Vec<f32> {
     use rayon::prelude::*;
 
     let plane_size = width * height;
@@ -725,4 +861,47 @@ fn extract_luminance(data: &[f32], width: usize, height: usize) -> Vec<f32> {
             }
         });
     lum
+}
+
+/// Prepare luminance data from raw metadata + pixels.
+///
+/// Handles u16→f32 conversion, green-channel interpolation for OSC,
+/// and luminance extraction for multi-channel images.
+/// Returns `(luminance, width, height, channels, green_mask)`.
+#[cfg(feature = "debug-pipeline")]
+pub fn prepare_luminance(
+    meta: &crate::types::ImageMetadata,
+    pixels: &crate::types::PixelData,
+    apply_debayer: bool,
+) -> (Vec<f32>, usize, usize, usize, Option<Vec<bool>>) {
+    use crate::processing::color::u16_to_f32;
+    use crate::processing::debayer;
+
+    let f32_data = match pixels {
+        PixelData::Float32(d) => std::borrow::Cow::Borrowed(d.as_slice()),
+        PixelData::Uint16(d) => std::borrow::Cow::Owned(u16_to_f32(d)),
+    };
+
+    let mut data = f32_data.into_owned();
+    let width = meta.width;
+    let height = meta.height;
+    let channels = meta.channels;
+
+    let green_mask = if apply_debayer
+        && meta.bayer_pattern != BayerPattern::None
+        && channels == 1
+    {
+        data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
+        Some(build_green_mask(width, height, meta.bayer_pattern))
+    } else {
+        None
+    };
+
+    let lum = if channels == 3 {
+        extract_luminance(&data, width, height)
+    } else {
+        data[..width * height].to_vec()
+    };
+
+    (lum, width, height, channels, green_mask)
 }

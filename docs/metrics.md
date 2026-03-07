@@ -79,7 +79,25 @@ HFR is more robust than FWHM for non-Gaussian profiles (e.g. coma, defocused sta
 
 Two methods are available:
 
-### Method 1: 2D Gaussian Fit (Default)
+### Method 1: 2D Moffat Fit (Default)
+
+Uses full elliptical Moffat fitting for accurate PSF measurement. The Moffat profile
+models power-law wings better than a Gaussian, giving more accurate FWHM especially
+for well-sampled stars (FWHM > 3 px). See [fitting.md](fitting.md) for the full model.
+
+Two variants:
+
+- **Free beta** (default, 8 parameters) — fits the wing slope parameter β alongside all other
+  parameters. Reports `beta` in `StarMetrics` and `median_beta` in `AnalysisResult`.
+- **Fixed beta** (`with_moffat_beta(4.0)`, 7 parameters) — holds β constant during optimization.
+  Improves FWHM stability by removing the beta/axis-ratio tradeoff.
+
+When a Moffat fit fails (non-convergence or unphysical parameters), the Gaussian result
+is used as fallback (same FWHM/eccentricity formulas, just sigma-based instead of alpha-based).
+
+Disable Moffat fitting entirely with `without_moffat_fit()` to use Gaussian only.
+
+### Method 2: 2D Gaussian Fit
 
 Uses full elliptical Gaussian fitting (see [fitting.md](fitting.md)):
 
@@ -122,7 +140,7 @@ Star Stamp
 +-----------------------------+
 ```
 
-**Accuracy:** Matches PixInsight FWHMEccentricity within ~2% on typical data.
+**Accuracy:** Within ~1-2% of professional tools on typical data.
 
 **Note on axis canonicalization:** The LM optimizer has a degeneracy — the pair
 (sigma_x, sigma_y, theta) produces an identical PSF to (sigma_y, sigma_x,
@@ -133,7 +151,7 @@ all downstream consumers (annotation ellipses, direction ticks). The same
 canonicalization applies to Moffat fits. The moments path already produces
 canonical output because eigenvalues are sorted by construction.
 
-### Method 2: Windowed Moments (Fast Path)
+### Method 3: Windowed Moments (Fast Path)
 
 Non-parametric method using second-order intensity moments:
 
@@ -193,16 +211,17 @@ Star Stamp
 
 **mono.fits:**
 
-| Metric           | Gaussian Fit | Moments | PixInsight |
-|------------------|-------------|---------|------------|
-| Median FWHM      | 2.14 px     | 4.91 px | 2.16 px    |
-| Median Ecc       | 0.341       | 0.302   | 0.480      |
+| Metric           | Moffat (default) | Gaussian | Moments |
+|------------------|-------------------|----------|---------|
+| Median FWHM      | ~2.16 px          | ~2.14 px | ~4.91 px |
+| Median Ecc       | ~0.34             | ~0.34    | ~0.30   |
+| Reports beta     | Yes (~3.5)        | No       | No      |
 
 **osc.fits (green-pixel-only fitting):**
 
-| Metric           | Gaussian Fit | PixInsight |
-|------------------|-------------|------------|
-| Median FWHM      | 2.61 px     | 2.73 px    |
+| Metric           | Moffat (default) | Gaussian |
+|------------------|-------------------|----------|
+| Median FWHM      | ~2.66 px          | ~2.61 px |
 
 ---
 

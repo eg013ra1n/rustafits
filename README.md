@@ -5,13 +5,13 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 ## Features
 
 - **FITS & XISF Support**: Native readers for both formats (no external libraries)
-- **Auto-Stretch**: Median-based statistical stretching (PixInsight STF compatible)
+- **Auto-Stretch**: Median-based statistical stretching (STF-compatible midtones transfer)
 - **Bayer Debayering**: Super-pixel 2x2 block averaging (RGGB, BGGR, GBRG, GRBG)
 - **Preview Mode**: 2x2 binning for fast previews
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
-- **Image Analysis**: Star detection with matched-filter convolution, Gaussian and Moffat PSF fitting, FWHM/HFR/eccentricity measurement, and SNR computation
+- **Image Analysis**: Star detection with matched-filter convolution, Gaussian and Moffat PSF fitting, FWHM/HFR/eccentricity measurement, SNR computation, MRS wavelet noise estimation, and configurable distortion filtering
 - **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
 
 ## Supported Formats
@@ -116,6 +116,35 @@ let image: ProcessedImage = ImageConverter::new()
 // image.is_color - true if debayered/RGB, false if mono (gray replicated to RGB)
 ```
 
+### Image analysis
+
+Detect stars, measure PSF shape, and compute image quality metrics:
+
+```rust
+use astroimage::ImageAnalyzer;
+
+let result = ImageAnalyzer::new()
+    .with_background_mesh(64)        // Spatially varying background
+    .with_max_stars(500)
+    .analyze("light.fits")?;
+
+println!("Stars: {}  FWHM: {:.2} px  Ecc: {:.3}  SNR: {:.1} dB",
+    result.stars_detected, result.median_fwhm,
+    result.median_eccentricity, result.snr_db);
+```
+
+Default configuration includes Moffat PSF fitting with free beta, iterative source-masked
+background re-estimation, and two-pass adaptive detection. See [Analysis API](docs/usage.md)
+for all builder methods.
+
+Optional settings for advanced use cases:
+
+| Method | Description |
+|--------|-------------|
+| `with_mrs_noise(1)` | MRS wavelet noise — isolates noise from nebulosity using B3-spline à trous wavelet |
+| `with_moffat_beta(4.0)` | Fix Moffat beta — constrains PSF wing slope for more stable FWHM |
+| `with_max_distortion(0.6)` | Reject elongated candidates before fitting — reduces outliers |
+
 ### Star annotation overlay
 
 Analyze an image for stars and draw color-coded ellipses showing PSF shape and quality:
@@ -128,6 +157,7 @@ use astroimage::{
 
 let mut image = ImageConverter::new().process("light.fits")?;
 let result = ImageAnalyzer::new()
+    .with_background_mesh(64)
     .with_max_stars(500)
     .analyze("light.fits")?;
 
@@ -273,10 +303,10 @@ rustafits/
 │   │   └── xisf.rs         # XISF reader (zlib/LZ4/Zstd)
 │   ├── analysis/
 │   │   ├── mod.rs            # Analyzer builder + pipeline orchestration
-│   │   ├── background.rs     # Background estimation (global + mesh-grid)
-│   │   ├── convolution.rs    # Separable matched-filter convolution
+│   │   ├── background.rs     # Background estimation (global, mesh-grid, MRS wavelet)
+│   │   ├── convolution.rs    # Separable convolution + B3-spline smoothing
 │   │   ├── detection.rs      # Star detection (DAOFIND + CCL)
-│   │   ├── fitting.rs        # LM Gaussian & Moffat PSF fitting
+│   │   ├── fitting.rs        # LM Gaussian & Moffat PSF fitting (free/fixed beta)
 │   │   ├── metrics.rs        # FWHM, eccentricity, HFR measurement
 │   │   └── snr.rs            # Per-star and image-wide SNR
 │   └── processing/
@@ -300,9 +330,10 @@ rustafits/
 
 ## References
 
-- PixInsight — Screen Transfer Function documentation
 - [FITS Standard](https://fits.gsfc.nasa.gov/)
 - [XISF Specification](https://pixinsight.com/xisf/)
+- Stetson, P.B. (1987) — DAOFIND star detection algorithm
+- SExtractor — Background estimation methodology
 
 ## License
 

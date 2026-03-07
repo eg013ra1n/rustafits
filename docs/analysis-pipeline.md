@@ -2,10 +2,10 @@
 
 The analysis module performs automatic star detection, PSF measurement, and image quality
 assessment on astronomical images. It outputs per-star metrics and image-wide statistics
-comparable to PixInsight's SubframeSelector.
+suitable for subframe evaluation and stacking weight computation.
 
 All detected stars are measured and contribute to statistics — no artificial cap on
-measurement count. Like PixInsight, statistics reflect the full stellar population.
+measurement count. Statistics reflect the full stellar population.
 
 ## Data Flow
 
@@ -44,6 +44,11 @@ FITS / XISF File
 | -> background level (ADU)     |  Optional iterative source-masked re-estimation
 | -> noise sigma (ADU)          |  (with_iterative_background + with_background_mesh)
 | -> optional bg/noise maps     |
+|                               |
+| Noise estimation (two modes): |
+|   MAD (default):              |  1.4826 * MAD of sigma-clipped samples
+|   MRS wavelet (with_mrs_noise)|  B3-spline à trous wavelet, layer 1 coefficients
+|                               |  Isolates noise from nebulosity/gradients
 +-------------------------------+
        |
        v
@@ -72,11 +77,21 @@ FITS / XISF File
        |
        v
 +-------------------------------+
++-------------------------------+
+| Distortion Pre-Filter         |  (optional, with_max_distortion)
+| (optional)                    |  Reject detected stars with moments-based
+|                               |  eccentricity > threshold before fitting.
+|                               |  Reduces outlier count from elongated artifacts.
++-------------------------------+
+       |
+       v
++-------------------------------+
 | PSF Measurement (ALL stars)   |  Extract stamp around each detected star
-| -> FWHM (x, y, geometric)    |  2D Gaussian LM fit (default) or windowed moments
-| -> Eccentricity               |  Optional: 2D Moffat LM fit (8-param, reports beta)
-| -> HFR, theta                 |  Moments-based theta (always computed)
-| -> Moffat beta (optional)     |  OSC: only green CFA pixels fed to fitter
+| -> FWHM (x, y, geometric)    |  2D Moffat LM fit (default, 8-param free beta)
+| -> Eccentricity               |  Optional: fixed beta (7-param, with_moffat_beta)
+| -> HFR, theta                 |  Gaussian LM fallback if Moffat disabled
+| -> Moffat beta (optional)     |  Moments-based theta (always computed)
+|                               |  OSC: only green CFA pixels fed to fitter
 |                               |  Stars that fail fitting are excluded
 +-------------------------------+
        |
@@ -99,8 +114,8 @@ FITS / XISF File
        v
 +-------------------------------+
 | Image-Wide Metrics            |
-| -> SNR dB                     |  20 * log10(mean / noise)  -- PI SNRViews
-| -> SNR Weight                 |  (MeanDev / noise)^2       -- PI SubframeSelector
+| -> SNR dB                     |  20 * log10(mean / noise)
+| -> SNR Weight                 |  (MeanDev / noise)^2  -- subframe ranking
 | -> PSF Signal                 |  median(star_peaks) / noise
 +-------------------------------+
        |
@@ -130,18 +145,20 @@ Stars are filtered during detection (before measurement) by:
 | Saturation | saturation_fraction * 65535 (default 0.95) | Saturated stars |
 | Border | Touches image edge | Truncated PSFs |
 | Aspect ratio | Bounding box > 8:1 | Cosmic rays (aspect ~20-100), satellite trails (~50+) |
+| Max distortion | `with_max_distortion(f32)` (optional) | Elongated candidates (detection-stage ecc above threshold) |
 
-No eccentricity filter is applied — all stars with valid measurements contribute
-to statistics, matching PixInsight's approach.
+By default, no eccentricity filter is applied — all stars with valid measurements
+contribute to statistics. Use `with_max_distortion()` to pre-filter elongated
+candidates before PSF fitting.
 
 ## Module Map
 
 | Module           | File              | Purpose                                      |
 |------------------|-------------------|----------------------------------------------|
-| Background       | `background.rs`   | Global, mesh-grid, and iterative background   |
-| Convolution      | `convolution.rs`  | Separable Gaussian convolution (SIMD dispatch) |
+| Background       | `background.rs`   | Global, mesh-grid, iterative background, MRS wavelet noise |
+| Convolution      | `convolution.rs`  | Separable Gaussian convolution (SIMD), B3-spline smoothing |
 | Detection        | `detection.rs`    | DAOFIND matched filter + CCL + deblending     |
-| Fitting          | `fitting.rs`      | LM 2D Gaussian (7-param) and Moffat (8-param) |
+| Fitting          | `fitting.rs`      | LM 2D Gaussian (7-param), Moffat (8-param free / 7-param fixed beta) |
 | Metrics          | `metrics.rs`      | Per-star FWHM, eccentricity, HFR measurement |
 | SNR              | `snr.rs`          | Per-star and image-wide SNR computations      |
 | Orchestration    | `mod.rs`          | Builder API, trail detection, pipeline wiring |
@@ -164,19 +181,43 @@ The Path A threshold defaults to 0.5 and is configurable via `with_trail_thresho
 
 See [Trail Detection](trail-rejection.md) for the full algorithm and rationale.
 
-## PixInsight Comparison
+## Typical Results
 
-| Metric              | PixInsight Tool            | Our Equivalent        | mono.fits | osc.fits  |
-|---------------------|----------------------------|-----------------------|-----------|-----------|
-| FWHM                | FWHMEccentricity           | `median_fwhm`         | ~2.16 px  | ~2.66 px  |
-| FWHM (PI)           | FWHMEccentricity           | —                     | ~2.16 px  | ~2.73 px  |
-| Eccentricity        | FWHMEccentricity           | `median_eccentricity` | ~0.49     | ~0.44     |
-| Stars detected      | SubframeSelector           | `stars_detected`      | ~4,485    | ~712      |
-| Image SNR           | SNRViews (dB)              | `snr_db`              | ~27.7 dB  | —         |
-| SNR Weight          | SubframeSelector           | `snr_weight`          | ~1.1      | —         |
-| PSF Signal          | SubframeSelector           | `psf_signal`          | ~14       | —         |
+| Metric              | Field               | mono.fits | osc.fits  |
+|---------------------|---------------------|-----------|-----------|
+| FWHM                | `median_fwhm`       | ~2.16 px  | ~2.66 px  |
+| Eccentricity        | `median_eccentricity` | ~0.49   | ~0.44     |
+| Stars detected      | `stars_detected`    | ~4,485    | ~712      |
+| Image SNR           | `snr_db`            | ~27.7 dB  | —         |
+| SNR Weight          | `snr_weight`        | ~1.1      | —         |
+| PSF Signal          | `psf_signal`        | ~14       | —         |
 
-FWHM accuracy: mono ~1% vs PixInsight, OSC ~3% vs PixInsight.
+FWHM accuracy: within ~1% of professional tools on mono, ~3% on OSC.
+
+## Configurable Algorithms
+
+The pipeline offers multiple algorithm variants for noise estimation and PSF fitting,
+selectable via the builder API:
+
+| Component | Default | Alternative | Builder Method |
+|-----------|---------|-------------|----------------|
+| Noise estimation | Sigma-clipped MAD | MRS wavelet (à trous) | `with_mrs_noise(1)` |
+| PSF model | Moffat, free beta | Moffat, fixed beta | `with_moffat_beta(4.0)` |
+| PSF model | Moffat | Gaussian only | `without_moffat_fit()` |
+| PSF model | Gaussian + Moffat | Windowed moments | `without_gaussian_fit()` |
+| Distortion filter | None | Reject ecc > threshold | `with_max_distortion(0.6)` |
+
+**MRS wavelet noise** isolates the finest-scale fluctuations from nebulosity and gradients
+using a B3-spline à trous wavelet transform. Useful for nebula-rich fields where the standard
+MAD estimator overestimates noise by conflating nebulosity with background fluctuations.
+
+**Fixed Moffat beta** constrains the PSF wing slope during fitting (7 free parameters instead
+of 8). This improves FWHM stability when the free beta parameter trades off against the
+axis ratio. Typical values: beta=4 for well-corrected optics.
+
+**Max distortion filter** rejects candidates with high moments-based eccentricity before
+PSF fitting. This removes elongated artifacts (optical ghosts, diffraction spikes, edge
+effects) from the measurement population.
 
 See individual algorithm documents for full details:
 

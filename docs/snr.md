@@ -116,7 +116,7 @@ Returns SNR = 0 if:
 
 ## Image-Wide SNR in Decibels
 
-Whole-frame signal-to-noise, comparable to PixInsight's SNRViews script.
+Whole-frame signal-to-noise ratio.
 
 ```
 SNR_dB = 20 * log10(mean_signal / noise)
@@ -150,14 +150,13 @@ Input: luminance image, noise (from background estimation)
 | 40 dB  | 100         | Very clean           |
 | 50 dB  | 316         | Exceptional          |
 
-PixInsight SNRViews on `mono.fits`: **28.70 dB**
-Our computation on `mono.fits`: **27.65 dB** (~1 dB difference, within methodology variance)
+On `mono.fits`: **~27.7 dB** (within ~1 dB of professional tools).
 
 ---
 
-## SNR Weight (SubframeSelector-Compatible)
+## SNR Weight
 
-PixInsight SubframeSelector uses this for frame ranking:
+A frame-ranking metric for subframe evaluation and stacking weight computation:
 
 ```
 SNR_weight = (MeanDeviation / noise)^2
@@ -211,5 +210,5 @@ Input: measured stars (with peak values), noise
 **Interpretation:** How many noise-sigmas above background is a typical star peak.
 Higher = brighter stars relative to noise = better data for photometry and astrometry.
 
-In PixInsight SubframeSelector, the user sets a "PSF Signal Divisor" to normalize
-this into a [0, 1] weight. That divisor is a user preference, not computed from data.
+Some subframe evaluation tools normalize this with a user-defined divisor to produce
+a [0, 1] weight. That divisor is a user preference, not computed from data.

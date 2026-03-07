@@ -10,7 +10,7 @@ use crate::processing::stretch::find_median;
 /// `median_fwhm`: used to scale aperture/annulus radii.
 /// `background`: global background level.
 /// `bg_map`: optional per-pixel background map.
-pub(crate) fn compute_star_snr(
+pub fn compute_star_snr(
     data: &[f32],
     width: usize,
     height: usize,
@@ -143,9 +143,9 @@ fn compute_single_snr(
     (star_flux / noise_sq.sqrt()) as f32
 }
 
-/// Compute image-wide SNR Weight (PixInsight-style).
+/// Compute image-wide SNR Weight for frame ranking.
 /// SNRWeight = (MeanDeviation / noise)²
-pub(crate) fn compute_snr_weight(data: &[f32], background: f32, noise: f32) -> f32 {
+pub fn compute_snr_weight(data: &[f32], background: f32, noise: f32) -> f32 {
     if noise <= 0.0 || data.is_empty() {
         return 0.0;
     }
@@ -173,8 +173,7 @@ pub(crate) fn compute_snr_weight(data: &[f32], background: f32, noise: f32) -> f
 }
 
 /// Compute whole-image SNR in decibels: 20 × log10(mean / noise).
-/// Matches PixInsight SNRViews methodology.
-pub(crate) fn compute_snr_db(data: &[f32], noise: f32) -> f32 {
+pub fn compute_snr_db(data: &[f32], noise: f32) -> f32 {
     if noise <= 0.0 || data.is_empty() {
         return 0.0;
     }
@@ -204,7 +203,7 @@ pub(crate) fn compute_snr_db(data: &[f32], noise: f32) -> f32 {
 }
 
 /// Compute PSF Signal = median(star_peaks) / noise.
-pub(crate) fn compute_psf_signal(stars: &[MeasuredStar], noise: f32) -> f32 {
+pub fn compute_psf_signal(stars: &[MeasuredStar], noise: f32) -> f32 {
     if stars.is_empty() || noise <= 0.0 {
         return 0.0;
     }

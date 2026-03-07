@@ -1,7 +1,16 @@
-# Gaussian Fitting (Levenberg-Marquardt)
+# PSF Fitting (Levenberg-Marquardt)
 
-Non-linear least-squares fitting of 1D and 2D Gaussian models using the
+Non-linear least-squares fitting of 2D Gaussian and Moffat PSF models using the
 Levenberg-Marquardt algorithm. Used for accurate FWHM and eccentricity measurement.
+
+Two PSF models are available:
+
+| Model | Parameters | Use Case |
+|-------|------------|----------|
+| **Gaussian** | 7 (B, A, x0, y0, sigma_x, sigma_y, theta) | Fast, good for well-sampled stars |
+| **Moffat** (default) | 8 free / 7 fixed-beta | Better wing modeling, reports beta shape parameter |
+
+Moffat fitting is enabled by default. See [Moffat section](#2d-elliptical-moffat-fit) below.
 
 ## 2D Elliptical Gaussian Fit (Primary — Used for Stars)
 
@@ -179,13 +188,168 @@ sigma0 = half-max-width / 2.3548      (from left/right half-maximum crossings)
 
 ---
 
+## 2D Elliptical Moffat Fit
+
+The Moffat profile models PSF wings more accurately than a Gaussian. Real stellar PSFs
+have power-law wings from atmospheric scattering and optical diffraction that a Gaussian
+cannot capture. The Moffat function interpolates between Gaussian (beta → ∞) and
+Lorentzian (beta = 1) profiles.
+
+Moffat fitting is **enabled by default**. Disable with `without_moffat_fit()`.
+
+### Model
+
+```
+M(x, y) = B + A × (1 + Q(x,y))^(-β)
+```
+
+where Q is the rotated quadratic form:
+
+```
+u = (x - x0) × cos(θ) + (y - y0) × sin(θ)
+v = -(x - x0) × sin(θ) + (y - y0) × cos(θ)
+
+Q(x, y) = (u / α_x)² + (v / α_y)²
+```
+
+**8 Parameters (free beta):** `[B, A, x0, y0, alpha_x, alpha_y, theta, beta]`
+
+- `B` — background pedestal
+- `A` — peak amplitude above background
+- `x0, y0` — centroid position
+- `alpha_x, alpha_y` — Moffat scale parameters along major/minor axes
+- `theta` — rotation angle of the ellipse
+- `beta` — wing slope exponent (higher = steeper = more Gaussian-like)
+
+**7 Parameters (fixed beta):** Same as above but `beta` is held constant during
+optimization. Enable with `with_moffat_beta(4.0)`. This removes one degree of
+freedom, improving FWHM stability when beta and axis ratio trade off against each other.
+
+### FWHM from Moffat Parameters
+
+```
+FWHM = 2α × √(2^(1/β) - 1)
+```
+
+This is the analytic half-maximum width of the Moffat profile. For beta → ∞,
+the factor `√(2^(1/β) - 1)` approaches `√(ln 2)` and recovers the Gaussian FWHM.
+
+### Fitting Strategy
+
+```
+Input: star stamp (background-subtracted pixels + positions)
+       |
+       v
++------------------------------+
+| Initial Parameter Estimates  |
+|                              |
+|   B0 = 0 (pre-subtracted)   |
+|   A0 = max(stamp pixels)    |
+|   x0, y0 = input centroid   |
+|   α0 = σ_gauss × FWHM / (2 × √(2^(1/β₀) - 1))
+|   β0 = fixed_beta or 3.0    |
+|   theta0 = 0                |
++------------------------------+
+       |
+       v
++------------------------------+
+| Levenberg-Marquardt          |  np = 7 (fixed beta) or 8 (free beta)
+|   max 30 iterations          |  Same LM engine as Gaussian
+|   convergence: 1e-7          |  Cholesky solver (np × np system)
++------------------------------+
+       |
+       v
+  Moffat2DResult { b, a, x0, y0, alpha_x, alpha_y, theta, beta, converged }
+```
+
+### Jacobian (8-parameter, free beta)
+
+```
+At each pixel (x, y):
+
+  base = 1 + Q(x,y)
+  power = base^(-β)
+  dpower/dQ = -β × base^(-β - 1)
+
+  J[0] = 1                        dM/dB
+  J[1] = power                    dM/dA
+  J[2] = A × dpower/dQ × dQ/dx0  dM/dx0
+  J[3] = A × dpower/dQ × dQ/dy0  dM/dy0
+  J[4] = A × dpower/dQ × (-2u²/α_x³)    dM/dα_x
+  J[5] = A × dpower/dQ × (-2v²/α_y³)    dM/dα_y
+  J[6] = A × dpower/dQ × dQ/dθ   dM/dθ
+  J[7] = -A × power × ln(base)   dM/dβ
+```
+
+For fixed beta (7-parameter): `J[7]` (dM/dβ) is omitted. The Cholesky solver
+operates on a 7×7 system instead of 8×8.
+
+### Beta Interpretation
+
+| Beta | Wing Shape | Equivalent |
+|------|-----------|------------|
+| 1.0 | Very broad wings | Lorentzian |
+| 2.0 | Moderate wings | Typical poor seeing |
+| 3.0 | Default initial guess | Typical good optics |
+| 4.0 | Gentle wings | Well-corrected optics, common fixed value |
+| 4.765 | Gaussian-equivalent | Exactly matches Gaussian shape |
+| > 6 | Very steep falloff | Near-Gaussian, unusual |
+
+### Validation
+
+The fit result is rejected (returns `None`) if:
+- `alpha_x < 0.3` or `alpha_y < 0.3` (sub-pixel — unphysical)
+- `A <= 0` (no star detected)
+- `beta < 1.0` or `beta > 20.0` (unphysical wing parameter)
+- Fewer than 12 pixel samples (underdetermined for 8-parameter system)
+
+### FWHM and Eccentricity from Moffat Fit
+
+The same axis canonicalization as the Gaussian fit applies:
+
+```
+if alpha_x >= alpha_y:
+    FWHM_x = 2 × alpha_x × √(2^(1/β) - 1)    (major)
+    FWHM_y = 2 × alpha_y × √(2^(1/β) - 1)    (minor)
+    theta  = theta                              (unchanged)
+else:
+    FWHM_x = 2 × alpha_y × √(2^(1/β) - 1)    (major — was y-axis)
+    FWHM_y = 2 × alpha_x × √(2^(1/β) - 1)    (minor — was x-axis)
+    theta  = theta + π/2                        (rotated to match)
+
+FWHM   = √(FWHM_x × FWHM_y)     (geometric mean)
+
+eccentricity = √(1 - FWHM_y² / FWHM_x²)
+```
+
+### Moffat vs Gaussian
+
+The pipeline supports both models. When Moffat fitting is enabled (default), the
+2D Gaussian fit runs first to provide initial parameter estimates, then the Moffat fit
+refines the result. If the Moffat fit fails (non-convergence, unphysical parameters),
+the Gaussian result is used as fallback.
+
+| Aspect | Gaussian | Moffat |
+|--------|----------|--------|
+| Wing accuracy | Underestimates wings | Accurate power-law wings |
+| Parameters | 7 | 8 (free) or 7 (fixed beta) |
+| Min samples | 10 | 12 |
+| Convergence | Faster (simpler model) | Slightly slower |
+| Reports beta | No | Yes |
+| Default | Fallback | Primary |
+
+---
+
 ## Constants
 
 | Parameter           | Value  | Rationale                                     |
 |---------------------|--------|-----------------------------------------------|
 | Max iterations      | 30     | Sufficient for well-conditioned star profiles |
 | Convergence tol     | 1e-7   | Relative parameter change threshold           |
-| Min sigma           | 0.3 px | Below this, fit is unphysical (noise artifact)|
+| Min sigma (Gaussian)| 0.3 px | Below this, fit is unphysical (noise artifact)|
+| Min alpha (Moffat)  | 0.3 px | Below this, fit is unphysical (noise artifact)|
+| Max beta            | 20.0   | Above this, effectively Gaussian              |
+| Min beta            | 1.0    | Below this, unphysical                        |
 | Ellipticity trigger | 0.1    | Below this, rotation angle adds no value      |
-| Min pixel samples   | 10     | Need overdetermined system for robust fit     |
+| Min pixel samples   | 10/12  | Gaussian / Moffat minimum for overdetermined system |
 | Arithmetic          | f64    | Avoid float32 precision loss in normal eqns   |
