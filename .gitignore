@@ -53,3 +53,4 @@ tests/*
 # Temporary files
 *.tmp
 *.log
+CLAUDE.md
