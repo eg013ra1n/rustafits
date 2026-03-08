@@ -20,6 +20,8 @@ pub struct MeasuredStar {
     pub theta: f32,
     /// Moffat β parameter (None if Gaussian fit was used).
     pub beta: Option<f32>,
+    /// Which PSF fitting method produced this measurement.
+    pub fit_method: super::FitMethod,
 }
 
 const FWHM_FACTOR: f32 = 2.3548;
@@ -291,6 +293,7 @@ fn measure_with_moments(
         snr: 0.0,
         theta: theta as f32,
         beta: None,
+        fit_method: super::FitMethod::Moments,
     })
 }
 
@@ -482,6 +485,7 @@ fn measure_with_gaussian_fit(
         snr: 0.0,
         theta: theta as f32,
         beta: None,
+        fit_method: super::FitMethod::Gaussian,
     })
 }
 
@@ -620,6 +624,11 @@ fn measure_with_moffat_fit(
         snr: 0.0,
         theta: theta as f32,
         beta: Some(result.beta as f32),
+        fit_method: if fixed_beta.is_some() {
+            super::FitMethod::FixedMoffat
+        } else {
+            super::FitMethod::FreeMoffat
+        },
     })
 }
 

@@ -477,6 +477,7 @@ mod tests {
             hfr: fwhm * 0.6,
             theta: 0.0,
             beta: None,
+            fit_method: crate::analysis::FitMethod::Gaussian,
         }
     }
 
@@ -566,6 +567,7 @@ mod tests {
             hfr: 3.0,
             theta,
             beta: None,
+            fit_method: crate::analysis::FitMethod::Gaussian,
         };
         let result = dummy_result(vec![star]);
         let config = AnnotationConfig::default();

@@ -46,6 +46,19 @@ use crate::types::{BayerPattern, ImageMetadata, PixelData};
 
 use detection::DetectionParams;
 
+/// Method used to measure this star's PSF.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FitMethod {
+    /// Free-beta Moffat (8 params) — highest accuracy.
+    FreeMoffat,
+    /// Fixed-beta Moffat (7 params) — field median beta.
+    FixedMoffat,
+    /// Gaussian fallback (7 params).
+    Gaussian,
+    /// Windowed moments — lowest accuracy, flagged unreliable.
+    Moments,
+}
+
 /// Quantitative metrics for a single detected star.
 pub struct StarMetrics {
     /// Subpixel centroid X.
@@ -74,6 +87,8 @@ pub struct StarMetrics {
     pub theta: f32,
     /// Moffat β parameter (None if Gaussian/moments fit was used).
     pub beta: Option<f32>,
+    /// Which PSF fitting method produced this measurement.
+    pub fit_method: FitMethod,
 }
 
 /// Full analysis result for an image.
@@ -690,6 +705,7 @@ impl ImageAnalyzer {
                 hfr: m.hfr,
                 theta: m.theta,
                 beta: m.beta,
+                fit_method: m.fit_method,
             })
             .collect();
 

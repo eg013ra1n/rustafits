@@ -262,14 +262,17 @@ mod tests {
             MeasuredStar {
                 x: 0.0, y: 0.0, peak: 5000.0, flux: 50000.0,
                 fwhm_x: 7.0, fwhm_y: 7.0, fwhm: 7.0, eccentricity: 0.0, hfr: 3.5, snr: 0.0, theta: 0.0, beta: None,
+                fit_method: crate::analysis::FitMethod::Gaussian,
             },
             MeasuredStar {
                 x: 0.0, y: 0.0, peak: 3000.0, flux: 30000.0,
                 fwhm_x: 7.0, fwhm_y: 7.0, fwhm: 7.0, eccentricity: 0.0, hfr: 3.5, snr: 0.0, theta: 0.0, beta: None,
+                fit_method: crate::analysis::FitMethod::Gaussian,
             },
             MeasuredStar {
                 x: 0.0, y: 0.0, peak: 7000.0, flux: 70000.0,
                 fwhm_x: 7.0, fwhm_y: 7.0, fwhm: 7.0, eccentricity: 0.0, hfr: 3.5, snr: 0.0, theta: 0.0, beta: None,
+                fit_method: crate::analysis::FitMethod::Gaussian,
             },
         ];
 
