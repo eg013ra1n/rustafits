@@ -124,26 +124,20 @@ Detect stars, measure PSF shape, and compute image quality metrics:
 use astroimage::ImageAnalyzer;
 
 let result = ImageAnalyzer::new()
-    .with_background_mesh(64)        // Spatially varying background
     .with_max_stars(500)
     .analyze("light.fits")?;
 
-println!("Stars: {}  FWHM: {:.2} px  Ecc: {:.3}  SNR: {:.1} dB",
+println!("Stars: {}  FWHM: {:.2} px  Ecc: {:.3}  Beta: {:.2}",
     result.stars_detected, result.median_fwhm,
-    result.median_eccentricity, result.snr_db);
+    result.median_eccentricity,
+    result.median_beta.unwrap_or(0.0));
 ```
 
-Default configuration includes Moffat PSF fitting with free beta, iterative source-masked
-background re-estimation, and two-pass adaptive detection. See [Analysis API](docs/usage.md)
-for all builder methods.
-
-Optional settings for advanced use cases:
-
-| Method | Description |
-|--------|-------------|
-| `with_mrs_noise(1)` | MRS wavelet noise — isolates noise from nebulosity using B3-spline à trous wavelet |
-| `with_moffat_beta(4.0)` | Fix Moffat beta — constrains PSF wing slope for more stable FWHM |
-| `with_max_distortion(0.6)` | Reject elongated candidates before fitting — reduces outliers |
+Default configuration uses Moffat-primary PSF fitting with a two-pass calibration pipeline:
+pass 1 discovers the field PSF model from bright calibration stars (free-beta Moffat),
+pass 2 applies fixed-beta Moffat to all stars. Background is always mesh-grid with
+auto-tuned cell size and MRS wavelet noise. See [Analysis API](docs/usage.md) for all
+builder methods.
 
 ### Star annotation overlay
 
@@ -157,7 +151,6 @@ use astroimage::{
 
 let mut image = ImageConverter::new().process("light.fits")?;
 let result = ImageAnalyzer::new()
-    .with_background_mesh(64)
     .with_max_stars(500)
     .analyze("light.fits")?;
 
