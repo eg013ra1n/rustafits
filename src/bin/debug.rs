@@ -1325,12 +1325,40 @@ fn analyze_one_file(
         (pass1, initial_fwhm)
     };
 
-    // Measurement
+    // Two-pass calibration: free-beta on bright calibration stars, fixed-beta on all
+    let calibration_stars: Vec<DetectedStar> = detected
+        .iter()
+        .filter(|s| s.eccentricity < 0.5 && s.area >= 5)
+        .take(100)
+        .map(|s| DetectedStar {
+            x: s.x, y: s.y, peak: s.peak, flux: s.flux,
+            area: s.area, theta: s.theta, eccentricity: s.eccentricity,
+        })
+        .collect();
+
+    let field_beta: Option<f64> = if calibration_stars.len() >= 3 {
+        let cal_measured = metrics::measure_stars(
+            &lum, w, h, &calibration_stars,
+            bg.background, bg_map_ref,
+            green_mask.as_deref(),
+            None, // free-beta
+        );
+        let beta_vals: Vec<f32> = cal_measured.iter().filter_map(|s| s.beta).collect();
+        if beta_vals.len() >= 3 {
+            Some(sigma_clipped_median(&beta_vals) as f64)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Pass 2: fixed-beta on all stars
     let mut measured = metrics::measure_stars(
         &lum, w, h, &detected,
         bg.background, bg_map_ref,
         green_mask.as_deref(),
-        None, // free-beta for compare
+        field_beta,
     );
 
     if measured.is_empty() {

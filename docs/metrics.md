@@ -79,23 +79,23 @@ HFR is more robust than FWHM for non-Gaussian profiles (e.g. coma, defocused sta
 
 Two methods are available:
 
-### Method 1: 2D Moffat Fit (Default)
+### Method 1: 2D Moffat Fit (Default — Two-Pass Calibration)
 
 Uses full elliptical Moffat fitting for accurate PSF measurement. The Moffat profile
 models power-law wings better than a Gaussian, giving more accurate FWHM especially
 for well-sampled stars (FWHM > 3 px). See [fitting.md](fitting.md) for the full model.
 
-Two variants:
+The pipeline uses a two-pass calibration approach:
 
-- **Free beta** (default, 8 parameters) — fits the wing slope parameter β alongside all other
-  parameters. Reports `beta` in `StarMetrics` and `median_beta` in `AnalysisResult`.
-- **Fixed beta** (`with_moffat_beta(4.0)`, 7 parameters) — holds β constant during optimization.
-  Improves FWHM stability by removing the beta/axis-ratio tradeoff.
+- **Pass 1** — free-beta Moffat (8 parameters) on top ~100 bright calibration stars
+  (eccentricity < 0.5, area >= 5). Derives `field_beta` and `field_fwhm` via
+  sigma-clipped median.
+- **Pass 2** — fixed-beta Moffat (7 parameters, using `field_beta`) on all detected stars.
+  This removes the beta/axis-ratio tradeoff, improving FWHM stability.
 
-When a Moffat fit fails (non-convergence or unphysical parameters), the Gaussian result
-is used as fallback (same FWHM/eccentricity formulas, just sigma-based instead of alpha-based).
-
-Disable Moffat fitting entirely with `without_moffat_fit()` to use Gaussian only.
+When a Moffat fit fails, the pipeline falls back to Gaussian, then to windowed moments.
+Each star's `fit_method` field records which method produced the result (`FreeMoffat`,
+`FixedMoffat`, `Gaussian`, or `Moments`).
 
 ### Method 2: 2D Gaussian Fit
 

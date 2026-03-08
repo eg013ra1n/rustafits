@@ -11,7 +11,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
-- **Image Analysis**: Star detection with matched-filter convolution, Gaussian and Moffat PSF fitting, FWHM/HFR/eccentricity measurement, SNR computation, MRS wavelet noise estimation, and configurable distortion filtering
+- **Image Analysis**: Two-pass Moffat-primary PSF calibration pipeline with star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MRS wavelet noise estimation
 - **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
 
 ## Supported Formats
@@ -84,7 +84,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustafits = "0.6"
+rustafits = "0.7"
 ```
 
 ### File output
@@ -130,13 +130,14 @@ let result = ImageAnalyzer::new()
 println!("Stars: {}  FWHM: {:.2} px  Ecc: {:.3}  Beta: {:.2}",
     result.stars_detected, result.median_fwhm,
     result.median_eccentricity,
-    result.median_beta.unwrap_or(0.0));
+    result.median_beta.unwrap_or_default());
 ```
 
-Default configuration uses Moffat-primary PSF fitting with a two-pass calibration pipeline:
-pass 1 discovers the field PSF model from bright calibration stars (free-beta Moffat),
-pass 2 applies fixed-beta Moffat to all stars. Background is always mesh-grid with
-auto-tuned cell size and MRS wavelet noise. See [Analysis API](docs/usage.md) for all
+Default configuration uses a two-pass calibration pipeline: pass 1 fits free-beta Moffat
+on bright calibration stars to derive the field PSF model (beta, FWHM), then re-estimates
+background with source masking. Pass 2 applies fixed-beta Moffat to all detected stars
+with Gaussian and moments fallbacks. Background is always mesh-grid with auto-tuned cell
+size and MRS wavelet noise (default 1 layer). See [Analysis API](docs/usage.md) for all
 builder methods.
 
 ### Star annotation overlay
@@ -201,7 +202,7 @@ Three API tiers for different integration needs:
 
 See [Annotation Documentation](docs/annotation.md) for full API reference, integration examples, and coordinate transform details.
 
-### Builder methods
+### ImageConverter builder methods
 
 | Method | Description |
 |--------|-------------|
@@ -211,6 +212,20 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 | `with_preview_mode()` | 2x2 binning for fast previews |
 | `with_rgba_output()` | Output RGBA instead of RGB (adds alpha=255 channel) |
 | `with_thread_pool(pool)` | Use a custom rayon thread pool (see below) |
+
+### ImageAnalyzer builder methods
+
+| Method | Description |
+|--------|-------------|
+| `with_detection_sigma(f32)` | Detection threshold in sigma above background (default 5.0) |
+| `with_min_star_area(usize)` | Minimum connected-component area (default 5 px) |
+| `with_max_star_area(usize)` | Maximum connected-component area (default 2000 px) |
+| `with_saturation_fraction(f32)` | Reject stars above this fraction of 65535 (default 0.95) |
+| `with_max_stars(usize)` | Keep only the brightest N stars (default 200) |
+| `with_mrs_layers(usize)` | MRS wavelet noise layers (default 1) |
+| `with_trail_threshold(f32)` | R² threshold for trail detection (default 0.5) |
+| `without_debayer()` | Skip green-channel interpolation for OSC images |
+| `with_thread_pool(pool)` | Use a custom rayon thread pool |
 
 ### Multi-image concurrent processing
 

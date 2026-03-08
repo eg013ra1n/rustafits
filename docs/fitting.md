@@ -57,8 +57,8 @@ Input: star stamp (background-subtracted pixels + positions)
 +------------------------------+
 | Stage 1: Axis-Aligned Fit   |  6 parameters (theta frozen at 0)
 | Levenberg-Marquardt          |
-|   max 30 iterations          |
-|   convergence: 1e-7          |
+|   max 50 iterations          |
+|   convergence: 1e-6          |
 +------------------------------+
        |
        v
@@ -75,7 +75,7 @@ Input: star stamp (background-subtracted pixels + positions)
 +------------------------------+
 | Stage 2: Full Elliptical Fit |  7 parameters (theta unfrozen)
 | Levenberg-Marquardt          |  Initialized from Stage 1 result
-|   max 30 iterations          |
+|   max 50 iterations          |
 +------------------------------+
        |
        v
@@ -118,7 +118,7 @@ At each iteration k:
        if rho <= 0: reject step, lambda <- lambda * 2
 
   8. Check convergence:
-       ||delta|| / ||params|| < 1e-7  ->  converged
+       ||delta|| / ||params|| < 1e-6  ->  converged
 ```
 
 ### Linear System Solver
@@ -195,7 +195,7 @@ have power-law wings from atmospheric scattering and optical diffraction that a 
 cannot capture. The Moffat function interpolates between Gaussian (beta → ∞) and
 Lorentzian (beta = 1) profiles.
 
-Moffat fitting is **enabled by default**. Disable with `without_moffat_fit()`.
+Moffat fitting is **always enabled** in the pipeline.
 
 ### Model
 
@@ -222,8 +222,10 @@ Q(x, y) = (u / α_x)² + (v / α_y)²
 - `beta` — wing slope exponent (higher = steeper = more Gaussian-like)
 
 **7 Parameters (fixed beta):** Same as above but `beta` is held constant during
-optimization. Enable with `with_moffat_beta(4.0)`. This removes one degree of
-freedom, improving FWHM stability when beta and axis ratio trade off against each other.
+optimization. The fixed beta value is automatically derived from the calibration
+pass (sigma-clipped median of free-beta fits on bright calibration stars). This
+removes one degree of freedom, improving FWHM stability when beta and axis ratio
+trade off against each other.
 
 ### FWHM from Moffat Parameters
 
@@ -254,8 +256,8 @@ Input: star stamp (background-subtracted pixels + positions)
        v
 +------------------------------+
 | Levenberg-Marquardt          |  np = 7 (fixed beta) or 8 (free beta)
-|   max 30 iterations          |  Same LM engine as Gaussian
-|   convergence: 1e-7          |  Cholesky solver (np × np system)
+|   max 50 iterations          |  Same LM engine as Gaussian
+|   convergence: 1e-6          |  Cholesky solver (np × np system)
 +------------------------------+
        |
        v
@@ -322,21 +324,84 @@ FWHM   = √(FWHM_x × FWHM_y)     (geometric mean)
 eccentricity = √(1 - FWHM_y² / FWHM_x²)
 ```
 
-### Moffat vs Gaussian
+### Fitting Fallback Chain
 
-The pipeline supports both models. When Moffat fitting is enabled (default), the
-2D Gaussian fit runs first to provide initial parameter estimates, then the Moffat fit
-refines the result. If the Moffat fit fails (non-convergence, unphysical parameters),
-the Gaussian result is used as fallback.
+The pipeline attempts PSF models in order of decreasing accuracy. Each star is
+measured by the first method that succeeds:
 
-| Aspect | Gaussian | Moffat |
-|--------|----------|--------|
-| Wing accuracy | Underestimates wings | Accurate power-law wings |
-| Parameters | 7 | 8 (free) or 7 (fixed beta) |
-| Min samples | 10 | 12 |
-| Convergence | Faster (simpler model) | Slightly slower |
-| Reports beta | No | Yes |
-| Default | Fallback | Primary |
+```
+Moffat fit (primary)
+  |
+  |-- success --> StarMetrics (FreeMoffat or FixedMoffat)
+  |
+  |-- fail (non-convergence / unphysical params)
+  v
+Gaussian fit (fallback)
+  |
+  |-- success --> StarMetrics (Gaussian)
+  |
+  |-- fail
+  v
+Windowed moments (last resort)
+  --> StarMetrics (Moments) — flagged as lowest accuracy
+```
+
+The `FitMethod` enum on each `StarMetrics` records which method produced the result.
+
+| Aspect | Moffat (primary) | Gaussian (fallback) | Moments (last resort) |
+|--------|-------------------|---------------------|-----------------------|
+| Wing accuracy | Accurate power-law wings | Underestimates wings | N/A |
+| Parameters | 8 (free) or 7 (fixed beta) | 7 | N/A |
+| Min samples | 12 | 10 | 1 |
+| Reports beta | Yes | No | No |
+| Accuracy | Highest | Good | Lowest |
+
+---
+
+## Two-Pass Calibration
+
+The analysis pipeline uses a two-pass strategy to derive per-field PSF parameters
+before measuring all stars.
+
+### Pass 1: Calibration (free-beta Moffat)
+
+1. Detect stars with an initial FWHM estimate.
+2. Select up to **100 bright calibration stars** filtered by:
+   - Eccentricity < 0.5 (reject elongated/blended sources)
+   - Area >= 5 pixels (reject hot pixels and noise spikes)
+3. Fit each calibration star with a **free-beta Moffat** (8 parameters).
+4. Derive field-wide PSF parameters via **sigma-clipped median** of the
+   calibration results:
+   - `field_beta` -- the characteristic Moffat beta for the image
+   - `field_fwhm` -- used to size source masks and refine the detection kernel
+
+If fewer than 3 calibration stars yield valid beta values, `field_beta` falls
+back to a simple median (or `None` if no betas are available), and the pipeline
+proceeds without a fixed beta constraint.
+
+### Pass 2: Measurement (fixed-beta Moffat)
+
+1. Re-estimate background with source masks sized by `field_fwhm`.
+2. Re-detect stars with the refined FWHM kernel.
+3. Measure every detected star using the fallback chain:
+   - **Fixed-beta Moffat** (7 params, using `field_beta`) -- primary
+   - Gaussian -- fallback
+   - Moments -- last resort
+
+When `field_beta` is `None` (calibration did not produce one), pass 2 falls
+back to free-beta Moffat as the primary fitter.
+
+### FitMethod Enum
+
+Each `StarMetrics` carries a `FitMethod` value indicating which model produced
+the measurement:
+
+| Variant | Description |
+|---------|-------------|
+| `FreeMoffat` | Free-beta Moffat (8 params) -- highest accuracy |
+| `FixedMoffat` | Fixed-beta Moffat (7 params) -- field median beta |
+| `Gaussian` | Gaussian fallback (7 params) |
+| `Moments` | Windowed moments -- lowest accuracy, flagged unreliable |
 
 ---
 
@@ -344,8 +409,8 @@ the Gaussian result is used as fallback.
 
 | Parameter           | Value  | Rationale                                     |
 |---------------------|--------|-----------------------------------------------|
-| Max iterations      | 30     | Sufficient for well-conditioned star profiles |
-| Convergence tol     | 1e-7   | Relative parameter change threshold           |
+| Max iterations      | 50     | Sufficient for well-conditioned star profiles |
+| Convergence tol     | 1e-6   | Relative parameter change threshold           |
 | Min sigma (Gaussian)| 0.3 px | Below this, fit is unphysical (noise artifact)|
 | Min alpha (Moffat)  | 0.3 px | Below this, fit is unphysical (noise artifact)|
 | Max beta            | 20.0   | Above this, effectively Gaussian              |

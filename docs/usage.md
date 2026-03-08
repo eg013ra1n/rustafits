@@ -13,7 +13,7 @@ println!("Median FWHM:    {:.2} px", result.median_fwhm);
 println!("Median HFR:     {:.2} px", result.median_hfr);
 println!("Median SNR:     {:.1}", result.median_snr);
 println!("Eccentricity:   {:.3}", result.median_eccentricity);
-println!("SNR (dB):       {:.1}", result.snr_db);
+println!("Moffat beta:    {:.2}", result.median_beta.unwrap_or_default());
 println!("SNR weight:     {:.1}", result.snr_weight);
 println!("PSF signal:     {:.1}", result.psf_signal);
 ```
@@ -30,8 +30,7 @@ override only what you need.
 let analyzer = ImageAnalyzer::new()
     .with_detection_sigma(3.0)
     .with_min_star_area(8)
-    .with_max_stars(500)
-    .without_gaussian_fit();
+    .with_max_stars(500);
 
 let result = analyzer.analyze("light_001.fits")?;
 ```
@@ -45,14 +44,7 @@ let result = analyzer.analyze("light_001.fits")?;
 | `with_max_star_area(usize)` | 2000 | Maximum connected-component area in pixels. Filters extended objects like galaxies and nebulae. |
 | `with_saturation_fraction(f32)` | 0.95 | Reject stars with peak above this fraction of 65535. Clamped to 0.5-1.0. |
 | `with_max_stars(usize)` | 200 | Keep only the brightest N stars. Clamped to minimum 1. |
-| `without_gaussian_fit()` | Gaussian fit enabled | Use fast windowed-moments instead of iterative Gaussian fitting for FWHM/eccentricity. Less accurate but faster. |
-| `with_moffat_fit()` | **on** | Enable Moffat PSF fitting (8-parameter). Reports `beta` per star and `median_beta`. |
-| `without_moffat_fit()` | — | Disable Moffat fitting, use Gaussian only. |
-| `with_moffat_beta(f32)` | None (free) | Fix Moffat beta to a constant value (7 free parameters). Removes beta/axis-ratio tradeoff, improving FWHM stability. Typical: `4.0`. |
-| `with_background_mesh(usize)` | Global background | Enable mesh-grid background estimation with the given cell size in pixels. Handles uneven backgrounds and gradients. Cell size clamped to minimum 16. |
-| `with_iterative_background(usize)` | 1 | Number of source-masked background re-estimation iterations. Requires `with_background_mesh`. 0 = no iteration, 1 = one re-estimation pass. |
-| `with_mrs_noise(usize)` | 0 (off) | MRS wavelet noise estimation. Uses B3-spline à trous wavelet transform to isolate noise from nebulosity. Set to 1 for nebula-rich fields. |
-| `with_max_distortion(f32)` | None (off) | Reject detected stars with moments-based eccentricity above this threshold before PSF fitting. Reduces outliers from elongated artifacts. Typical: `0.6`. |
+| `with_mrs_layers(usize)` | 1 | MRS wavelet noise layers. Uses B3-spline a trous wavelet transform to isolate noise from nebulosity. Increase to 2 for very noisy data. |
 | `without_debayer()` | Debayer enabled | Skip green-channel interpolation for OSC images. By default, OSC images get native-resolution green interpolation + green-pixel-only fitting. This flag disables both, running analysis directly on the raw Bayer mosaic (faster but less accurate). |
 | `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection (Path A). Lower = more aggressive. The raw `trail_r_squared` is always reported regardless of this setting. Clamped to 0.0-1.0. |
 | `with_thread_pool(Arc<ThreadPool>)` | Global rayon pool | Route all parallel work through a custom rayon thread pool. |
@@ -63,11 +55,8 @@ let result = analyzer.analyze("light_001.fits")?;
 - **Sparse fields / short exposures** — lower `detection_sigma` to 3.0-4.0 to pick up faint stars.
 - **Hot pixel problems** — raise `min_star_area` to 8-10.
 - **Nebula regions** — lower `max_star_area` to avoid detecting bright nebula knots as stars.
-- **Speed over accuracy** — use `without_gaussian_fit()` and `without_debayer()`.
-- **Strong gradients** — enable `with_background_mesh(64)` (typical cell sizes: 32-128).
-- **Nebula-rich fields** — enable `with_mrs_noise(1)` to prevent nebulosity from inflating noise estimates.
-- **Stable FWHM** — use `with_moffat_beta(4.0)` to fix the wing slope and reduce beta/axis tradeoff.
-- **Fewer outliers** — use `with_max_distortion(0.6)` to reject elongated candidates before fitting.
+- **Speed over accuracy** — use `without_debayer()`.
+- **MRS wavelet layers** — increase `with_mrs_layers(2)` for very noisy data.
 - **OSC images** — green-channel interpolation and green-pixel-only fitting are applied automatically. No configuration needed.
 
 ## Analyzing Raw Data
@@ -110,9 +99,9 @@ be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
 | `median_eccentricity` | `f32` | Median eccentricity. 0 = perfectly round. Values > 0.5 suggest tracking issues. |
 | `median_snr` | `f32` | Median per-star SNR. |
 | `median_hfr` | `f32` | Median half-flux radius (pixels). Similar to FWHM but more robust to non-Gaussian profiles. |
-| `snr_db` | `f32` | Image-wide SNR in decibels: `20 * log10(mean_signal / noise)`. |
 | `snr_weight` | `f32` | SNR weight for stacking: `(MeanDev / noise)^2`. |
-| `median_beta` | `Option<f32>` | Median Moffat β. `None` if Gaussian-only fitting. Typical: 2-5. |
+| `median_beta` | `Option<f32>` | Median Moffat beta. Always present with default pipeline. Typical: 2-5. |
+| `measured_fwhm_kernel` | `f32` | FWHM used for final matched filter kernel in pixels. |
 | `psf_signal` | `f32` | PSF signal strength: `median(star_peaks) / noise`. Higher = better signal. |
 | `trail_r_squared` | `f32` | Rayleigh R² statistic for directional coherence of star position angles. 0.0 = uniform (no trail), 1.0 = all aligned (strong trail). |
 | `possibly_trailed` | `bool` | True if the image is likely trailed (R² above threshold or eccentricity-gated Rayleigh fires). |
@@ -131,7 +120,8 @@ be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
 | `snr` | `f32` | Per-star aperture photometry SNR. |
 | `hfr` | `f32` | Half-flux radius (pixels). |
 | `theta` | `f32` | PSF position angle in radians, counter-clockwise from +X axis. Orientation of the major axis (`fwhm_x` direction). |
-| `beta` | `Option<f32>` | Moffat β shape parameter. `None` if Gaussian/moments fit was used. |
+| `beta` | `Option<f32>` | Moffat beta shape parameter. `None` if Gaussian/moments fit was used. |
+| `fit_method` | `FitMethod` | Which PSF fitting method produced this measurement: `FreeMoffat`, `FixedMoffat`, `Gaussian`, or `Moments`. |
 
 ## Thread Pool Usage
 

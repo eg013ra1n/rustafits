@@ -57,13 +57,12 @@ ImageConverter::save_processed(&image, "output.png", 0)?;  // quality ignored fo
 use astroimage::ImageAnalyzer;
 
 let result = ImageAnalyzer::new()
-    .with_background_mesh(64)        // Always use for production
     .with_max_stars(500)
     .with_thread_pool(pool.clone())
     .analyze("light.fits")?;
 
-// Defaults: Moffat fitting ON, iterative background ON (1 iter),
-// Gaussian fit ON (fallback), detection sigma 5.0
+// Defaults: two-pass Moffat calibration, mesh-grid background (auto cell size),
+// MRS wavelet noise (1 layer), detection sigma 5.0
 ```
 
 ### Key `AnalysisResult` Fields
@@ -77,11 +76,11 @@ let result = ImageAnalyzer::new()
 | `median_eccentricity` | `f32` | Median eccentricity. 0 = round, >0.5 = elongated. |
 | `median_snr` | `f32` | Median per-star SNR. |
 | `median_hfr` | `f32` | Median half-flux radius (pixels). |
-| `snr_db` | `f32` | Image-wide SNR in dB (comparable to PixInsight SNRViews). |
+| `measured_fwhm_kernel` | `f32` | FWHM used for final matched filter kernel. |
 | `snr_weight` | `f32` | PixInsight-style SNR weight for stacking. |
 | `psf_signal` | `f32` | PSF signal strength: median(star_peaks) / noise. |
 | `trail_r_squared` | `f32` | Rayleigh R² for directional coherence. 0 = no trail, 1 = strong trail. |
-| `median_beta` | `Option<f32>` | Median Moffat β. `None` if Gaussian fitting was used. |
+| `median_beta` | `Option<f32>` | Median Moffat β. Always `Some(...)` with default settings (Moffat is always-on). |
 | `possibly_trailed` | `bool` | Advisory trail flag (dual-path Rayleigh test). |
 
 ### Key `StarMetrics` Fields
@@ -98,6 +97,7 @@ let result = ImageAnalyzer::new()
 | `peak` | `f32` | Background-subtracted peak (ADU). |
 | `flux` | `f32` | Total background-subtracted flux (ADU). |
 | `beta` | `Option<f32>` | Moffat β shape parameter. `None` if Gaussian fit. |
+| `fit_method` | `FitMethod` | Which fitting method produced this measurement. |
 
 ### Analyzer Builder Methods
 
@@ -107,50 +107,38 @@ let result = ImageAnalyzer::new()
 | `with_min_star_area(usize)` | 5 | Min connected-component area (filters hot pixels). |
 | `with_max_star_area(usize)` | 2000 | Max area (filters galaxies/nebulae). |
 | `with_saturation_fraction(f32)` | 0.95 | Reject stars above this fraction of 65535. |
-| `with_max_measure(usize)` | None (all) | Limit PSF fitting to brightest N detected stars. |
 | `with_max_stars(usize)` | 200 | Keep only the brightest N stars in returned result. |
-| `without_gaussian_fit()` | Gaussian on | Use fast moments instead of Gaussian fit. |
-| `with_background_mesh(usize)` | global | Mesh-grid background with given cell size. |
+| `with_mrs_layers(usize)` | 1 | MRS wavelet noise layers. |
 | `without_debayer()` | debayer on | Skip green-channel interpolation for OSC. |
 | `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection. |
-| `with_iterative_background(n)` | 1 | Source-masked background re-estimation (n iterations). Requires `with_background_mesh`. |
-| `with_moffat_fit()` | **on** | Use Moffat PSF model (better wing modeling). Reports `median_beta`. |
-| `without_moffat_fit()` | — | Disable Moffat fitting; use Gaussian only. |
-| `with_mrs_noise(usize)` | 0 (off) | MRS wavelet noise layers. Use 1 for nebula-rich fields. |
-| `with_moffat_beta(f32)` | None (free) | Fix Moffat beta to a constant (PI uses 4.0). |
-| `with_max_distortion(f32)` | None (off) | Reject stars with detection eccentricity above threshold. |
 | `with_thread_pool(pool)` | global | Route parallel work to a custom rayon pool. |
 
 ### Recommended Settings
 
-The defaults are tuned for general-purpose analysis. For production use in Athenaeum,
-always set `with_background_mesh(64)` — it handles gradients, vignetting, and
-nebulosity that the global estimator cannot.
+The defaults are tuned for general-purpose analysis. Mesh-grid background estimation
+is automatic (cell size derived from image dimensions), two-pass Moffat calibration
+handles gradients, vignetting, and nebulosity out of the box.
 
 ```rust
 // Recommended production configuration
 let result = ImageAnalyzer::new()
-    .with_background_mesh(64)        // Local background — handles gradients/nebulosity
     .with_max_stars(500)             // Return top 500 for annotation
     .with_thread_pool(pool.clone())
     .analyze("light.fits")?;
 ```
 
-This uses the defaults: Moffat fitting (on), iterative background (1 iteration),
-Gaussian fit (on as fallback), detection sigma 5.0. These defaults are well-tested
+This uses the defaults: two-pass Moffat calibration, mesh-grid background (auto cell
+size), MRS wavelet noise (1 layer), detection sigma 5.0. These defaults are well-tested
 across all image types (mono, OSC, dense fields, nebulae).
 
 ### PixInsight-Compatible Settings
 
-To produce metrics comparable to PixInsight SubframeSelector v1.9.2, apply these
-settings. Based on file-by-file comparison of 77 M42 frames (300s + 30s exposures):
+The default pipeline already produces metrics close to PixInsight SubframeSelector
+v1.9.2. Based on file-by-file comparison of 77 M42 frames (300s + 30s exposures),
+no special configuration is required:
 
 ```rust
 let result = ImageAnalyzer::new()
-    .with_background_mesh(64)        // Required for all configurations
-    .with_mrs_noise(1)               // MRS wavelet noise (PI uses wavelet noise)
-    .with_moffat_beta(4.0)           // PI fixes beta=4
-    .with_max_distortion(0.6)        // PI rejects ecc > 0.6 before fitting
     .with_max_stars(500)
     .with_thread_pool(pool.clone())
     .analyze("light.fits")?;
@@ -158,40 +146,31 @@ let result = ImageAnalyzer::new()
 
 #### Expected accuracy vs PixInsight (file-by-file, 77 frames)
 
-| Metric | Setting | Accuracy vs PI | Notes |
-|--------|---------|----------------|-------|
-| **FWHM** | defaults | +1.1% median bias | Excellent match |
-| **FWHM** | PI-compat | +0.4% median bias | Near-perfect |
-| **Eccentricity** | defaults | −0.056 offset, R²=0.98 | Systematic methodology difference (see below) |
-| **Eccentricity** | PI-compat | −0.074 offset, R²=0.97 | max-distortion filter lowers ecc further |
-| **Noise** | defaults (MAD) | 1.0× PI | Already close on most images |
-| **Noise** | `with_mrs_noise(1)` | 0.92× PI | Better on nebula-rich fields |
-| **Star count** | defaults | 3.5× PI | We detect more faint stars |
-| **Star count** | PI-compat | 2.1× PI | max-distortion reduces count |
+| Metric | Accuracy vs PI | Notes |
+|--------|----------------|-------|
+| **FWHM** | -0.3% median bias | Near-perfect match |
+| **Eccentricity** | -0.067 offset, R²=0.984 | Systematic methodology difference (see below) |
+| **Noise** | 0.92x PI | MRS wavelet noise (default 1 layer) |
+| **Star count** | ~3x PI | We detect more faint stars |
 
 #### Eccentricity methodology note
 
-Our eccentricity comes from the **Moffat/Gaussian fit** axis ratio: `e = sqrt(1 − (b/a)²)`.
+Our eccentricity comes from the **Moffat/Gaussian fit** axis ratio: `e = sqrt(1 - (b/a)^2)`.
 PixInsight likely uses **image moments** for eccentricity, which gives systematically
-higher values (mean offset ~+0.06). The frame-to-frame correlation is excellent
-(R²=0.97), meaning relative rankings are correct — only the absolute scale differs.
-
-The regression is: `PI_ecc ≈ 1.19 × our_ecc − 0.003`.
+higher values (mean offset ~+0.067). The frame-to-frame correlation is excellent
+(R²=0.984), meaning relative rankings are correct — only the absolute scale differs.
 
 If Athenaeum displays eccentricity alongside PI values, consider noting this
-calibration difference, or applying the linear correction for display purposes.
+calibration difference, or applying a linear correction for display purposes.
 
 #### When to use each setting
 
 | Setting | Use when |
 |---------|----------|
-| `with_mrs_noise(1)` | Nebula-rich fields (M42, NGC 7000, etc.). Prevents nebulosity from inflating noise estimate. Not needed for sparse star fields. |
-| `with_moffat_beta(4.0)` | Comparing FWHM with PI. Improves FWHM accuracy from +1.1% to +0.4%. No meaningful effect on eccentricity. |
-| `with_max_distortion(0.6)` | Reducing star count toward PI levels. Removes elongated candidates before fitting. Lowers median eccentricity (not always desirable). |
+| `with_mrs_layers(n)` | Increase wavelet layers for nebula-rich fields (e.g., `with_mrs_layers(2)`). Default 1 layer is sufficient for most images. |
 
-For general-purpose Athenaeum use (not comparing with PI), the defaults without
-these three options give the best overall results: accurate FWHM, stable eccentricity,
-and higher star counts for better field coverage.
+For general-purpose Athenaeum use, the defaults give the best overall results:
+accurate FWHM, stable eccentricity, and high star counts for field coverage.
 
 ### Analyzing pre-loaded data
 
@@ -405,27 +384,23 @@ let image = ImageConverter::new()
     .with_thread_pool(pool.clone())
     .process("light_001.fits")?;
 
-// Recommended production settings:
-// - Moffat fit is ON by default (no need to call with_moffat_fit())
-// - Iterative background is ON by default (1 iteration)
-// - with_background_mesh(64) is the only required addition
+// Defaults handle everything: two-pass Moffat calibration,
+// mesh-grid background (auto cell size), MRS wavelet noise (1 layer)
 let result = ImageAnalyzer::new()
-    .with_background_mesh(64)        // Local background — always use this
     .with_max_stars(500)             // Return top 500 stars for annotation
     .with_thread_pool(pool.clone())
     .analyze("light_001.fits")?;
 
 // Display metrics in subframe inspector
-println!("Stars: {}  FWHM: {:.2}  Ecc: {:.3}  SNR: {:.1} dB  HFR: {:.2}  R²: {:.3}",
+println!("Stars: {}  FWHM: {:.2}  Ecc: {:.3}  HFR: {:.2}  R²: {:.3}",
     result.stars.len(),
     result.median_fwhm,
     result.median_eccentricity,
-    result.snr_db,
     result.median_hfr,
     result.trail_r_squared,
 );
 if let Some(beta) = result.median_beta {
-    println!("  Moffat β: {:.2}", beta);
+    println!("  Moffat beta: {:.2}", beta);
 }
 
 // Option A: Get raw geometry for native UI rendering
@@ -450,23 +425,20 @@ ImageConverter::save_processed(&export_image, "annotated.jpg", 95)?;
 
 ### PixInsight-compatible variant
 
-Use this when Athenaeum needs to display metrics alongside PixInsight values,
-or when users expect PI-matching numbers:
+The defaults already produce metrics close to PixInsight. No special configuration
+is needed. To increase wavelet layers for nebula-rich fields:
 
 ```rust
 let result = ImageAnalyzer::new()
-    .with_background_mesh(64)
-    .with_mrs_noise(1)               // Wavelet noise — better on nebulae
-    .with_moffat_beta(4.0)           // Fixed beta=4 — matches PI FWHM closely
-    .with_max_distortion(0.6)        // Reject ecc>0.6 — reduces star count toward PI
+    .with_mrs_layers(2)              // Extra wavelet layer for heavy nebulosity
     .with_max_stars(500)
     .with_thread_pool(pool.clone())
     .analyze("light_001.fits")?;
 
-// FWHM will be within ~0.4% of PI SubframeSelector
-// Eccentricity will be ~0.07 lower than PI (methodology difference)
-// Noise will be ~8% lower than PI on nebula-rich fields
-// Star count will be ~2x PI (we detect more faint stars)
+// FWHM will be within ~0.3% of PI SubframeSelector
+// Eccentricity will be ~0.067 lower than PI (methodology difference)
+// Noise will be ~0.92x PI (MRS wavelet noise)
+// Star count will be ~3x PI (we detect more faint stars)
 ```
 
 ---
@@ -481,7 +453,6 @@ Core metrics — always available:
 |--------|-------|--------|-------|
 | FWHM | `median_fwhm` | `{:.2}` | Median FWHM in pixels. Good seeing: 2-3 px |
 | Eccentricity | `median_eccentricity` | `{:.3}` | Median eccentricity. 0=round, >0.5=elongated |
-| SNR (dB) | `snr_db` | `{:.1}` | Image-wide signal-to-noise ratio |
 | HFR | `median_hfr` | `{:.2}` | Half-flux radius in pixels |
 | Stars | `stars.len()` | integer | Stars returned (capped at `max_stars`) |
 | Stars Detected | `stars_detected` | integer | Total stars with valid PSF fits |
@@ -539,6 +510,7 @@ use astroimage::{
     AnalysisResult,
     StarMetrics,
     AnalysisConfig,
+    FitMethod,
 
     // Annotation
     annotate_image,
@@ -553,3 +525,199 @@ use astroimage::{
     ThreadPoolBuilder,
 };
 ```
+
+---
+
+## 9. Migrating from v0.6.x to v0.7.0
+
+This section covers every change needed in the Athenaeum codebase to upgrade from
+rustafits v0.6.4 to v0.7.0.
+
+### 9.0 Release Summary — What Changed
+
+**Breaking changes:**
+- `AnalysisResult.snr_db` field removed
+- 9 `ImageAnalyzer` builder methods removed: `with_max_measure`, `without_gaussian_fit`,
+  `with_background_mesh`, `with_moffat_fit` / `without_moffat_fit`,
+  `with_iterative_background`, `with_mrs_noise`, `with_moffat_beta`, `with_max_distortion`
+- `with_mrs_noise(n)` renamed to `with_mrs_layers(n)`
+
+**New defaults (no configuration needed):**
+- Two-pass Moffat calibration (free-beta pass 1 → fixed-beta pass 2)
+- Mesh-grid background with auto cell size: `max(16, max(w,h)/32)`
+- Source-mask background re-estimation (always one pass after calibration)
+- MRS wavelet noise (default 1 layer)
+- Moffat → Gaussian → Moments fallback chain
+
+**New fields:**
+- `AnalysisResult.measured_fwhm_kernel: f32` — FWHM used for final matched-filter kernel
+- `StarMetrics.fit_method: FitMethod` — which PSF model produced the measurement
+  (`FreeMoffat`, `FixedMoffat`, `Gaussian`, `Moments`)
+
+**Behavioral changes:**
+- `median_beta` is now always populated (`Some(...)`) — Moffat fitting can't be disabled
+- Default noise estimation changed from MAD to MRS wavelet (1 layer)
+- Default background changed from global to mesh-grid (auto cell size)
+- Accuracy vs PixInsight improved: FWHM -0.3% median (was +1.1%), ecc R²=0.984
+
+**Remaining builder methods (unchanged):**
+- `with_detection_sigma(f32)` — default 5.0
+- `with_min_star_area(usize)` — default 5
+- `with_max_star_area(usize)` — default 2000
+- `with_saturation_fraction(f32)` — default 0.95
+- `with_max_stars(usize)` — default 200
+- `with_mrs_layers(usize)` — default 1
+- `with_trail_threshold(f32)` — default 0.5
+- `without_debayer()` — skip OSC green interpolation
+- `with_thread_pool(Arc<ThreadPool>)` — custom rayon pool
+
+### 9.1 Dependency Version Bump
+
+| File | Change |
+|------|--------|
+| `crates/athenaeum-core/Cargo.toml` | `rustafits = "0.6.4"` → `rustafits = "0.7"` |
+| `crates/athenaeum-tauri/Cargo.toml` | `rustafits = "0.6.4"` → `rustafits = "0.7"` |
+
+### 9.2 Removed Builder Methods
+
+**File:** `crates/athenaeum-core/src/analysis/analyzer.rs` — `build_analyzer()`
+
+9 method calls must be removed from `build_analyzer()`:
+
+| Line | Removed Call | Action |
+|------|-------------|--------|
+| 19 | `.with_max_measure(config.max_stars)` | Delete — redundant with `with_max_stars` |
+| 23-25 | `if !config.use_gaussian_fit { analyzer.without_gaussian_fit() }` | Delete block — Gaussian is always fallback now |
+| 27-29 | `if let Some(mesh_size) = config.background_mesh_size { analyzer.with_background_mesh(...) }` | Delete block — mesh-grid is always-on with auto cell size |
+| 31-35 | `if config.use_moffat_fit { ... with_moffat_fit() } else { ... without_moffat_fit() }` | Delete block — Moffat is always-on (two-pass calibration) |
+| 37-39 | `if config.iterative_background > 0 { analyzer.with_iterative_background(...) }` | Delete block — source-mask re-estimation is always-on |
+| 41-43 | `if config.mrs_noise > 0 { analyzer.with_mrs_noise(...) }` | Replace with `.with_mrs_layers(config.mrs_layers as usize)` |
+| 45-47 | `if let Some(beta) = config.moffat_beta { analyzer.with_moffat_beta(beta) }` | Delete block — beta auto-derived from calibration pass |
+| 49-51 | `if let Some(max_dist) = config.max_distortion { analyzer.with_max_distortion(...) }` | Delete block — distortion filter removed |
+
+After cleanup, `build_analyzer()` should be:
+
+```rust
+let mut analyzer = ImageAnalyzer::new()
+    .with_detection_sigma(config.detection_sigma as f32)
+    .with_min_star_area(config.min_star_area as usize)
+    .with_max_star_area(config.max_star_area as usize)
+    .with_saturation_fraction(config.saturation_fraction as f32)
+    .with_max_stars(config.max_stars as usize)
+    .with_trail_threshold(config.trail_threshold as f32)
+    .with_mrs_layers(config.mrs_layers as usize);
+
+if let Some(pool) = thread_pool {
+    analyzer = analyzer.with_thread_pool(pool);
+}
+analyzer
+```
+
+### 9.3 Removed `snr_db` Field
+
+`AnalysisResult.snr_db` was removed in v0.7.0. All references must be deleted or replaced.
+
+**Rust files:**
+
+| File | Line | Change |
+|------|------|--------|
+| `crates/athenaeum-core/src/analysis/analyzer.rs` | 79 | Remove `snr_db: result.snr_db as f64,` from `FrameAnalysis` construction |
+| `crates/athenaeum-core/src/models.rs` | 719 | Remove `pub snr_db: f64,` from `FrameAnalysis` struct |
+| `crates/athenaeum-core/src/rustafits_processor/mod.rs` | 161 | Remove `pub snr_db: f32,` from `AnnotationMetrics` |
+| `crates/athenaeum-core/src/rustafits_processor/mod.rs` | 291 | Remove `snr_db: result.snr_db,` from `AnnotationMetrics` construction |
+| `crates/athenaeum-core/src/db/schema.rs` | 662 | Remove `snr_db REAL NOT NULL,` from `frame_analysis` table DDL |
+| `crates/athenaeum-core/src/db/analysis.rs` | all | Remove `snr_db` from all INSERT/SELECT/query-mapping code |
+
+**TypeScript files:**
+
+| File | Change |
+|------|--------|
+| `src/types/models.ts` | Remove `snr_db: number` from `FrameAnalysis` and `AnnotationMetrics` interfaces |
+| `src/components/blink/FrameInfoPanel.tsx` | Remove the `<InfoRow label="SNR (dB)" ...>` line |
+| `src/components/calibration/LightsAnalysisTable.tsx` | Remove `snr_db` from `SortField` type, averages calculation, sort switch case, column header, and table cell |
+| `src/components/calibration/RejectionThresholdBar.tsx` | Remove `snr_db` from `RejectionThresholds` interface, `THRESHOLD_FIELDS` array, and `EMPTY_THRESHOLDS` |
+| `src/components/LightsAnalysisView.tsx` | Remove `snr_db` rejection threshold logic and CSV export column |
+
+**Database migration:** The `frame_analysis` table already has data with `snr_db`. Options:
+- Add a migration to `ALTER TABLE frame_analysis DROP COLUMN snr_db` (SQLite 3.35.0+)
+- Or keep the column but stop writing to it (simpler, backward-compatible)
+- Or recreate the table without the column (safest for older SQLite)
+
+### 9.4 New `measured_fwhm_kernel` Field (Optional)
+
+`AnalysisResult.measured_fwhm_kernel: f32` is new in v0.7.0 — the FWHM used for the
+final matched-filter kernel. Athenaeum can optionally expose this:
+
+- Add `measured_fwhm_kernel: f64` to `FrameAnalysis` in `models.rs`
+- Map from `result.measured_fwhm_kernel as f64` in `analyze_frame()`
+- Add DB column and display column (or skip if not needed for UI)
+
+### 9.5 New `FitMethod` Enum (Optional)
+
+`StarMetrics.fit_method: FitMethod` is new — tracks which fitting method produced each
+star's measurement (`FreeMoffat`, `FixedMoffat`, `Gaussian`, `Moments`).
+
+- Add `FitMethod` to the `use astroimage::` import
+- Athenaeum doesn't currently expose per-star metrics in the UI, so this is informational
+- Could be useful for future per-star debugging or quality breakdown display
+
+### 9.6 `AnalysisConfig` Simplification
+
+**File:** `crates/athenaeum-core/src/analysis/config.rs`
+
+Remove fields that no longer map to builder methods:
+
+| Field | Action |
+|-------|--------|
+| `use_gaussian_fit: bool` | Remove — Gaussian is always available as fallback |
+| `background_mesh_size: Option<u32>` | Remove — always-on with auto cell size |
+| `use_moffat_fit: bool` | Remove — always-on (two-pass calibration) |
+| `iterative_background: u32` | Remove — always-on (one re-estimation) |
+| `moffat_beta: Option<f32>` | Remove — auto-derived from calibration |
+| `max_distortion: Option<f32>` | Remove — distortion filter removed |
+| `mrs_noise: u32` | Rename to `mrs_layers: u32`, change default from `0` to `1` |
+
+Remove the corresponding `default_*` helper functions (`default_true`, `default_one`,
+`default_mesh_64`, `default_mrs_0`).
+
+Update `validate()` to remove validation for deleted fields and rename `mrs_noise` checks
+to `mrs_layers`.
+
+**Serde migration note:** Existing JSON configs stored in the database will have the old
+field names. Use `#[serde(default)]` on `mrs_layers` and add `#[serde(alias = "mrs_noise")]`
+so old configs deserialize cleanly. Deleted fields are silently ignored during
+deserialization (serde's default behavior when `deny_unknown_fields` is not active).
+
+### 9.7 `AnalysisSettingsPanel` UI Simplification
+
+**File:** `src/components/analysis/AnalysisSettingsPanel.tsx`
+
+Remove UI controls for deleted config fields:
+- "Use Gaussian Fit" checkbox (lines 197-208)
+- "Use Moffat PSF Model" checkbox (lines 209-220)
+- "Background Mesh Size" input (lines 221-235)
+- "Iterative Background Passes" input (lines 236-246)
+- "Fixed Moffat Beta" input (lines 258-272)
+- "Max Distortion" input (lines 273-287)
+
+Rename "MRS Noise Passes" to "MRS Wavelet Layers" and update `mrs_noise` → `mrs_layers`.
+Update the description to note it defaults to 1 (always-on).
+
+**File:** `src/types/analysis-config.ts`
+
+Update the `AnalysisConfig` interface and `DEFAULT_ANALYSIS_CONFIG` to match:
+- Remove `use_gaussian_fit`, `background_mesh_size`, `use_moffat_fit`,
+  `iterative_background`, `moffat_beta`, `max_distortion`
+- Rename `mrs_noise` → `mrs_layers`, default `1`
+
+### 9.8 `median_beta` is Now Always Present
+
+In v0.6.x, `median_beta` was `Option<f32>` that was `None` when Moffat fitting was
+disabled. In v0.7.0, Moffat fitting is always-on, so `median_beta` is always `Some(...)`.
+
+The UI already handles `Option` correctly (conditional rendering), so no code change is
+strictly required — but the conditional check can be simplified:
+- `FrameInfoPanel.tsx`: The `{metrics.median_beta != null && ...}` guard can stay or
+  be removed (beta is always present now)
+- `LightsAnalysisTable.tsx`: `hasBeta` will always be `true` — the Beta column will
+  always show

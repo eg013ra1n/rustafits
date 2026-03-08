@@ -1,7 +1,7 @@
 # SNR Computations
 
-Three levels of signal-to-noise measurement: per-star aperture photometry,
-image-wide SNR in decibels, and derived quality metrics.
+Two levels of signal-to-noise measurement: per-star aperture photometry
+and derived quality metrics (SNR weight, PSF signal).
 
 ## Per-Star SNR (Aperture Photometry)
 
@@ -111,46 +111,6 @@ Returns SNR = 0 if:
 | Clip rounds     | 2              | Remove stars contaminating the annulus |
 | Clip threshold  | 3.0 sigma      | Standard astronomical clipping         |
 | Min annulus px  | 5              | Need minimum samples for statistics    |
-
----
-
-## Image-Wide SNR in Decibels
-
-Whole-frame signal-to-noise ratio.
-
-```
-SNR_dB = 20 * log10(mean_signal / noise)
-```
-
-### Algorithm
-
-```
-Input: luminance image, noise (from background estimation)
-       |
-       v
-+--------------------------------+
-| Subsample Image                |  stride to ~500k pixels
-|   mean = sum(pixels) / count   |
-+--------------------------------+
-       |
-       v
-+--------------------------------+
-| SNR in Decibels                |
-|   SNR_dB = 20 * log10(mean / noise)
-+--------------------------------+
-```
-
-### Interpretation
-
-| SNR dB | Linear Ratio | Image Quality        |
-|--------|-------------|----------------------|
-| 10 dB  | 3.2         | Very noisy           |
-| 20 dB  | 10          | Noisy                |
-| 30 dB  | 31.6        | Good                 |
-| 40 dB  | 100         | Very clean           |
-| 50 dB  | 316         | Exceptional          |
-
-On `mono.fits`: **~27.7 dB** (within ~1 dB of professional tools).
 
 ---
 

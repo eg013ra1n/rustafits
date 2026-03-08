@@ -152,7 +152,6 @@ Input: luminance image, peak positions, background, noise
 |   [x] touches image border    |    (truncated profiles)
 |   [x] peak > saturation_limit |    (default 0.95 * 65535 = 62163 ADU)
 |   [x] aspect_ratio > 3.0      |    (cosmic rays, satellite trails)
-|   [ ] eccentricity > max_dist |    (optional, with_max_distortion)
 |                               |
 |   aspect_ratio = max(bbox_w, bbox_h) / min(bbox_w, bbox_h)
 +-------------------------------+
@@ -301,7 +300,6 @@ measurement:
 | Min star area     | 5 px         | Rejects hot pixels and cosmic ray hits    |
 | Max star area     | 2000 px      | Rejects extended objects                  |
 | Max aspect ratio  | 3.0          | Rejects elongated artifacts               |
-| Max distortion    | None (off, configurable) | Optional eccentricity pre-filter |
 | Saturation        | 0.95 * 65535 | Saturated stars have unreliable profiles  |
 | Max stars         | 200          | Performance cap (configurable)            |
 | Min stamp radius  | 5            | 11x11 stamp for smallest blobs           |

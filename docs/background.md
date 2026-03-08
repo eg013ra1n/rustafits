@@ -1,10 +1,13 @@
 # Background Estimation
 
-Two background methods are available: global (default) and mesh-grid (for images with
-gradients). Two noise estimation methods are available: sigma-clipped MAD (default) and
-MRS wavelet (for nebula-rich fields).
+Background estimation uses a mesh-grid approach with auto-tuned cell size. Noise is
+estimated via MRS wavelet (B3-spline a trous, default 1 layer). After pass 1 calibration,
+a source-masked re-estimation is always performed for cleaner statistics.
 
 ## Global Background Estimation
+
+> **Note:** This algorithm is used internally within each mesh cell. It is no longer
+> available as a standalone pipeline option.
 
 **Algorithm:** Iterative sigma-clipped statistics with SExtractor-style mode estimation.
 
@@ -81,10 +84,14 @@ MAD consistent with standard deviation while being insensitive to outliers (star
 
 ## Mesh-Grid Background Estimation
 
-For images with large-scale gradients (vignetting, light pollution, differential dust).
+The primary background estimation method. Handles large-scale gradients (vignetting,
+light pollution, differential dust) by estimating the background locally per cell and
+interpolating to full resolution.
+
+Cell size is determined automatically: `auto_cell_size = max(16, max(w, h) / 32)`.
 
 ```
-Input: luminance image, cell_size (e.g. 64 px)
+Input: luminance image, auto_cell_size
        |
        v
 +---------------------------+
@@ -151,19 +158,19 @@ w(+2) =  0.5*t^3 - 0.5*t^2
 where t is the fractional position between cell centers. The 2D interpolation is
 separable: compute 4 horizontal interpolations, then 1 vertical.
 
-### Iterative Source-Masked Re-estimation
+### Source-Masked Re-estimation
 
-When `with_iterative_background(n)` is used with `with_background_mesh(cell_size)`,
-the pipeline performs n rounds of background estimation:
+The pipeline always performs one source-masked re-estimation after pass 1 calibration.
+After the initial background estimate and star detection, star pixels are masked and
+the mesh-grid background is re-estimated for cleaner statistics:
 
-1. First pass: estimate background normally (sources contaminate statistics).
+1. Pass 1: estimate background normally (sources contaminate statistics).
 2. Detect stars using the initial background.
 3. Build a source mask: circle of r = 2.5 * FWHM around each detected star.
 4. Re-estimate background excluding masked pixels (cleaner statistics).
-5. Re-detect stars with improved background.
 
-One iteration (n=2) is usually sufficient. This is particularly valuable for crowded
-fields where bright stars bias the per-cell background estimate.
+This is particularly valuable for crowded fields where bright stars bias the per-cell
+background estimate.
 
 ### Constants
 
@@ -178,11 +185,11 @@ fields where bright stars bias the per-cell background estimate.
 
 ## MRS Wavelet Noise Estimation
 
-The standard sigma-clipped MAD noise estimator works well for clean backgrounds, but
-on nebula-rich fields (M42, NGC 7000, etc.) it overestimates noise by 30-40% because
-it conflates nebulosity with background fluctuations. The MRS (Multiscale Residual
-Spectrum) wavelet method isolates the finest-scale fluctuations using the à trous
-(with holes) wavelet transform.
+Always-on (default `noise_layers=1`). The MRS (Multiscale Residual Spectrum) wavelet
+method isolates the finest-scale fluctuations using the à trous (with holes) wavelet
+transform. This avoids the problem where sigma-clipped MAD overestimates noise by
+30-40% on nebula-rich fields (M42, NGC 7000, etc.) by conflating nebulosity with
+background fluctuations.
 
 ### Algorithm
 
@@ -235,20 +242,10 @@ The first wavelet layer (`w1 = data - smoothed`) captures structure at the 1-2 p
 scale — exactly where Poisson/read noise lives. Nebulosity, gradients, and extended
 objects have much larger spatial scales and are almost entirely removed by the subtraction.
 
-### When to Use
-
-| Scenario | MAD (default) | MRS wavelet |
-|----------|---------------|-------------|
-| Clean background (dark, sparse field) | Accurate | Accurate (no difference) |
-| Mild nebulosity | Slightly overestimates | Accurate |
-| Strong nebulosity (M42, emission regions) | Overestimates 30-40% | Accurate |
-| Gradient-only (vignetting, LP) | Handled by mesh-grid | No advantage over mesh-grid MAD |
-
-Enable via: `ImageAnalyzer::new().with_mrs_noise(1)`
-
-The `noise_layers` parameter specifies how many à trous layers to compute. Layer 1 is
-sufficient for noise estimation. Higher layers (2+) would remove progressively larger-scale
-structure, but are not needed in practice.
+MRS wavelet noise is always-on (default 1 layer). The layer count is configurable via
+`with_mrs_layers(n)`. Layer 1 is sufficient for noise estimation. Higher layers (2+)
+remove progressively larger-scale structure using dilated convolution, but are not
+needed in practice.
 
 ### Constants
 
@@ -270,9 +267,10 @@ structure, but are not needed in practice.
 |---------|---------------|-----------|-----------|
 | Mode estimator | 2.5m - 1.5mu | Pluggable (SExtractor, biweight, MMM) | 2.5m - 1.5mu |
 | Asymmetry fallback | Yes (0.3sigma) | Depends on estimator | Yes (0.3sigma) |
-| Noise estimator | Clipped sigma | MAD or biweight scale | MAD or MRS wavelet (configurable) |
-| Wavelet noise | — | — | B3-spline à trous (1 layer) |
+| Background method | Mesh-grid | Mesh-grid | Mesh-grid (always, auto cell size) |
+| Noise estimator | Clipped sigma | MAD or biweight scale | MRS wavelet (always-on, 1 layer) |
+| Wavelet noise | — | — | B3-spline à trous (default 1 layer) |
 | Grid filtering | 3x3 median | Configurable median | 3x3 median |
 | Interpolation | Bicubic spline | Bicubic spline (scipy zoom) | Catmull-Rom bicubic |
-| Source masking | No (single pass) | Manual mask input | Iterative (auto-mask) |
+| Source masking | No (single pass) | Manual mask input | Always-on (1 re-estimation, auto-mask) |
 | Parallelization | No | No (Python) | Yes (rayon per-row) |
