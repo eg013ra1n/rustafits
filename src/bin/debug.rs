@@ -1101,7 +1101,6 @@ fn cmd_pipeline(
     let median_ecc = sigma_clipped_median(&ecc_vals);
     let median_hfr = sigma_clipped_median(&hfr_vals);
 
-    let snr_db = snr::compute_snr_db(lum, bg.noise);
     let snr_weight = snr::compute_snr_weight(lum, bg.background, bg.noise);
     let psf_signal = snr::compute_psf_signal(&measured, bg.noise);
 
@@ -1118,7 +1117,6 @@ fn cmd_pipeline(
     eprintln!("  Median FWHM:     {:.3}px", median_fwhm);
     eprintln!("  Median ecc:      {:.3}", median_ecc);
     eprintln!("  Median HFR:      {:.3}px", median_hfr);
-    eprintln!("  SNR (dB):        {:.2}", snr_db);
     eprintln!("  SNR weight:      {:.2}", snr_weight);
     eprintln!("  PSF signal:      {:.2}", psf_signal);
     if let Some(beta) = median_beta {

@@ -172,36 +172,6 @@ pub fn compute_snr_weight(data: &[f32], background: f32, noise: f32) -> f32 {
     ratio * ratio
 }
 
-/// Compute whole-image SNR in decibels: 20 × log10(mean / noise).
-pub fn compute_snr_db(data: &[f32], noise: f32) -> f32 {
-    if noise <= 0.0 || data.is_empty() {
-        return 0.0;
-    }
-
-    let stride = (data.len() / 500_000).max(1);
-    let mut sum = 0.0_f64;
-    let mut count = 0u64;
-
-    for (i, &val) in data.iter().enumerate() {
-        if i % stride != 0 {
-            continue;
-        }
-        sum += val as f64;
-        count += 1;
-    }
-
-    if count == 0 {
-        return 0.0;
-    }
-
-    let mean = (sum / count as f64) as f32;
-    if mean <= 0.0 {
-        return 0.0;
-    }
-
-    20.0 * (mean / noise).log10()
-}
-
 /// Compute PSF Signal = median(star_peaks) / noise.
 pub fn compute_psf_signal(stars: &[MeasuredStar], noise: f32) -> f32 {
     if stars.is_empty() || noise <= 0.0 {

@@ -453,7 +453,6 @@ mod tests {
             median_eccentricity: 0.2,
             median_snr: 50.0,
             median_hfr: 3.0,
-            snr_db: 20.0,
             snr_weight: 100.0,
             psf_signal: 50.0,
             trail_r_squared: 0.0,

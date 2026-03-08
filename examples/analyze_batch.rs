@@ -11,10 +11,10 @@ fn main() {
     files.sort();
 
     println!(
-        "{:<12} {:>5} {:>5} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>8} {:>6} {:>6} {:>6} {:>7}",
-        "FILE", "DET", "KEPT", "FWHM", "ECC", "SNR", "HFR", "SNR_dB", "SNR_W", "PSF_SIG", "W", "H", "R²", "TRAIL?"
+        "{:<12} {:>5} {:>5} {:>6} {:>6} {:>6} {:>6} {:>7} {:>8} {:>6} {:>6} {:>6} {:>7}",
+        "FILE", "DET", "KEPT", "FWHM", "ECC", "SNR", "HFR", "SNR_W", "PSF_SIG", "W", "H", "R²", "TRAIL?"
     );
-    println!("{}", "-".repeat(125));
+    println!("{}", "-".repeat(115));
 
     for path in &files {
         let name = path.file_name().unwrap().to_str().unwrap();
@@ -29,7 +29,7 @@ fn main() {
         match analyzer.analyze(path) {
             Ok(r) => {
                 println!(
-                    "{:<12} {:>5} {:>5} {:>6.2} {:>6.3} {:>6.1} {:>6.2} {:>7.2} {:>7.3} {:>8.1} {:>6} {:>6} {:>6.3} {:>7}",
+                    "{:<12} {:>5} {:>5} {:>6.2} {:>6.3} {:>6.1} {:>6.2} {:>7.3} {:>8.1} {:>6} {:>6} {:>6.3} {:>7}",
                     short,
                     r.stars_detected,
                     r.stars.len(),
@@ -37,7 +37,6 @@ fn main() {
                     r.median_eccentricity,
                     r.median_snr,
                     r.median_hfr,
-                    r.snr_db,
                     r.snr_weight,
                     r.psf_signal,
                     r.width,

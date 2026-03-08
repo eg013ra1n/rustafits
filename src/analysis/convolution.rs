@@ -450,7 +450,7 @@ mod tests {
         data[50 * width + 50] += 5000.0;
 
         let (kernel_1d, _) = generate_1d_kernel(sigma);
-        let radius = kernel_1d.len() / 2;
+        let _radius = kernel_1d.len() / 2;
         let mut output = vec![0.0_f32; width * height];
         separable_convolve(&data, width, height, &kernel_1d, &mut output);
 

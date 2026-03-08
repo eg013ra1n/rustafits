@@ -117,8 +117,6 @@ pub struct AnalysisResult {
     pub median_snr: f32,
     /// Median half-flux radius (pixels).
     pub median_hfr: f32,
-    /// Image-wide SNR in decibels: 20 × log10(mean_signal / noise).
-    pub snr_db: f32,
     /// SNR weight for frame ranking: (MeanDev / noise)².
     pub snr_weight: f32,
     /// PSF signal: median(star_peaks) / noise.
@@ -264,7 +262,6 @@ impl ImageAnalyzer {
     /// Enable iterative source-masked background estimation.
     /// After initial detection, source pixels are masked and background is re-estimated.
     /// Default: 1 (no iteration). Set to 2-3 for images with many bright sources.
-    /// Requires `with_background_mesh` to be set (no-op with global background).
     pub fn with_iterative_background(mut self, iterations: usize) -> Self {
         self.config.iterative_background = iterations.max(1);
         self
@@ -444,24 +441,15 @@ impl ImageAnalyzer {
         };
 
         // Iterative background estimation + detection loop
-        let n_iterations = if self.config.background_mesh_size.is_some() {
-            self.config.iterative_background
-        } else {
-            1 // no iteration without mesh background
-        };
+        let n_iterations = self.config.iterative_background;
 
-        let mut bg_result = if let Some(cell_size) = self.config.background_mesh_size {
-            background::estimate_background_mesh(&lum, width, height, cell_size)
-        } else {
-            background::estimate_background(&lum, width, height)
-        };
+        let cell_size = background::auto_cell_size(width, height);
+        let mut bg_result = background::estimate_background_mesh(&lum, width, height, cell_size);
 
-        // MRS wavelet noise override
-        if self.config.noise_layers > 0 {
-            bg_result.noise = background::estimate_noise_mrs(
-                &lum, width, height, self.config.noise_layers,
-            ).max(0.001);
-        }
+        // MRS wavelet noise: always-on
+        bg_result.noise = background::estimate_noise_mrs(
+            &lum, width, height, self.config.noise_layers.max(1),
+        ).max(0.001);
 
         let mut detected;
         let final_fwhm;
@@ -500,53 +488,49 @@ impl ImageAnalyzer {
         }
 
         // Iterative source-masked background re-estimation (iterations 2..n)
-        if let Some(cell_size) = self.config.background_mesh_size {
-            for _ in 1..n_iterations {
-                if detected.is_empty() {
-                    break;
-                }
+        for _ in 1..n_iterations {
+            if detected.is_empty() {
+                break;
+            }
 
-                // Build source mask: circle of r = 2.5 × FWHM around each star
-                let mask_radius = (2.5 * final_fwhm).ceil() as i32;
-                let mask_r_sq = (mask_radius * mask_radius) as f32;
-                let mut source_mask = vec![false; width * height];
-                for star in &detected {
-                    let cx = star.x.round() as i32;
-                    let cy = star.y.round() as i32;
-                    for dy in -mask_radius..=mask_radius {
-                        let py = cy + dy;
-                        if py < 0 || py >= height as i32 { continue; }
-                        for dx in -mask_radius..=mask_radius {
-                            let px = cx + dx;
-                            if px < 0 || px >= width as i32 { continue; }
-                            if (dx * dx + dy * dy) as f32 <= mask_r_sq {
-                                source_mask[py as usize * width + px as usize] = true;
-                            }
+            // Build source mask: circle of r = 2.5 × FWHM around each star
+            let mask_radius = (2.5 * final_fwhm).ceil() as i32;
+            let mask_r_sq = (mask_radius * mask_radius) as f32;
+            let mut source_mask = vec![false; width * height];
+            for star in &detected {
+                let cx = star.x.round() as i32;
+                let cy = star.y.round() as i32;
+                for dy in -mask_radius..=mask_radius {
+                    let py = cy + dy;
+                    if py < 0 || py >= height as i32 { continue; }
+                    for dx in -mask_radius..=mask_radius {
+                        let px = cx + dx;
+                        if px < 0 || px >= width as i32 { continue; }
+                        if (dx * dx + dy * dy) as f32 <= mask_r_sq {
+                            source_mask[py as usize * width + px as usize] = true;
                         }
                     }
                 }
-
-                // Re-estimate background excluding masked pixels
-                bg_result = background::estimate_background_mesh_masked(
-                    &lum, width, height, cell_size, &source_mask,
-                );
-
-                // Re-apply MRS noise override
-                if self.config.noise_layers > 0 {
-                    bg_result.noise = background::estimate_noise_mrs(
-                        &lum, width, height, self.config.noise_layers,
-                    ).max(0.001);
-                }
-
-                // Re-detect with updated background and noise map
-                let bg_map_ref = bg_result.background_map.as_deref();
-                let noise_map_ref = bg_result.noise_map.as_deref();
-                detected = detection::detect_stars(
-                    &lum, width, height,
-                    bg_result.background, bg_result.noise,
-                    bg_map_ref, noise_map_ref, &det_params, final_fwhm,
-                );
             }
+
+            // Re-estimate background excluding masked pixels
+            bg_result = background::estimate_background_mesh_masked(
+                &lum, width, height, cell_size, &source_mask,
+            );
+
+            // Re-apply MRS noise
+            bg_result.noise = background::estimate_noise_mrs(
+                &lum, width, height, self.config.noise_layers.max(1),
+            ).max(0.001);
+
+            // Re-detect with updated background and noise map
+            let bg_map_ref = bg_result.background_map.as_deref();
+            let noise_map_ref = bg_result.noise_map.as_deref();
+            detected = detection::detect_stars(
+                &lum, width, height,
+                bg_result.background, bg_result.noise,
+                bg_map_ref, noise_map_ref, &det_params, final_fwhm,
+            );
         }
 
         let bg_map_ref = bg_result.background_map.as_deref();
@@ -591,7 +575,6 @@ impl ImageAnalyzer {
             (0.0, false)
         };
 
-        let snr_db = snr::compute_snr_db(&lum, bg_result.noise);
         let snr_weight = snr::compute_snr_weight(&lum, bg_result.background, bg_result.noise);
 
         // Helper for zero-star results
@@ -609,7 +592,6 @@ impl ImageAnalyzer {
                 median_eccentricity: 0.0,
                 median_snr: 0.0,
                 median_hfr: 0.0,
-                snr_db,
                 snr_weight,
                 psf_signal: 0.0,
                 trail_r_squared,
@@ -722,7 +704,6 @@ impl ImageAnalyzer {
             median_eccentricity,
             median_snr,
             median_hfr,
-            snr_db,
             snr_weight,
             psf_signal,
             trail_r_squared,

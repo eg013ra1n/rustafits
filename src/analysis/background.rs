@@ -16,6 +16,12 @@ pub struct BackgroundResult {
     pub noise_map: Option<Vec<f32>>,
 }
 
+/// Compute auto-tuned mesh cell size from image dimensions.
+/// Targets ~32 cells across the longest axis, minimum 16 pixels per cell.
+pub fn auto_cell_size(width: usize, height: usize) -> usize {
+    (width.max(height) / 32).max(16)
+}
+
 /// Estimate background and noise using sigma-clipped statistics.
 /// Subsamples to ~500k pixels, runs 3 rounds of 3-sigma clipping.
 pub fn estimate_background(data: &[f32], width: usize, height: usize) -> BackgroundResult {
@@ -535,6 +541,13 @@ fn interpolate_grid_to_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_auto_cell_size() {
+        assert_eq!(auto_cell_size(1024, 768), 32);
+        assert_eq!(auto_cell_size(4096, 2160), 128);
+        assert_eq!(auto_cell_size(256, 256), 16);
+    }
 
     #[test]
     fn test_sigma_clipped_gaussian() {
