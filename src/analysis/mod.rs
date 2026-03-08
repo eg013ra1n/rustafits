@@ -624,8 +624,6 @@ impl ImageAnalyzer {
             &detected,
             bg_result.background,
             bg_map_ref,
-            self.config.use_gaussian_fit,
-            self.config.use_moffat_fit,
             green_mask,
             self.config.moffat_beta.map(|b| b as f64),
         );

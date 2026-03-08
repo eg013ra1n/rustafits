@@ -28,13 +28,9 @@ const FWHM_FACTOR: f32 = 2.3548;
 
 /// Measure PSF metrics for all detected stars.
 ///
-/// `data`: single-channel f32 image.
-/// `stars`: detected star candidates from detection stage.
-/// `background`: global background level.
-/// `bg_map`: optional per-pixel background map.
-/// `use_gaussian_fit`: if true, use full 2D Gaussian fit instead of windowed moments.
-/// `use_moffat`: if true, try Moffat fit first, falling back to Gaussian on failure.
-/// `fixed_beta`: if Some, fix Moffat beta to this value (PI uses 4.0).
+/// Uses a unified fallback chain: Moffat → Gaussian → Moments.
+/// `field_beta`: if Some, use fixed-beta Moffat (from pass 1 calibration).
+///              if None, use free-beta Moffat (for calibration stars).
 pub fn measure_stars(
     data: &[f32],
     width: usize,
@@ -42,17 +38,15 @@ pub fn measure_stars(
     stars: &[DetectedStar],
     background: f32,
     bg_map: Option<&[f32]>,
-    use_gaussian_fit: bool,
-    use_moffat: bool,
     green_mask: Option<&[bool]>,
-    fixed_beta: Option<f64>,
+    field_beta: Option<f64>,
 ) -> Vec<MeasuredStar> {
     use rayon::prelude::*;
 
     stars
         .par_iter()
         .filter_map(|star| {
-            measure_single_star(data, width, height, star, background, bg_map, use_gaussian_fit, use_moffat, green_mask, fixed_beta)
+            measure_single_star(data, width, height, star, background, bg_map, green_mask, field_beta)
         })
         .collect()
 }
@@ -64,10 +58,8 @@ fn measure_single_star(
     star: &DetectedStar,
     background: f32,
     bg_map: Option<&[f32]>,
-    use_gaussian_fit: bool,
-    use_moffat: bool,
     green_mask: Option<&[bool]>,
-    fixed_beta: Option<f64>,
+    field_beta: Option<f64>,
 ) -> Option<MeasuredStar> {
     // Estimate sigma from the star's area: area ≈ π*(2σ)² for a Gaussian at low_threshold
     let estimated_sigma = (star.area as f32 / std::f32::consts::PI).sqrt() * 0.5;
@@ -122,26 +114,25 @@ fn measure_single_star(
     let stamp_mask_ref = stamp_mask.as_deref();
 
     // Robust sigma estimate used by all paths (HFR, moments, Gaussian fit)
-    // (uses bilinear interpolation — fine to use all pixels for initialization)
     let robust_sigma = estimate_sigma_halfmax(&stamp, stamp_w, rel_cx, rel_cy);
     let hfr_radius = 5.0_f32.max(4.0 * robust_sigma);
 
     // Compute HFR within the star vicinity (not the entire stamp)
     let hfr = compute_hfr(&stamp, stamp_w, rel_cx, rel_cy, hfr_radius, stamp_mask_ref);
 
-    if use_moffat {
-        // Try Moffat first, fall back to Gaussian
-        if let Some(result) = measure_with_moffat_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref, fixed_beta) {
-            return Some(result);
-        }
+    // Fallback chain: Moffat → Gaussian → Moments
+    // Try Moffat (fixed-beta if field_beta provided, free-beta otherwise)
+    if let Some(result) = measure_with_moffat_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref, field_beta) {
+        return Some(result);
     }
-    if use_gaussian_fit {
-        // Full 2D Gaussian fit
-        measure_with_gaussian_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref)
-    } else {
-        // Windowed moments
-        measure_with_moments(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref)
+
+    // Try Gaussian
+    if let Some(result) = measure_with_gaussian_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref) {
+        return Some(result);
     }
+
+    // Last resort: moments
+    measure_with_moments(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref)
 }
 
 /// Compute Half-Flux Radius within a given radius of the centroid.

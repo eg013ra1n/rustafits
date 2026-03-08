@@ -413,7 +413,7 @@ fn cmd_measure(
     let mut measured = metrics::measure_stars(
         lum, w, h, &detected,
         bg.background, bg.background_map.as_deref(),
-        true, use_moffat, green_mask,
+        green_mask,
         opts.fixed_beta.map(|b| b as f64),
     );
     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
@@ -731,7 +731,7 @@ fn cmd_query(
     let mut measured = metrics::measure_stars(
         lum, w, h, &detected,
         bg.background, bg.background_map.as_deref(),
-        true, use_moffat, green_mask,
+        green_mask,
         opts.fixed_beta.map(|b| b as f64),
     );
 
@@ -1076,7 +1076,7 @@ fn cmd_pipeline(
     let mut measured = metrics::measure_stars(
         lum, w, h, &detected,
         bg.background, bg_map_ref,
-        true, use_moffat, green_mask,
+        green_mask,
         opts.fixed_beta.map(|b| b as f64),
     );
     eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
@@ -1184,7 +1184,7 @@ fn cmd_dump(
     let mut measured = metrics::measure_stars(
         lum, w, h, &detected,
         bg.background, bg.background_map.as_deref(),
-        true, use_moffat, green_mask,
+        green_mask,
         opts.fixed_beta.map(|b| b as f64),
     );
 
@@ -1424,7 +1424,7 @@ fn analyze_one_file(
     let mut measured = metrics::measure_stars(
         &lum, w, h, &detected,
         bg.background, bg_map_ref,
-        true, use_moffat, green_mask.as_deref(),
+        green_mask.as_deref(),
         opts.fixed_beta.map(|b| b as f64),
     );
 
