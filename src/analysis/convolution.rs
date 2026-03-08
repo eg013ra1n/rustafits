@@ -356,6 +356,75 @@ pub fn b3_spline_smooth(
         });
 }
 
+/// Dilated B3-spline smoothing for à trous wavelet layers 2+.
+///
+/// Same kernel [1/16, 1/4, 3/8, 1/4, 1/16] but with spacing `2^(layer-1)`
+/// between taps. Layer 1 has spacing 1 (use `b3_spline_smooth`).
+/// Layer 2 has spacing 2, layer 3 has spacing 4, etc.
+///
+/// # Panics
+///
+/// Panics if `layer` is 0.
+pub fn b3_spline_smooth_dilated(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    output: &mut [f32],
+    layer: usize,
+) {
+    use rayon::prelude::*;
+
+    const K: [f32; 5] = [1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0];
+    let spacing = 1_i32 << (layer - 1); // 2^(layer-1)
+
+    let mut hpass = vec![0.0_f32; width * height];
+
+    // Horizontal pass with reflected boundary
+    hpass
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let src = &data[y * width..(y + 1) * width];
+            for x in 0..width {
+                let mut sum = 0.0_f32;
+                for (ki, &kv) in K.iter().enumerate() {
+                    let sx = x as i32 + (ki as i32 - 2) * spacing;
+                    let sx = if sx < 0 {
+                        -sx
+                    } else if sx >= width as i32 {
+                        2 * width as i32 - 2 - sx
+                    } else {
+                        sx
+                    } as usize;
+                    sum += src[sx.min(width - 1)] * kv;
+                }
+                row[x] = sum;
+            }
+        });
+
+    // Vertical pass with reflected boundary
+    output
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let mut sum = 0.0_f32;
+                for (ki, &kv) in K.iter().enumerate() {
+                    let sy = y as i32 + (ki as i32 - 2) * spacing;
+                    let sy = if sy < 0 {
+                        -sy
+                    } else if sy >= height as i32 {
+                        2 * height as i32 - 2 - sy
+                    } else {
+                        sy
+                    } as usize;
+                    sum += hpass[sy.min(height - 1) * width + x] * kv;
+                }
+                row[x] = sum;
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +535,68 @@ mod tests {
                     x, y, output[y * width + x]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_b3_spline_dilated_layer2() {
+        // Both layers produce the same center-peak for a point source (the center
+        // tap always captures the spike), but layer 2 places its outer taps at
+        // spacing 2, so the pixel immediately adjacent to the spike receives more
+        // energy under layer 1 (tap at distance 1) than under layer 2 (nearest
+        // non-center tap is at distance 2, skipping the adjacent pixel entirely).
+        let w = 64;
+        let h = 64;
+        let mut data = vec![0.0_f32; w * h];
+        data[32 * w + 32] = 1000.0;
+
+        let mut out1 = vec![0.0_f32; w * h];
+        b3_spline_smooth(&data, w, h, &mut out1);
+        // Layer 1: pixel at distance 1 from the spike gets weight 1/4 * 3/8 from
+        // the separable horizontal+vertical passes.
+        let near1_h = out1[32 * w + 33]; // one pixel right of center (horizontal neighbour)
+
+        let mut out2 = vec![0.0_f32; w * h];
+        b3_spline_smooth_dilated(&data, w, h, &mut out2, 2);
+        // Layer 2 spacing=2: the nearest non-center taps land at distance 2, so
+        // the pixel at distance 1 from the spike receives zero from the horizontal
+        // pass and thus zero overall.
+        let near2_h = out2[32 * w + 33];
+
+        assert!(
+            near1_h > near2_h,
+            "Layer 1 adjacent response {} should exceed layer 2 adjacent response {} \
+             (layer 2 skips distance-1 pixels)",
+            near1_h,
+            near2_h
+        );
+
+        // Conversely, layer 2 places energy at distance 2 that layer 1 also reaches,
+        // but layer 2 carries more weight there because spacing=2 means the distance-2
+        // pixel is the *nearest* neighbour tap (weight 1/4), not the second one.
+        let far1 = out1[32 * w + 34]; // distance 2 from centre
+        let far2 = out2[32 * w + 34];
+        assert!(
+            far2 > far1,
+            "Layer 2 response at distance 2 ({}) should exceed layer 1 ({})",
+            far2,
+            far1
+        );
+    }
+
+    #[test]
+    fn test_b3_spline_dilated_flat_preserved() {
+        let w = 32;
+        let h = 32;
+        let data = vec![500.0_f32; w * h];
+        let mut out = vec![0.0_f32; w * h];
+        b3_spline_smooth_dilated(&data, w, h, &mut out, 2);
+        for &v in &out {
+            assert!(
+                (v - 500.0).abs() < 0.01,
+                "Flat image should be preserved, got {}",
+                v
+            );
         }
     }
 }

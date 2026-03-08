@@ -210,16 +210,16 @@ pub fn estimate_background_mesh(
 /// `1.4826 * MAD(w1)`. This isolates the finest-scale (noise) fluctuations,
 /// separating them from nebulosity and gradients that bias the plain MAD estimator.
 ///
-/// `noise_layers`: number of à trous layers (1 is sufficient for noise estimation).
-/// For layers > 1, each subsequent smooth uses a dilated kernel (spacing 2^layer),
-/// but layer 1 alone is adequate for noise estimation.
+/// `_noise_layers`: reserved for future multi-scale background refinement.
+/// Noise is always estimated from the layer-1 coefficients (finest scale = pure noise).
+/// Higher layers are dilated à trous passes useful for background estimation, not noise.
 pub fn estimate_noise_mrs(
     data: &[f32],
     width: usize,
     height: usize,
-    noise_layers: usize,
+    _noise_layers: usize,
 ) -> f32 {
-    if noise_layers == 0 || data.is_empty() {
+    if data.is_empty() {
         return 0.001;
     }
 
@@ -228,11 +228,6 @@ pub fn estimate_noise_mrs(
 
     // Layer 1: standard B3-spline smooth (spacing=1)
     b3_spline_smooth(data, width, height, &mut smoothed);
-
-    // For noise_layers > 1, iterate: smooth the smoothed image with dilated kernel.
-    // Each layer removes progressively larger-scale structure.
-    // Currently only layer 1 is needed for PI-matching noise.
-    // (Future: implement dilated à trous for layers 2+)
 
     // Compute wavelet coefficients: w1 = data - smoothed
     // Subsample for speed (~500k pixels, same approach as estimate_background)
