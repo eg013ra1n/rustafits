@@ -1,8 +1,8 @@
 /// Levenberg-Marquardt 2D elliptical Gaussian fitting (7-param).
 /// All internal computations in f64 for numerical stability.
 
-const MAX_ITER: usize = 30;
-const CONV_TOL: f64 = 1e-7;
+const MAX_ITER: usize = 50;
+const CONV_TOL: f64 = 1e-6;
 
 /// 2D Gaussian model: f(x,y) = B + A * exp(-0.5 * Q(x,y))
 /// Q(x,y) = u^2/sx^2 + v^2/sy^2
@@ -79,6 +79,7 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
     let mut best_cost = residual_cost_2d(pixels, params, fit_theta);
+    let mut prev_cost = best_cost;
     let mut converged = false;
 
     // Scratch space for normal equations
@@ -147,9 +148,22 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
             mat[p * np + p] += lambda * jtj[p * np + p].max(1e-12);
         }
 
-        let delta = match cholesky_solve(&mat, &jtr, np) {
-            Some(d) => d,
-            None => break,
+        let delta = {
+            let mut result = cholesky_solve(&mat, &jtr, np);
+            if result.is_none() {
+                for _ in 0..3 {
+                    lambda *= 10.0;
+                    for p in 0..np {
+                        mat[p * np + p] = jtj[p * np + p] + lambda * jtj[p * np + p].max(1e-12);
+                    }
+                    result = cholesky_solve(&mat, &jtr, np);
+                    if result.is_some() { break; }
+                }
+            }
+            match result {
+                Some(d) => d,
+                None => break,
+            }
         };
 
         new_params[..np].copy_from_slice(&params[..np]);
@@ -164,6 +178,19 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
             new_params[5] = params[5] * 0.5;
         }
 
+        // Reject step if sigma too small or centroid drifts too far
+        if new_params[4] < 0.5 || new_params[5] < 0.5
+            || {
+                let cdx = new_params[2] - params[2];
+                let cdy = new_params[3] - params[3];
+                cdx * cdx + cdy * cdy > 4.0
+            }
+        {
+            lambda *= nu;
+            nu *= 2.0;
+            continue;
+        }
+
         let new_cost = residual_cost_2d(pixels, &new_params[..np], fit_theta);
 
         // Nielsen gain ratio
@@ -173,6 +200,8 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
             .map(|(i, d)| d * (lambda * jtj[i * np + i].max(1e-12) * d + jtr[i]))
             .sum();
 
+        prev_cost = best_cost;
+        let mut step_accepted = false;
         if predicted > 0.0 {
             let rho = (best_cost - new_cost) / predicted;
             if rho > 0.0 {
@@ -180,6 +209,7 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
                 best_cost = new_cost;
                 lambda *= (1.0_f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3));
                 nu = 2.0;
+                step_accepted = true;
             } else {
                 lambda *= nu;
                 nu *= 2.0;
@@ -189,10 +219,16 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
             nu *= 2.0;
         }
 
-        // Convergence
+        // Dual convergence criterion
         let param_norm = params[..np].iter().map(|p| p * p).sum::<f64>().sqrt();
         let delta_norm = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
-        if delta_norm / param_norm.max(1e-12) < CONV_TOL {
+        let param_converged = delta_norm / param_norm.max(1e-12) < CONV_TOL;
+        let residual_converged = if step_accepted && best_cost > 0.0 {
+            (prev_cost - best_cost).abs() / best_cost < 1e-4
+        } else {
+            false
+        };
+        if param_converged || residual_converged {
             converged = true;
             break;
         }
@@ -338,6 +374,22 @@ pub fn fit_moffat_2d_fixed_beta(
     fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, Some(beta))
 }
 
+/// Evaluate the 2D Moffat model at a single point.
+///
+/// `params`: [B, A, x0, y0, alpha_x, alpha_y, theta, beta]
+/// Returns the model value at (x, y).
+pub fn evaluate_moffat_2d(params: &[f64], x: f64, y: f64) -> f64 {
+    let (cos_t, sin_t) = (params[6].cos(), params[6].sin());
+    let dx = x - params[2];
+    let dy = y - params[3];
+    let u = dx * cos_t + dy * sin_t;
+    let v = -dx * sin_t + dy * cos_t;
+    let ax = params[4];
+    let ay = params[5];
+    let q = (u / ax).powi(2) + (v / ay).powi(2);
+    params[0] + params[1] * (1.0 + q).powf(-params[7])
+}
+
 fn fit_moffat_2d_impl(
     pixels: &[PixelSample],
     init_b: f64,
@@ -401,6 +453,7 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
     let mut best_cost = residual_cost_moffat(pixels, params);
+    let mut prev_cost = best_cost;
     let mut converged = false;
 
     let mut jtj = vec![0.0_f64; np * np];
@@ -477,9 +530,22 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
             mat[p * np + p] += lambda * jtj[p * np + p].max(1e-12);
         }
 
-        let delta = match cholesky_solve(&mat[..np * np], &jtr, np) {
-            Some(d) => d,
-            None => break,
+        let delta = {
+            let mut result = cholesky_solve(&mat[..np * np], &jtr, np);
+            if result.is_none() {
+                for _ in 0..3 {
+                    lambda *= 10.0;
+                    for p in 0..np {
+                        mat[p * np + p] = jtj[p * np + p] + lambda * jtj[p * np + p].max(1e-12);
+                    }
+                    result = cholesky_solve(&mat[..np * np], &jtr, np);
+                    if result.is_some() { break; }
+                }
+            }
+            match result {
+                Some(d) => d,
+                None => break,
+            }
         };
 
         new_params[..8].copy_from_slice(&params[..8]);
@@ -491,8 +557,21 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
         if new_params[5] <= 0.0 { new_params[5] = params[5] * 0.5; }
         // Keep beta in reasonable range (only when free)
         if fixed_beta.is_none() {
-            if new_params[7] < 0.5 { new_params[7] = 0.5; }
-            if new_params[7] > 25.0 { new_params[7] = 25.0; }
+            if new_params[7] < 1.5 { new_params[7] = 1.5; }
+            if new_params[7] > 20.0 { new_params[7] = 20.0; }
+        }
+
+        // Reject step if alpha too small or centroid drifts too far
+        if new_params[4] < 0.5 || new_params[5] < 0.5
+            || {
+                let cdx = new_params[2] - params[2];
+                let cdy = new_params[3] - params[3];
+                cdx * cdx + cdy * cdy > 4.0
+            }
+        {
+            lambda *= nu;
+            nu *= 2.0;
+            continue;
         }
 
         let new_cost = residual_cost_moffat(pixels, &new_params);
@@ -503,6 +582,8 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
             .map(|(i, d)| d * (lambda * jtj[i * np + i].max(1e-12) * d + jtr[i]))
             .sum();
 
+        prev_cost = best_cost;
+        let mut step_accepted = false;
         if predicted > 0.0 {
             let rho = (best_cost - new_cost) / predicted;
             if rho > 0.0 {
@@ -510,6 +591,7 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
                 best_cost = new_cost;
                 lambda *= (1.0_f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3));
                 nu = 2.0;
+                step_accepted = true;
             } else {
                 lambda *= nu;
                 nu *= 2.0;
@@ -519,9 +601,16 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
             nu *= 2.0;
         }
 
+        // Dual convergence criterion
         let param_norm = params[..np].iter().map(|p| p * p).sum::<f64>().sqrt();
         let delta_norm = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
-        if delta_norm / param_norm.max(1e-12) < CONV_TOL {
+        let param_converged = delta_norm / param_norm.max(1e-12) < CONV_TOL;
+        let residual_converged = if step_accepted && best_cost > 0.0 {
+            (prev_cost - best_cost).abs() / best_cost < 1e-4
+        } else {
+            false
+        };
+        if param_converged || residual_converged {
             converged = true;
             break;
         }
@@ -774,5 +863,48 @@ mod tests {
         assert!((x[0] - 1.0).abs() < 1e-10);
         assert!((x[1] - 2.0).abs() < 1e-10);
         assert!((x[2] - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cholesky_retry_on_faint_star() {
+        let mut samples = Vec::new();
+        let sigma = 2.0_f64;
+        let amplitude = 5.0_f64;
+        let noise_bg = 100.0_f64;
+        for y in -8..=8 {
+            for x in -8..=8 {
+                let r2 = (x * x + y * y) as f64;
+                let val = noise_bg + amplitude * (-0.5 * r2 / (sigma * sigma)).exp();
+                samples.push(PixelSample { x: x as f64, y: y as f64, value: val });
+            }
+        }
+        let result = fit_gaussian_2d(&samples, noise_bg, amplitude, 0.0, 0.0, sigma, sigma, 0.0);
+        assert!(result.is_some(), "Faint star should produce a result");
+        let result = result.unwrap();
+        assert!(result.converged, "Faint star should converge");
+        assert!((result.sigma_x - sigma).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_evaluate_moffat_2d_center() {
+        let params = [100.0, 5000.0, 0.0, 0.0, 3.0, 3.0, 0.0, 3.0];
+        let val = evaluate_moffat_2d(&params, 0.0, 0.0);
+        assert!((val - 5100.0).abs() < 0.01, "At center: B + A = 5100, got {}", val);
+    }
+
+    #[test]
+    fn test_evaluate_moffat_2d_off_center() {
+        let params = [100.0, 5000.0, 0.0, 0.0, 3.0, 3.0, 0.0, 3.0];
+        let val_center = evaluate_moffat_2d(&params, 0.0, 0.0);
+        let val_off = evaluate_moffat_2d(&params, 3.0, 0.0);
+        assert!(val_off < val_center, "Off-center should be less");
+        assert!(val_off > 100.0, "Should be above background");
+    }
+
+    #[test]
+    fn test_evaluate_moffat_2d_far_away() {
+        let params = [100.0, 5000.0, 0.0, 0.0, 3.0, 3.0, 0.0, 3.0];
+        let val = evaluate_moffat_2d(&params, 100.0, 100.0);
+        assert!((val - 100.0).abs() < 1.0, "Far from center should approach background, got {}", val);
     }
 }
