@@ -79,7 +79,7 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
     let mut best_cost = residual_cost_2d(pixels, params, fit_theta);
-    let mut prev_cost = best_cost;
+    let mut prev_cost: f64;
     let mut converged = false;
 
     // Scratch space for normal equations
@@ -378,6 +378,7 @@ pub fn fit_moffat_2d_fixed_beta(
 ///
 /// `params`: [B, A, x0, y0, alpha_x, alpha_y, theta, beta]
 /// Returns the model value at (x, y).
+#[cfg(test)]
 pub fn evaluate_moffat_2d(params: &[f64], x: f64, y: f64) -> f64 {
     let (cos_t, sin_t) = (params[6].cos(), params[6].sin());
     let dx = x - params[2];
@@ -453,7 +454,7 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
     let mut best_cost = residual_cost_moffat(pixels, params);
-    let mut prev_cost = best_cost;
+    let mut prev_cost: f64;
     let mut converged = false;
 
     let mut jtj = vec![0.0_f64; np * np];

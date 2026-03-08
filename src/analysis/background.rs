@@ -24,47 +24,6 @@ pub fn auto_cell_size(width: usize, height: usize) -> usize {
 
 /// Estimate background and noise using sigma-clipped statistics.
 /// Subsamples to ~500k pixels, runs 3 rounds of 3-sigma clipping.
-pub fn estimate_background(data: &[f32], width: usize, height: usize) -> BackgroundResult {
-    let total = width * height;
-    let target_samples = 500_000usize;
-    let stride = ((total as f64 / target_samples as f64).sqrt() as usize).max(1);
-
-    // Subsample, skipping 2-pixel border
-    let border = 2;
-    let mut samples = Vec::with_capacity(target_samples);
-    let mut y = border;
-    while y < height.saturating_sub(border) {
-        let mut x = border;
-        while x < width.saturating_sub(border) {
-            let val = data[y * width + x];
-            if val.is_finite() {
-                samples.push(val);
-            }
-            x += stride;
-        }
-        y += stride;
-    }
-
-    if samples.len() < 100 {
-        return BackgroundResult {
-            background: 0.0,
-            noise: 1.0,
-            background_map: None,
-            noise_map: None,
-        };
-    }
-
-    // Iterative sigma-clipping: 3 rounds, 3σ threshold
-    let (mode, sigma) = sigma_clipped_stats(&mut samples, 3, 3.0);
-
-    BackgroundResult {
-        background: mode,
-        noise: sigma.max(0.001),
-        background_map: None,
-        noise_map: None,
-    }
-}
-
 /// Estimate background with SExtractor-style mesh grid for spatially varying backgrounds.
 pub fn estimate_background_mesh(
     data: &[f32],
@@ -603,7 +562,8 @@ mod tests {
             *val += noise;
         }
 
-        let result = estimate_background(&data, width, height);
+        let cell_size = auto_cell_size(width, height);
+        let result = estimate_background_mesh(&data, width, height, cell_size);
         assert!(
             (result.background - bg_level).abs() < 30.0,
             "bg {} should be ~{}",
@@ -611,7 +571,6 @@ mod tests {
             bg_level
         );
         assert!(result.noise > 0.0, "noise should be > 0");
-        assert!(result.background_map.is_none());
     }
 
     #[test]
