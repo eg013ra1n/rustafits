@@ -14,6 +14,7 @@ fn analyze_file(label: &str, path: &str) {
     println!("  Median eccentricity:  {:.3}", r.median_eccentricity);
     println!("  Median SNR:           {:.1}", r.median_snr);
     println!("  PSF signal:           {:.1}", r.psf_signal);
+    println!("  Frame SNR:            {:.1}", r.frame_snr);
     println!("  Trail R²:             {:.4}", r.trail_r_squared);
     println!("  Possibly trailed:     {}", r.possibly_trailed);
 

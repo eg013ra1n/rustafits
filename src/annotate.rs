@@ -455,6 +455,7 @@ mod tests {
             median_hfr: 3.0,
             snr_weight: 100.0,
             psf_signal: 50.0,
+            frame_snr: 0.0,
             trail_r_squared: 0.0,
             possibly_trailed: false,
             measured_fwhm_kernel: 3.0,

@@ -1042,6 +1042,7 @@ fn cmd_pipeline(
     eprintln!("  Median HFR:      {:.3}px", median_hfr);
     eprintln!("  SNR weight:      {:.2}", snr_weight);
     eprintln!("  PSF signal:      {:.2}", psf_signal);
+    eprintln!("  Frame SNR:       {:.1}", bg.background / bg.noise.max(1e-6));
     if let Some(beta) = median_beta {
         let moffat_count = measured.iter().filter(|s| s.beta.is_some()).count();
         eprintln!("  Median beta:     {:.2} ({} Moffat / {} Gauss)",

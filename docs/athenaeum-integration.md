@@ -79,6 +79,7 @@ let result = ImageAnalyzer::new()
 | `measured_fwhm_kernel` | `f32` | FWHM used for final matched filter kernel. |
 | `snr_weight` | `f32` | PixInsight-style SNR weight for stacking. |
 | `psf_signal` | `f32` | PSF signal strength: median(star_peaks) / noise. |
+| `frame_snr` | `f32` | Per-frame SNR: background / noise. For stacking: `stacked_snr = sqrt(sum(frame_snr_i²))`. |
 | `trail_r_squared` | `f32` | Rayleigh R² for directional coherence. 0 = no trail, 1 = strong trail. |
 | `median_beta` | `Option<f32>` | Median Moffat β. Always `Some(...)` with default settings (Moffat is always-on). |
 | `possibly_trailed` | `bool` | Advisory trail flag (dual-path Rayleigh test). |
@@ -468,6 +469,7 @@ Additional quality indicators:
 | Trailed | `possibly_trailed` | icon/badge | Warning, not auto-reject |
 | PSF Signal | `psf_signal` | `{:.0}` | median(star_peaks) / noise |
 | SNR Weight | `snr_weight` | `{:.1}` | PixInsight-style weight for stacking |
+| Frame SNR | `frame_snr` | `{:.1}` | background / noise, for stacking prediction |
 
 ### Annotation toggle in image viewer
 

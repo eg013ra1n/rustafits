@@ -191,6 +191,7 @@ See [Trail Detection](trail-rejection.md) for the full algorithm and rationale.
 | Stars detected      | `stars_detected`    | ~4,485    | ~712      |
 | SNR Weight          | `snr_weight`        | ~1.1      | —         |
 | PSF Signal          | `psf_signal`        | ~14       | —         |
+| Frame SNR           | `frame_snr`         | —         | —         |
 
 FWHM accuracy: within ~0.3% of professional tools.
 

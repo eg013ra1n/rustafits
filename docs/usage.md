@@ -16,6 +16,7 @@ println!("Eccentricity:   {:.3}", result.median_eccentricity);
 println!("Moffat beta:    {:.2}", result.median_beta.unwrap_or_default());
 println!("SNR weight:     {:.1}", result.snr_weight);
 println!("PSF signal:     {:.1}", result.psf_signal);
+println!("Frame SNR:      {:.1}", result.frame_snr);
 ```
 
 `analyze()` accepts any path to a FITS or XISF file. It handles byte-swap,
@@ -100,6 +101,7 @@ be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
 | `median_snr` | `f32` | Median per-star SNR. |
 | `median_hfr` | `f32` | Median half-flux radius (pixels). Similar to FWHM but more robust to non-Gaussian profiles. |
 | `snr_weight` | `f32` | SNR weight for stacking: `(MeanDev / noise)^2`. |
+| `frame_snr` | `f32` | Per-frame SNR: `background / noise`. Use for stacking prediction: `stacked_snr = sqrt(sum(frame_snr_i²))`. |
 | `median_beta` | `Option<f32>` | Median Moffat beta. Always present with default pipeline. Typical: 2-5. |
 | `measured_fwhm_kernel` | `f32` | FWHM used for final matched filter kernel in pixels. |
 | `psf_signal` | `f32` | PSF signal strength: `median(star_peaks) / noise`. Higher = better signal. |
