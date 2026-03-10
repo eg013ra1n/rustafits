@@ -1,8 +1,9 @@
 # Background Estimation
 
 Background estimation uses a mesh-grid approach with auto-tuned cell size. Noise is
-estimated via MRS wavelet (B3-spline a trous, default 1 layer). After pass 1 calibration,
-a source-masked re-estimation is always performed for cleaner statistics.
+estimated via iterative MRS wavelet (B3-spline à trous, default 4 layers with significance
+masking). After pass 1 calibration, a source-masked re-estimation is always performed for
+cleaner statistics.
 
 ## Global Background Estimation
 
@@ -185,43 +186,42 @@ background estimate.
 
 ## MRS Wavelet Noise Estimation
 
-Always-on (default `noise_layers=1`). The MRS (Multiscale Residual Spectrum) wavelet
+Always-on (default `noise_layers=4`). The MRS (Multiresolution Support) wavelet
 method isolates the finest-scale fluctuations using the à trous (with holes) wavelet
-transform. This avoids the problem where sigma-clipped MAD overestimates noise by
-30-40% on nebula-rich fields (M42, NGC 7000, etc.) by conflating nebulosity with
-background fluctuations.
+transform with iterative significance masking. This avoids the problem where
+sigma-clipped MAD overestimates noise by 30-40% on nebula-rich fields (M42, NGC 7000,
+etc.) by conflating nebulosity with background fluctuations.
 
 ### Algorithm
 
 ```
-Input: luminance image
+Input: luminance image, noise_layers (default 4)
        |
        v
 +-------------------------------+
-| B3-Spline Smooth              |  Separable 5-tap kernel: [1/16, 1/4, 3/8, 1/4, 1/16]
-|                               |  DC-preserving (coefficients sum to 1)
-|                               |  Reflected boundary conditions
-|                               |  Parallelized per row with rayon
-+-------------------------------+
-       |
-       v
-+-------------------------------+
-| Wavelet Coefficients          |  w1[i] = data[i] - smoothed[i]
-|                               |  First wavelet layer: finest-scale structure
-|                               |  Contains noise + point sources, NOT nebulosity
+| Layer 1: B3-Spline Smooth     |  Separable 5-tap kernel: [1/16, 1/4, 3/8, 1/4, 1/16]
+|                               |  w1[i] = data[i] - smoothed[i]
+|                               |  Finest-scale coefficients (noise + point sources)
 +-------------------------------+
        |
        v
 +-------------------------------+
-| Subsample (~500k pixels)      |  Skip 2px border, stride to ~500k samples
-|                               |  Same approach as global background estimation
+| Initial sigma from w1         |  sigma1 = 1.4826 * MAD(w1)
+| Mark significant pixels       |  |w1[i]| > 3*sigma1 → sig_mask[i] = true
 +-------------------------------+
        |
        v
 +-------------------------------+
-| MAD-based Sigma               |  median_w1 = median(w1_samples)
-|                               |  MAD = median(|w1 - median_w1|)
-|                               |  sigma = 1.4826 * MAD
+| Layers 2..N: Dilated Smooth   |  Spacing = 2^(layer-1) between taps
+|                               |  w_j = c_{j-1} - c_j (coarser wavelet coefficients)
+|                               |  sigma_j from unmasked pixels only
+|                               |  |w_j[i]| > 3*sigma_j → add to sig_mask
++-------------------------------+
+       |
+       v
++-------------------------------+
+| Re-estimate from w1           |  Use only unmasked pixels (structure-free)
+| Iterate until convergence     |  sigma-clip on w1, 4 rounds, <0.1% change
 +-------------------------------+
        |
        v
@@ -242,10 +242,10 @@ The first wavelet layer (`w1 = data - smoothed`) captures structure at the 1-2 p
 scale — exactly where Poisson/read noise lives. Nebulosity, gradients, and extended
 objects have much larger spatial scales and are almost entirely removed by the subtraction.
 
-MRS wavelet noise is always-on (default 1 layer). The layer count is configurable via
-`with_mrs_layers(n)`. Layer 1 is sufficient for noise estimation. Higher layers (2+)
-remove progressively larger-scale structure using dilated convolution, but are not
-needed in practice.
+MRS wavelet noise is always-on (default 4 layers). The layer count is configurable via
+`with_mrs_layers(n)`. Higher layers (2+) build a significance mask using dilated
+convolution to identify and exclude structure at progressively larger scales, producing
+a purer noise estimate from the layer-1 coefficients.
 
 ### Constants
 
@@ -268,8 +268,8 @@ needed in practice.
 | Mode estimator | 2.5m - 1.5mu | Pluggable (SExtractor, biweight, MMM) | 2.5m - 1.5mu |
 | Asymmetry fallback | Yes (0.3sigma) | Depends on estimator | Yes (0.3sigma) |
 | Background method | Mesh-grid | Mesh-grid | Mesh-grid (always, auto cell size) |
-| Noise estimator | Clipped sigma | MAD or biweight scale | MRS wavelet (always-on, 1 layer) |
-| Wavelet noise | — | — | B3-spline à trous (default 1 layer) |
+| Noise estimator | Clipped sigma | MAD or biweight scale | MRS wavelet (always-on, 4 layers) |
+| Wavelet noise | — | — | B3-spline à trous (default 4 layers, significance masking) |
 | Grid filtering | 3x3 median | Configurable median | 3x3 median |
 | Interpolation | Bicubic spline | Bicubic spline (scipy zoom) | Catmull-Rom bicubic |
 | Source masking | No (single pass) | Manual mask input | Always-on (1 re-estimation, auto-mask) |

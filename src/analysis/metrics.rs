@@ -31,6 +31,7 @@ const FWHM_FACTOR: f32 = 2.3548;
 /// Uses a unified fallback chain: Moffat → Gaussian → Moments.
 /// `field_beta`: if Some, use fixed-beta Moffat (from pass 1 calibration).
 ///              if None, use free-beta Moffat (for calibration stars).
+/// `max_iter`, `conv_tol`, `max_rejects` control LM solver convergence.
 pub fn measure_stars(
     data: &[f32],
     width: usize,
@@ -40,13 +41,16 @@ pub fn measure_stars(
     bg_map: Option<&[f32]>,
     green_mask: Option<&[bool]>,
     field_beta: Option<f64>,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
 ) -> Vec<MeasuredStar> {
     use rayon::prelude::*;
 
     stars
         .par_iter()
         .filter_map(|star| {
-            measure_single_star(data, width, height, star, background, bg_map, green_mask, field_beta)
+            measure_single_star(data, width, height, star, background, bg_map, green_mask, field_beta, max_iter, conv_tol, max_rejects)
         })
         .collect()
 }
@@ -60,6 +64,9 @@ fn measure_single_star(
     bg_map: Option<&[f32]>,
     green_mask: Option<&[bool]>,
     field_beta: Option<f64>,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
 ) -> Option<MeasuredStar> {
     // Estimate sigma from the star's area: area ≈ π*(2σ)² for a Gaussian at low_threshold
     let estimated_sigma = (star.area as f32 / std::f32::consts::PI).sqrt() * 0.5;
@@ -122,12 +129,12 @@ fn measure_single_star(
 
     // Fallback chain: Moffat → Gaussian → Moments
     // Try Moffat (fixed-beta if field_beta provided, free-beta otherwise)
-    if let Some(result) = measure_with_moffat_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref, field_beta) {
+    if let Some(result) = measure_with_moffat_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref, field_beta, max_iter, conv_tol, max_rejects) {
         return Some(result);
     }
 
     // Try Gaussian
-    if let Some(result) = measure_with_gaussian_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref) {
+    if let Some(result) = measure_with_gaussian_fit(&stamp, stamp_w, stamp_h, rel_cx, rel_cy, robust_sigma, star, hfr, x0, y0, stamp_mask_ref, max_iter, conv_tol, max_rejects) {
         return Some(result);
     }
 
@@ -347,6 +354,9 @@ fn measure_with_gaussian_fit(
     x0: usize,
     y0: usize,
     stamp_mask: Option<&[bool]>,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
 ) -> Option<MeasuredStar> {
 
     // Limit fitting radius to exclude distant nebula pixels
@@ -433,6 +443,9 @@ fn measure_with_gaussian_fit(
         init_sx,
         init_sy,
         mom_theta,
+        max_iter,
+        conv_tol,
+        max_rejects,
     )?;
 
     // Reject divergent fits: fitted sigma should not exceed 3x the initial estimate
@@ -495,6 +508,9 @@ fn measure_with_moffat_fit(
     y0: usize,
     stamp_mask: Option<&[bool]>,
     fixed_beta: Option<f64>,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
 ) -> Option<MeasuredStar> {
     let fitting_radius = 5.0_f64.max(4.0 * init_sigma as f64);
     let fitting_radius_sq = fitting_radius * fitting_radius;
@@ -570,6 +586,9 @@ fn measure_with_moffat_fit(
             init_sy,
             mom_theta,
             beta,
+            max_iter,
+            conv_tol,
+            max_rejects,
         )?
     } else {
         fit_moffat_2d(
@@ -581,6 +600,9 @@ fn measure_with_moffat_fit(
             init_sx,
             init_sy,
             mom_theta,
+            max_iter,
+            conv_tol,
+            max_rejects,
         )?
     };
 
@@ -760,6 +782,7 @@ fn estimate_sigma_from_stamp(stamp: &[f32], stamp_w: usize, cx: f32, cy: f32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::fitting::{CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS};
 
     fn make_gaussian_stamp(
         size: usize,
@@ -885,7 +908,7 @@ mod tests {
             measure_with_moments(&stamp, size, size, 15.0, 15.0, sigma, &star, 3.0, 0, 0, None)
                 .unwrap();
         let fit_result =
-            measure_with_gaussian_fit(&stamp, size, size, 15.0, 15.0, sigma, &star, 3.0, 0, 0, None).unwrap();
+            measure_with_gaussian_fit(&stamp, size, size, 15.0, 15.0, sigma, &star, 3.0, 0, 0, None, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
 
         // Should agree within 10%
         let diff_pct = (moments_result.fwhm - fit_result.fwhm).abs() / fit_result.fwhm * 100.0;
@@ -921,7 +944,7 @@ mod tests {
 
         let init_sigma = (sx * sy).sqrt();
         let result =
-            measure_with_gaussian_fit(&stamp, size, size, 20.0, 20.0, init_sigma, &star, 4.0, 0, 0, None)
+            measure_with_gaussian_fit(&stamp, size, size, 20.0, 20.0, init_sigma, &star, 4.0, 0, 0, None, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS)
                 .unwrap();
 
         // fwhm_x must be >= fwhm_y (canonical ordering)
@@ -966,7 +989,7 @@ mod tests {
 
         let init_sigma = (sx * sy).sqrt(); // geometric mean ≈ 3.16
         let result =
-            measure_with_gaussian_fit(&stamp, size, size, 20.0, 20.0, init_sigma, &star, 4.0, 0, 0, None)
+            measure_with_gaussian_fit(&stamp, size, size, 20.0, 20.0, init_sigma, &star, 4.0, 0, 0, None, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS)
                 .unwrap();
 
         // Expected eccentricity: sqrt(1 - 4/25) ≈ 0.917

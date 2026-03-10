@@ -19,6 +19,7 @@ fn print_usage(program: &str) {
     eprintln!("  --preview            Enable preview mode (2x2 binning for mono, faster)");
     eprintln!("  --annotate           Overlay star detection ellipses on the output image");
     eprintln!("  --max-stars <N>      Max stars for annotation analysis (default: 200)");
+    eprintln!("  --measure-cap <N>    Max stars to PSF-fit (default: 2000, 0 = all)");
     eprintln!("  --log                Show detailed conversion information");
     eprintln!();
     eprintln!("Examples:");
@@ -53,6 +54,7 @@ fn run() -> Result<()> {
     let mut preview_mode = false;
     let mut annotate = false;
     let mut max_stars: usize = 500;
+    let mut measure_cap: usize = 2000;
     let mut log_enabled = false;
 
     let mut i = 3;
@@ -106,6 +108,15 @@ fn run() -> Result<()> {
                 }
                 i += 2;
             }
+            "--measure-cap" => {
+                if i + 1 >= args.len() {
+                    return Err(anyhow::anyhow!("--measure-cap requires a value"));
+                }
+                measure_cap = args[i + 1]
+                    .parse::<usize>()
+                    .context("Invalid measure-cap value")?;
+                i += 2;
+            }
             "--log" => {
                 log_enabled = true;
                 i += 1;
@@ -151,6 +162,7 @@ fn run() -> Result<()> {
         // Analyze first (borrows pixels)
         let result = ImageAnalyzer::new()
             .with_max_stars(max_stars)
+            .with_measure_cap(measure_cap)
             .analyze_raw(&meta, &pixels)
             .context("Analysis failed")?;
 

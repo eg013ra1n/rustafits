@@ -10,7 +10,8 @@ use anyhow::{bail, Context, Result};
 use astroimage::analysis::background;
 use astroimage::analysis::convolution;
 use astroimage::analysis::detection::{self, DetectedStar, DetectionParams};
-use astroimage::analysis::fitting::{self, PixelSample};
+use astroimage::analysis::fitting::{self, PixelSample,
+    CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS};
 use astroimage::analysis::metrics;
 use astroimage::analysis::render;
 use astroimage::analysis::snr;
@@ -38,6 +39,10 @@ struct Opts {
     near: Option<(f32, f32, f32)>,
     no_debayer: bool,
     mrs_layers: usize,
+    measure_cap: usize,
+    fit_max_iter: usize,
+    fit_tolerance: f64,
+    fit_max_rejects: usize,
 }
 
 fn print_usage() {
@@ -64,7 +69,11 @@ fn print_usage() {
     eprintln!("  --radius <N>        Stamp radius for 'fit'/'query' (default: 15)");
     eprintln!("  --near <x>,<y>,<r>  Filter stars within radius of position");
     eprintln!("  --no-debayer        Skip green interpolation for OSC");
-    eprintln!("  --mrs <N>           MRS wavelet noise layers (default: 1)");
+    eprintln!("  --mrs <N>           MRS wavelet noise layers (default: 4)");
+    eprintln!("  --measure-cap <N>   Max stars to measure (default: 2000, 0 = all)");
+    eprintln!("  --fit-iter <N>      LM max iterations (default: 25)");
+    eprintln!("  --fit-tol <F>       LM convergence tolerance (default: 1e-4)");
+    eprintln!("  --fit-rejects <N>   LM consecutive reject bailout (default: 5)");
 }
 
 fn parse_args() -> Result<Opts> {
@@ -88,7 +97,11 @@ fn parse_args() -> Result<Opts> {
         stamp_radius: 15,
         near: None,
         no_debayer: false,
-        mrs_layers: 1,
+        mrs_layers: 4,
+        measure_cap: 2000,
+        fit_max_iter: 25,
+        fit_tolerance: 1e-4,
+        fit_max_rejects: 5,
     };
 
     let mut i = 3;
@@ -141,6 +154,22 @@ fn parse_args() -> Result<Opts> {
             "--mrs" => {
                 i += 1;
                 opts.mrs_layers = args[i].parse().context("--mrs value")?;
+            }
+            "--measure-cap" => {
+                i += 1;
+                opts.measure_cap = args[i].parse().context("--measure-cap value")?;
+            }
+            "--fit-iter" => {
+                i += 1;
+                opts.fit_max_iter = args[i].parse().context("--fit-iter value")?;
+            }
+            "--fit-tol" => {
+                i += 1;
+                opts.fit_tolerance = args[i].parse().context("--fit-tol value")?;
+            }
+            "--fit-rejects" => {
+                i += 1;
+                opts.fit_max_rejects = args[i].parse().context("--fit-rejects value")?;
             }
             other => {
                 bail!("Unknown option: {}", other);
@@ -373,6 +402,7 @@ fn cmd_measure(
         bg.background, bg.background_map.as_deref(),
         green_mask,
         None, // free-beta for debug measure
+        CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
     );
     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -558,6 +588,7 @@ fn cmd_fit(lum: &[f32], w: usize, h: usize, opts: &Opts) -> Result<()> {
         &pixels, init_bg, init_a,
         cx64, cy64,
         robust_sigma as f64, robust_sigma as f64, 0.0,
+        CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
     );
     if let Some(ref g) = gauss {
         let fwhm_x = 2.3548 * g.sigma_x;
@@ -585,6 +616,7 @@ fn cmd_fit(lum: &[f32], w: usize, h: usize, opts: &Opts) -> Result<()> {
         &pixels, init_bg, init_a,
         cx64, cy64,
         robust_sigma as f64, robust_sigma as f64, 0.0,
+        CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
     );
     if let Some(ref m) = moffat {
         let fwhm_x = m.fwhm_x();
@@ -680,6 +712,7 @@ fn cmd_query(
         bg.background, bg.background_map.as_deref(),
         green_mask,
         None, // free-beta for debug query
+        CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
     );
 
     if measured.is_empty() {
@@ -803,6 +836,7 @@ fn cmd_query(
         &pixels, init_bg, init_a,
         cx64, cy64,
         robust_sigma as f64, robust_sigma as f64, 0.0,
+        CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
     );
     if let Some(ref g) = gauss {
         let fwhm_x = 2.3548 * g.sigma_x;
@@ -830,6 +864,7 @@ fn cmd_query(
         &pixels, init_bg, init_a,
         cx64, cy64,
         robust_sigma as f64, robust_sigma as f64, 0.0,
+        CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
     );
     if let Some(ref m) = moffat {
         let fwhm_x = m.fwhm_x();
@@ -1000,11 +1035,18 @@ fn cmd_pipeline(
     eprintln!("\n=== Stage 3: PSF Measurement ===");
     let t = Instant::now();
 
+    let effective_cap = if opts.measure_cap == 0 { detected.len() } else { opts.measure_cap };
+    let to_measure = &detected[..detected.len().min(effective_cap)];
+    if to_measure.len() < detected.len() {
+        eprintln!("  Measure cap: {} / {} detected", to_measure.len(), detected.len());
+    }
+
     let mut measured = metrics::measure_stars(
-        lum, w, h, &detected,
+        lum, w, h, to_measure,
         bg.background, bg_map_ref,
         green_mask,
         None, // free-beta for pipeline debug
+        opts.fit_max_iter, opts.fit_tolerance, opts.fit_max_rejects,
     );
     eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
     eprintln!("  Measured: {} / {} detected", measured.len(), detected.len());
@@ -1102,6 +1144,7 @@ fn cmd_dump(
         bg.background, bg.background_map.as_deref(),
         green_mask,
         None, // free-beta for debug dump
+        CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
     );
 
     if measured.is_empty() {
@@ -1193,6 +1236,8 @@ struct PiRef {
     eccentricity: f64,
     noise_adu: f64,
     stars: usize,
+    snr: f64,
+    psf_signal_weight: f64,
 }
 
 /// Our measurements for one file.
@@ -1204,6 +1249,9 @@ struct OurResult {
     mean_ecc: f64,
     noise: f64,
     stars: usize,
+    frame_snr: f64,
+    snr_weight: f64,
+    median_snr: f64,
 }
 
 /// Parse a PixInsight SubframeSelector CSV.
@@ -1230,13 +1278,17 @@ fn parse_pi_csv(path: &std::path::Path) -> Result<(Vec<String>, Vec<PiRef>)> {
     let i_ecc = col("Eccentricity")?;
     let i_noise = col("Noise")?;
     let i_stars = col("Stars")?;
+    let i_snr = col("SNR")?;
+    let i_psfw = col("PSF Signal Weight")?;
+    let max_col = i_file.max(i_fwhm).max(i_ecc).max(i_noise).max(i_stars)
+        .max(i_snr).max(i_psfw);
 
     let mut refs = Vec::new();
     for line in &lines[(header_idx + 1)..] {
         if line.trim().is_empty() { continue; }
         // CSV with quoted file paths — split carefully
         let fields = csv_split(line);
-        if fields.len() <= i_file.max(i_fwhm).max(i_ecc).max(i_noise).max(i_stars) {
+        if fields.len() <= max_col {
             continue;
         }
         let file = fields[i_file].trim_matches('"').to_string();
@@ -1244,6 +1296,8 @@ fn parse_pi_csv(path: &std::path::Path) -> Result<(Vec<String>, Vec<PiRef>)> {
         let ecc: f64 = fields[i_ecc].parse().unwrap_or(0.0);
         let noise_norm: f64 = fields[i_noise].parse().unwrap_or(0.0);
         let stars: usize = fields[i_stars].parse().unwrap_or(0);
+        let snr: f64 = fields[i_snr].parse().unwrap_or(0.0);
+        let psf_signal_weight: f64 = fields[i_psfw].parse().unwrap_or(0.0);
 
         refs.push(PiRef {
             file,
@@ -1251,6 +1305,8 @@ fn parse_pi_csv(path: &std::path::Path) -> Result<(Vec<String>, Vec<PiRef>)> {
             eccentricity: ecc,
             noise_adu: noise_norm * 65535.0,
             stars,
+            snr,
+            psf_signal_weight,
         });
     }
 
@@ -1343,6 +1399,7 @@ fn analyze_one_file(
             bg.background, bg_map_ref,
             green_mask.as_deref(),
             None, // free-beta
+            CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
         );
         let beta_vals: Vec<f32> = cal_measured.iter().filter_map(|s| s.beta).collect();
         if beta_vals.len() >= 3 {
@@ -1360,24 +1417,45 @@ fn analyze_one_file(
         bg.background, bg_map_ref,
         green_mask.as_deref(),
         field_beta,
+        CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
     );
+
+    let snr_weight = snr::compute_snr_weight(&lum, bg.background, bg.noise) as f64;
+    let frame_snr = if bg.noise > 0.0 { bg.background as f64 / bg.noise as f64 } else { 0.0 };
 
     if measured.is_empty() {
         return Ok(OurResult {
             median_fwhm: 0.0, mean_fwhm: 0.0,
             median_ecc: 0.0, mean_ecc: 0.0,
             noise: bg.noise as f64, stars: 0,
+            frame_snr, snr_weight, median_snr: 0.0,
         });
     }
 
-    let fwhm_vals: Vec<f32> = measured.iter().map(|s| s.fwhm).collect();
+    // Filter high-eccentricity stars from shape statistics (matching pipeline)
+    const STATS_ECC_MAX: f32 = 0.8;
+    let round: Vec<&metrics::MeasuredStar> = measured.iter()
+        .filter(|s| s.eccentricity <= STATS_ECC_MAX)
+        .collect();
+    let (fwhm_vals, ecc_vals) = if round.len() >= 3 {
+        (
+            round.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
+            round.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
+        )
+    } else {
+        (
+            measured.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
+            measured.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
+        )
+    };
     let median_fwhm = sigma_clipped_median(&fwhm_vals);
     snr::compute_star_snr(&lum, w, h, &mut measured, median_fwhm);
 
-    let ecc_vals: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
     let median_ecc = sigma_clipped_median(&ecc_vals);
     let mean_fwhm: f64 = fwhm_vals.iter().map(|&v| v as f64).sum::<f64>() / fwhm_vals.len() as f64;
     let mean_ecc: f64 = ecc_vals.iter().map(|&v| v as f64).sum::<f64>() / ecc_vals.len() as f64;
+    let snr_vals: Vec<f32> = measured.iter().map(|s| s.snr).collect();
+    let median_snr = sigma_clipped_median(&snr_vals) as f64;
 
     Ok(OurResult {
         median_fwhm: median_fwhm as f64,
@@ -1386,6 +1464,7 @@ fn analyze_one_file(
         mean_ecc,
         noise: bg.noise as f64,
         stars: measured.len(),
+        frame_snr, snr_weight, median_snr,
     })
 }
 
@@ -1416,6 +1495,7 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
         ecc_diff: f64,
         noise_ratio: f64,
         star_ratio: f64,
+        snr_ratio: f64,
     }
 
     let n_files = pi_refs.len();
@@ -1442,6 +1522,9 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
                 let star_ratio = if pi.stars > 0 {
                     ours.stars as f64 / pi.stars as f64
                 } else { 0.0 };
+                let snr_ratio = if pi.snr > 0.0 {
+                    ours.frame_snr / pi.snr
+                } else { 0.0 };
 
                 results.push(FileResult {
                     fname,
@@ -1451,6 +1534,7 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
                     ecc_diff,
                     noise_ratio,
                     star_ratio,
+                    snr_ratio,
                 });
             }
             Err(e) => {
@@ -1471,18 +1555,19 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
 
     // ── Per-file table ──────────────────────────────────────────────────────
     eprintln!();
-    eprintln!("{:<52} {:>7} {:>7} {:>7} {:>7} {:>8} {:>7}",
-        "File", "PI_FWHM", "FWHM", "PI_Ecc", "Ecc", "Noise_r", "Star_r");
-    eprintln!("{}", "-".repeat(102));
+    eprintln!("{:<52} {:>7} {:>7} {:>7} {:>7} {:>8} {:>7} {:>8} {:>8}",
+        "File", "PI_FWHM", "FWHM", "PI_Ecc", "Ecc", "Noise_r", "Star_r", "PI_SNR", "SNR");
+    eprintln!("{}", "-".repeat(120));
 
     let mut sorted = results.iter().collect::<Vec<_>>();
     sorted.sort_by(|a, b| a.fname.cmp(&b.fname));
     for r in &sorted {
-        eprintln!("{:<52} {:>7.3} {:>7.3} {:>7.4} {:>7.4} {:>7.3}x {:>6.2}x",
+        eprintln!("{:<52} {:>7.3} {:>7.3} {:>7.4} {:>7.4} {:>7.3}x {:>6.2}x {:>8.2} {:>8.2}",
             &r.fname[..r.fname.len().min(52)],
             r.pi.fwhm, r.ours.median_fwhm,
             r.pi.eccentricity, r.ours.median_ecc,
-            r.noise_ratio, r.star_ratio);
+            r.noise_ratio, r.star_ratio,
+            r.pi.snr, r.ours.frame_snr);
     }
 
     // ── Aggregate statistics ────────────────────────────────────────────────
@@ -1490,6 +1575,7 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
     let ecc_diffs: Vec<f64> = results.iter().map(|r| r.ecc_diff).collect();
     let noise_rats: Vec<f64> = results.iter().map(|r| r.noise_ratio).collect();
     let star_rats: Vec<f64> = results.iter().map(|r| r.star_ratio).collect();
+    let snr_rats: Vec<f64> = results.iter().map(|r| r.snr_ratio).collect();
 
     // Also compute mean-ecc based offsets for comparison
     let mean_ecc_diffs: Vec<f64> = results.iter()
@@ -1505,20 +1591,26 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
         let m = mean(v);
         (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
     }
+    fn percentile_f64(v: &[f64], p: f64) -> f64 {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((p / 100.0) * (s.len() - 1) as f64).round() as usize;
+        s[idx.min(s.len() - 1)]
+    }
 
     eprintln!();
     eprintln!("=== AGGREGATE ({} files) ===", results.len());
-    eprintln!("{:<22} {:>10} {:>10} {:>10} {:>10}",
-        "", "FWHM %", "Ecc off", "Noise ×", "Stars ×");
-    eprintln!("{}", "-".repeat(66));
-    eprintln!("{:<22} {:>+10.3}% {:>+10.4} {:>10.3}x {:>10.2}x",
-        "Mean", mean(&fwhm_pcts), mean(&ecc_diffs), mean(&noise_rats), mean(&star_rats));
-    eprintln!("{:<22} {:>+10.3}% {:>+10.4} {:>10.3}x {:>10.2}x",
+    eprintln!("{:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "", "FWHM %", "Ecc off", "Noise ×", "Stars ×", "SNR ×");
+    eprintln!("{}", "-".repeat(76));
+    eprintln!("{:<22} {:>+10.3}% {:>+10.4} {:>10.3}x {:>10.2}x {:>10.3}x",
+        "Mean", mean(&fwhm_pcts), mean(&ecc_diffs), mean(&noise_rats), mean(&star_rats), mean(&snr_rats));
+    eprintln!("{:<22} {:>+10.3}% {:>+10.4} {:>10.3}x {:>10.2}x {:>10.3}x",
         "Median", median_f64(&fwhm_pcts), median_f64(&ecc_diffs),
-        median_f64(&noise_rats), median_f64(&star_rats));
-    eprintln!("{:<22} {:>10.3}% {:>10.4} {:>10.3}x {:>10.2}x",
+        median_f64(&noise_rats), median_f64(&star_rats), median_f64(&snr_rats));
+    eprintln!("{:<22} {:>10.3}% {:>10.4} {:>10.3}x {:>10.2}x {:>10.3}x",
         "Std dev", std_dev(&fwhm_pcts), std_dev(&ecc_diffs),
-        std_dev(&noise_rats), std_dev(&star_rats));
+        std_dev(&noise_rats), std_dev(&star_rats), std_dev(&snr_rats));
 
     // Ecc with mean vs median
     eprintln!();
@@ -1529,23 +1621,80 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
         mean(&mean_ecc_diffs), median_f64(&mean_ecc_diffs));
 
     // ── Linear regression: PI_ecc = a × our_ecc + b ────────────────────────
+    fn linear_regression(xs: &[f64], ys: &[f64]) -> (f64, f64, f64) {
+        let mx = mean(xs);
+        let my = mean(ys);
+        let sxx: f64 = xs.iter().map(|x| (x - mx).powi(2)).sum();
+        let sxy: f64 = xs.iter().zip(ys.iter())
+            .map(|(x, y)| (x - mx) * (y - my)).sum();
+        let slope = sxy / sxx;
+        let intercept = my - slope * mx;
+        let ss_res: f64 = xs.iter().zip(ys.iter())
+            .map(|(x, y)| (y - (slope * x + intercept)).powi(2)).sum();
+        let ss_tot: f64 = ys.iter().map(|y| (y - my).powi(2)).sum();
+        let r_sq = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
+        (slope, intercept, r_sq)
+    }
+
     let our_eccs: Vec<f64> = results.iter().map(|r| r.ours.median_ecc).collect();
     let pi_eccs: Vec<f64> = results.iter().map(|r| r.pi.eccentricity).collect();
-    let mx = mean(&our_eccs);
-    let my = mean(&pi_eccs);
-    let sxx: f64 = our_eccs.iter().map(|x| (x - mx).powi(2)).sum();
-    let sxy: f64 = our_eccs.iter().zip(pi_eccs.iter())
-        .map(|(x, y)| (x - mx) * (y - my)).sum();
-    let slope = sxy / sxx;
-    let intercept = my - slope * mx;
-    let ss_res: f64 = our_eccs.iter().zip(pi_eccs.iter())
-        .map(|(x, y)| (y - (slope * x + intercept)).powi(2)).sum();
-    let ss_tot: f64 = pi_eccs.iter().map(|y| (y - my).powi(2)).sum();
-    let r_sq = 1.0 - ss_res / ss_tot;
+    let (ecc_slope, ecc_intercept, ecc_r_sq) = linear_regression(&our_eccs, &pi_eccs);
 
     eprintln!();
     eprintln!("Eccentricity regression: PI = {:.4} × ours + {:.4}  (R²={:.4})",
-        slope, intercept, r_sq);
+        ecc_slope, ecc_intercept, ecc_r_sq);
+
+    // Ecc percentiles
+    eprintln!();
+    eprintln!("Eccentricity offset percentiles:");
+    eprintln!("  P10={:+.4}  P25={:+.4}  P50={:+.4}  P75={:+.4}  P90={:+.4}",
+        percentile_f64(&ecc_diffs, 10.0), percentile_f64(&ecc_diffs, 25.0),
+        percentile_f64(&ecc_diffs, 50.0), percentile_f64(&ecc_diffs, 75.0),
+        percentile_f64(&ecc_diffs, 90.0));
+
+    // ── SNR analysis ────────────────────────────────────────────────────────
+    let our_snrs: Vec<f64> = results.iter().map(|r| r.ours.frame_snr).collect();
+    let pi_snrs: Vec<f64> = results.iter().map(|r| r.pi.snr).collect();
+    let (snr_slope, snr_intercept, snr_r_sq) = linear_regression(&our_snrs, &pi_snrs);
+
+    eprintln!();
+    eprintln!("=== FRAME SNR ANALYSIS ===");
+    eprintln!("  Our frame_snr = bg / noise;  PI SNR = their image SNR metric");
+    eprintln!();
+    eprintln!("  SNR ratio (ours/PI):  mean={:.3}x  median={:.3}x  std={:.3}x",
+        mean(&snr_rats), median_f64(&snr_rats), std_dev(&snr_rats));
+    eprintln!("  Regression: PI_SNR = {:.4} × ours + {:.4}  (R²={:.4})",
+        snr_slope, snr_intercept, snr_r_sq);
+    eprintln!("  Percentiles:");
+    eprintln!("    P10={:.3}x  P25={:.3}x  P50={:.3}x  P75={:.3}x  P90={:.3}x",
+        percentile_f64(&snr_rats, 10.0), percentile_f64(&snr_rats, 25.0),
+        percentile_f64(&snr_rats, 50.0), percentile_f64(&snr_rats, 75.0),
+        percentile_f64(&snr_rats, 90.0));
+
+    // SNR Weight comparison (our snr_weight vs PI PSF Signal Weight)
+    let our_snrw: Vec<f64> = results.iter().map(|r| r.ours.snr_weight).collect();
+    let pi_psfw: Vec<f64> = results.iter().map(|r| r.pi.psf_signal_weight).collect();
+    let snrw_rats: Vec<f64> = our_snrw.iter().zip(pi_psfw.iter())
+        .map(|(o, p)| if *p > 0.0 { o / p } else { 0.0 }).collect();
+    let (snrw_slope, snrw_intercept, snrw_r_sq) = linear_regression(&our_snrw, &pi_psfw);
+
+    eprintln!();
+    eprintln!("=== SNR WEIGHT vs PI PSF SIGNAL WEIGHT ===");
+    eprintln!("  Our: (MeanDev/noise)²;  PI: PSF Signal Weight");
+    eprintln!();
+    eprintln!("  Weight ratio (ours/PI):  mean={:.3}x  median={:.3}x  std={:.3}x",
+        mean(&snrw_rats), median_f64(&snrw_rats), std_dev(&snrw_rats));
+    eprintln!("  Regression: PI_PSFw = {:.6} × ours + {:.6}  (R²={:.4})",
+        snrw_slope, snrw_intercept, snrw_r_sq);
+
+    // Median per-star SNR summary
+    let our_msnrs: Vec<f64> = results.iter().map(|r| r.ours.median_snr).collect();
+    eprintln!();
+    eprintln!("=== MEDIAN PER-STAR SNR ===");
+    eprintln!("  mean={:.1}  median={:.1}  min={:.1}  max={:.1}",
+        mean(&our_msnrs), median_f64(&our_msnrs),
+        our_msnrs.iter().cloned().fold(f64::INFINITY, f64::min),
+        our_msnrs.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
 
     // ── Subgroup analysis (by exposure time pattern) ────────────────────────
     let groups: Vec<(&str, Box<dyn Fn(&FileResult) -> bool>)> = vec![
@@ -1560,6 +1709,8 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
         let ed: Vec<f64> = sub.iter().map(|r| r.ecc_diff).collect();
         let nr: Vec<f64> = sub.iter().map(|r| r.noise_ratio).collect();
         let sr: Vec<f64> = sub.iter().map(|r| r.star_ratio).collect();
+        let snr_r: Vec<f64> = sub.iter().map(|r| r.snr_ratio).collect();
+        let ms: Vec<f64> = sub.iter().map(|r| r.ours.median_snr).collect();
         eprintln!();
         eprintln!("--- {} (n={}) ---", label, sub.len());
         eprintln!("  FWHM:  mean={:+.3}%  median={:+.3}%  std={:.3}%",
@@ -1570,6 +1721,10 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
             mean(&nr), median_f64(&nr));
         eprintln!("  Stars: mean={:.2}x  median={:.2}x",
             mean(&sr), median_f64(&sr));
+        eprintln!("  SNR:   mean={:.3}x  median={:.3}x  (frame_snr ratio)",
+            mean(&snr_r), median_f64(&snr_r));
+        eprintln!("  Star SNR: mean={:.1}  median={:.1}  (our median per-star SNR)",
+            mean(&ms), median_f64(&ms));
     }
 
     // ── Worst outliers ──────────────────────────────────────────────────────
@@ -1599,6 +1754,19 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
             r.fwhm_pct, r.star_ratio);
     }
 
+    let mut by_snr = results.iter().collect::<Vec<_>>();
+    by_snr.sort_by(|a, b| (b.snr_ratio - 1.0).abs().partial_cmp(&(a.snr_ratio - 1.0).abs()).unwrap());
+    eprintln!();
+    eprintln!("=== WORST FRAME SNR OUTLIERS ===");
+    eprintln!("{:<48} {:>8} {:>8} {:>7} {:>7} {:>7}",
+        "File", "PI_SNR", "OurSNR", "Ratio", "FWHM%", "Noise×");
+    for r in by_snr.iter().take(5) {
+        eprintln!("{:<48} {:>8.2} {:>8.2} {:>6.3}x {:>+6.2}% {:>6.3}x",
+            &r.fname[..r.fname.len().min(48)],
+            r.pi.snr, r.ours.frame_snr, r.snr_ratio,
+            r.fwhm_pct, r.noise_ratio);
+    }
+
     // Errors
     if !errors.is_empty() {
         eprintln!();
@@ -1609,13 +1777,15 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
     }
 
     // TSV to stdout for downstream analysis
-    println!("file\tpi_fwhm\tours_fwhm\tfwhm_pct\tpi_ecc\tours_ecc\tours_mean_ecc\tecc_diff\tpi_noise\tours_noise\tnoise_ratio\tpi_stars\tours_stars\tstar_ratio");
+    println!("file\tpi_fwhm\tours_fwhm\tfwhm_pct\tpi_ecc\tours_ecc\tours_mean_ecc\tecc_diff\tpi_noise\tours_noise\tnoise_ratio\tpi_stars\tours_stars\tstar_ratio\tpi_snr\tours_frame_snr\tsnr_ratio\tours_snr_weight\tpi_psf_signal_weight\tours_median_snr");
     for r in &results {
-        println!("{}\t{:.4}\t{:.4}\t{:+.3}\t{:.4}\t{:.4}\t{:.4}\t{:+.4}\t{:.2}\t{:.2}\t{:.4}\t{}\t{}\t{:.3}",
+        println!("{}\t{:.4}\t{:.4}\t{:+.3}\t{:.4}\t{:.4}\t{:.4}\t{:+.4}\t{:.2}\t{:.2}\t{:.4}\t{}\t{}\t{:.3}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.1}",
             r.fname, r.pi.fwhm, r.ours.median_fwhm, r.fwhm_pct,
             r.pi.eccentricity, r.ours.median_ecc, r.ours.mean_ecc, r.ecc_diff,
             r.pi.noise_adu, r.ours.noise, r.noise_ratio,
-            r.pi.stars, r.ours.stars, r.star_ratio);
+            r.pi.stars, r.ours.stars, r.star_ratio,
+            r.pi.snr, r.ours.frame_snr, r.snr_ratio,
+            r.ours.snr_weight, r.pi.psf_signal_weight, r.ours.median_snr);
     }
 
     Ok(())

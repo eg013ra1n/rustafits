@@ -4,8 +4,9 @@ The analysis module performs automatic star detection, PSF measurement, and imag
 assessment on astronomical images. It outputs per-star metrics and image-wide statistics
 suitable for subframe evaluation and stacking weight computation.
 
-All detected stars are measured and contribute to statistics — no artificial cap on
-measurement count. Statistics reflect the full stellar population.
+A configurable measure cap (default 2000) limits how many stars undergo PSF fitting.
+Stars are sorted by flux (brightest first) before capping. Statistics reflect the
+measured population, while `stars_detected` reports the raw detection count.
 
 ## Data Flow
 
@@ -45,7 +46,7 @@ FITS / XISF File
 | -> noise sigma (ADU)          |  Bicubic interpolation between cell medians
 | -> bg/noise maps              |
 |                               |
-| Noise: MRS wavelet (default)  |  B3-spline à trous wavelet, layer 1 coefficients
+| Noise: MRS wavelet (default)  |  B3-spline à trous wavelet, 4-layer significance masking
 |   (configurable layers via    |  Isolates noise from nebulosity/gradients
 |    with_mrs_layers)            |
 +-------------------------------+
@@ -91,27 +92,35 @@ FITS / XISF File
        |
        v
 +-------------------------------+
-| PSF Measurement (ALL stars)   |  Extract stamp around each detected star
+| Measure Cap                   |  Slice detected stars to measure_cap (default 2000)
+| stars_detected = raw count    |  Stars already sorted by flux (brightest first)
+| 0 = measure all               |  Brightest stars have highest-SNR fits
++-------------------------------+
+       |
+       v
++-------------------------------+
+| PSF Measurement (capped)      |  Extract stamp around each star to measure
 | -> FWHM (x, y, geometric)    |  Fixed-beta Moffat (pass 2): beta = field_beta
 | -> Eccentricity               |  Fallback chain: Moffat -> Gaussian -> Moments
 | -> HFR, theta                 |  FitMethod tracked per star (Moffat/Gaussian/Moments)
 | -> Moffat beta                |  Moments-based theta (always computed)
 |                               |  OSC: only green CFA pixels fed to fitter
 |                               |  Stars that fail all fitting are excluded
+|                               |  LM: configurable max_iter/conv_tol/max_rejects
 +-------------------------------+
        |
        v
 +-------------------------------+
-| Per-Star SNR (ALL measured)   |  Aperture photometry with local sky annulus
+| Per-Star SNR (all measured)   |  Aperture photometry with local sky annulus
 | -> aperture flux              |  CCD noise equation: SNR = F / sqrt(F + n*sigma^2)
 | -> local background           |  Aperture radius = 2.5 * median_fwhm
 +-------------------------------+
        |
        v
 +-------------------------------+
-| Statistics (full population)  |  Computed from ALL measured stars, not a subset
+| Statistics (measured stars)   |  Computed from all measured stars (after cap)
 | -> median FWHM                |
-| -> median eccentricity        |  stars_detected = total with valid measurements
+| -> median eccentricity        |  stars_detected = raw detection count (before cap)
 | -> median SNR, HFR            |
 | -> median Moffat beta         |
 +-------------------------------+
@@ -150,7 +159,7 @@ Stars are filtered during detection (before measurement) by:
 | Border | Touches image edge | Truncated PSFs |
 | Aspect ratio | Bounding box > 8:1 | Cosmic rays (aspect ~20-100), satellite trails (~50+) |
 
-All stars with valid measurements contribute to statistics.
+All measured stars (after measure cap) contribute to statistics.
 
 ## Module Map
 
@@ -208,7 +217,11 @@ are now fixed defaults.
 | Max star area | 2000 px | `with_max_star_area(u32)` | Reject extended objects larger than N pixels |
 | Saturation fraction | 0.95 | `with_saturation_fraction(f32)` | Fraction of 65535 above which stars are rejected |
 | Max stars | 5000 | `with_max_stars(usize)` | Late cap on returned per-star vector (statistics use all) |
-| MRS noise layers | 1 | `with_mrs_layers(u32)` | Number of wavelet layers for noise estimation |
+| Measure cap | 2000 | `with_measure_cap(usize)` | Max stars to PSF-fit (0 = all). Dense fields benefit most. |
+| Fit max iter | 25 | `with_fit_max_iter(usize)` | LM max iterations for measurement pass (calibration always 50) |
+| Fit tolerance | 1e-4 | `with_fit_tolerance(f64)` | LM convergence tolerance for measurement pass (calibration always 1e-6) |
+| Fit max rejects | 5 | `with_fit_max_rejects(usize)` | LM consecutive reject bailout |
+| MRS noise layers | 4 | `with_mrs_layers(usize)` | Wavelet layers for iterative significance masking |
 | Trail threshold | 0.5 | `with_trail_threshold(f32)` | R^2 threshold for trail advisory flag |
 | Debayer | auto | `with_debayer(bool)` | Force debayer on/off for OSC data |
 | Thread pool | None | `with_thread_pool(Arc<ThreadPool>)` | Optional shared Rayon thread pool |

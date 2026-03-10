@@ -62,7 +62,7 @@ let result = ImageAnalyzer::new()
     .analyze("light.fits")?;
 
 // Defaults: two-pass Moffat calibration, mesh-grid background (auto cell size),
-// MRS wavelet noise (1 layer), detection sigma 5.0
+// MRS wavelet noise (4 layers), detection sigma 5.0
 ```
 
 ### Key `AnalysisResult` Fields
@@ -109,7 +109,7 @@ let result = ImageAnalyzer::new()
 | `with_max_star_area(usize)` | 2000 | Max area (filters galaxies/nebulae). |
 | `with_saturation_fraction(f32)` | 0.95 | Reject stars above this fraction of 65535. |
 | `with_max_stars(usize)` | 200 | Keep only the brightest N stars in returned result. |
-| `with_mrs_layers(usize)` | 1 | MRS wavelet noise layers. |
+| `with_mrs_layers(usize)` | 4 | MRS wavelet noise layers with iterative significance masking. |
 | `without_debayer()` | debayer on | Skip green-channel interpolation for OSC. |
 | `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection. |
 | `with_thread_pool(pool)` | global | Route parallel work to a custom rayon pool. |
@@ -129,7 +129,7 @@ let result = ImageAnalyzer::new()
 ```
 
 This uses the defaults: two-pass Moffat calibration, mesh-grid background (auto cell
-size), MRS wavelet noise (1 layer), detection sigma 5.0. These defaults are well-tested
+size), MRS wavelet noise (4 layers with significance masking), detection sigma 5.0. These defaults are well-tested
 across all image types (mono, OSC, dense fields, nebulae).
 
 ### PixInsight-Compatible Settings
@@ -151,7 +151,7 @@ let result = ImageAnalyzer::new()
 |--------|----------------|-------|
 | **FWHM** | -0.3% median bias | Near-perfect match |
 | **Eccentricity** | -0.067 offset, R²=0.984 | Systematic methodology difference (see below) |
-| **Noise** | 0.92x PI | MRS wavelet noise (default 1 layer) |
+| **Noise** | ~PI | MRS wavelet noise (default 4 layers, significance masking) |
 | **Star count** | ~3x PI | We detect more faint stars |
 
 #### Eccentricity methodology note
@@ -168,7 +168,7 @@ calibration difference, or applying a linear correction for display purposes.
 
 | Setting | Use when |
 |---------|----------|
-| `with_mrs_layers(n)` | Increase wavelet layers for nebula-rich fields (e.g., `with_mrs_layers(2)`). Default 1 layer is sufficient for most images. |
+| `with_mrs_layers(n)` | Default 4 layers matches PixInsight. Decrease to 1 for speed if noise accuracy is not critical. |
 
 For general-purpose Athenaeum use, the defaults give the best overall results:
 accurate FWHM, stable eccentricity, and high star counts for field coverage.
@@ -354,7 +354,118 @@ let analyzer = ImageAnalyzer::new()
 
 ---
 
-## 6. Full Integration Example
+## 6. Batch Analysis Performance
+
+### How It Works
+
+`analyze()` is CPU-bound — each call uses rayon internally for parallel PSF fitting,
+background estimation, and wavelet transforms. Each call has serial gaps between stages
+(background → detection → fitting → stats) where pool threads briefly idle.
+
+On a typical 26-megapixel frame (release build):
+
+| Field type | Stars | Time per frame |
+|---|---|---|
+| Dense (cocoon) | ~115K | ~4.6s |
+| Sparse (mono) | ~5.7K | ~1.4s |
+| OSC | ~4.6K | ~1.2s |
+
+### Key Requirement: Shared Thread Pool
+
+All concurrent `analyze()` calls **must** share a single rayon pool via
+`with_thread_pool()`. With a shared pool, multiple frames submit work to the same N
+threads — rayon's work-stealing handles queuing, no oversubscription occurs. Without a
+shared pool, each frame may contend on the global pool without `pool.install()` routing,
+losing control over thread allocation.
+
+```rust
+use std::sync::Arc;
+use astroimage::{ImageAnalyzer, ThreadPoolBuilder};
+
+let pool = Arc::new(
+    ThreadPoolBuilder::new()
+        .num_threads(num_cpus::get())
+        .build()?
+);
+
+let analyzer = ImageAnalyzer::new()
+    .with_thread_pool(pool.clone());
+```
+
+### Recommended Concurrency: buffer_unordered(2)
+
+With a shared pool, moderate concurrency **helps** — while frame A is in a serial
+section between stages, frame B's parallel work keeps the pool threads busy.
+
+```rust
+// GOOD: 2 concurrent frames, shared pool fills serial gaps
+let results = stream::iter(files)
+    .map(|path| {
+        let analyzer = analyzer.clone();
+        tokio::task::spawn_blocking(move || analyzer.analyze(&path))
+    })
+    .buffer_unordered(2)
+    .collect::<Vec<_>>()
+    .await;
+```
+
+**Why not higher?** Each in-flight frame needs several full-image buffers (~200MB for
+26MP). At concurrency 4, that's ~800MB competing for L2/L3 cache, causing thrashing
+that offsets the scheduling benefit. Concurrency 2 is the sweet spot: good pool
+utilization without excessive memory/cache pressure.
+
+| Concurrency | CPU utilization | Memory per frame | Cache behavior |
+|---|---|---|---|
+| `buffered(1)` | Threads idle during serial gaps | ~200MB | Clean |
+| `buffer_unordered(2)` | Good — gaps filled by second frame | ~400MB | Mild pressure |
+| `buffer_unordered(4)` | Marginally better than 2 | ~800MB | Thrashing |
+
+### Migration from buffer_unordered(4)
+
+Change concurrency from 4 to 2 and ensure a shared thread pool:
+
+```rust
+// Before: no shared pool, high concurrency
+let analyzer = ImageAnalyzer::new();
+// ... buffer_unordered(4)
+
+// After: shared pool, concurrency 2
+let pool = Arc::new(ThreadPoolBuilder::new().num_threads(num_cpus::get()).build()?);
+let analyzer = ImageAnalyzer::new()
+    .with_thread_pool(pool.clone());
+// ... buffer_unordered(2)
+```
+
+### Speed Tuning for Batch
+
+For batch frame ranking where speed matters more than maximum accuracy:
+
+```rust
+let analyzer = ImageAnalyzer::new()
+    .with_mrs_layers(1)       // 1 layer: ~15% faster background stage
+    .with_max_stars(50)       // fewer star records returned (stats still use all)
+    .with_thread_pool(pool.clone());
+```
+
+| Optimization | Speedup | Trade-off |
+|---|---|---|
+| `with_mrs_layers(1)` | ~10-15% | Less accurate noise on nebula-rich fields |
+| `with_max_stars(50)` | Negligible | Fewer star records in output (medians unchanged) |
+| Shared pool + concurrency 2 | ~15-25% vs no pool + concurrency 4 | Requires pool setup |
+
+### Expected Batch Throughput (Release Build)
+
+For 100 frames of 26-megapixel data on an 8-core machine:
+
+| Approach | Dense field | Sparse field |
+|---|---|---|
+| No shared pool, `buffer_unordered(4)` | ~500-600s | ~180-200s |
+| Shared pool, `buffer_unordered(2)` | ~380-420s | ~110-130s |
+| Shared pool, `buffer_unordered(2)`, mrs_layers(1) | ~330-370s | ~95-115s |
+
+---
+
+## 7. Full Integration Example
 
 Complete workflow: convert, analyze, and annotate with toggleable overlay.
 
@@ -386,7 +497,7 @@ let image = ImageConverter::new()
     .process("light_001.fits")?;
 
 // Defaults handle everything: two-pass Moffat calibration,
-// mesh-grid background (auto cell size), MRS wavelet noise (1 layer)
+// mesh-grid background (auto cell size), MRS wavelet noise (4 layers)
 let result = ImageAnalyzer::new()
     .with_max_stars(500)             // Return top 500 stars for annotation
     .with_thread_pool(pool.clone())
@@ -431,20 +542,20 @@ is needed. To increase wavelet layers for nebula-rich fields:
 
 ```rust
 let result = ImageAnalyzer::new()
-    .with_mrs_layers(2)              // Extra wavelet layer for heavy nebulosity
+    .with_mrs_layers(4)              // Default: 4-layer significance masking
     .with_max_stars(500)
     .with_thread_pool(pool.clone())
     .analyze("light_001.fits")?;
 
 // FWHM will be within ~0.3% of PI SubframeSelector
 // Eccentricity will be ~0.067 lower than PI (methodology difference)
-// Noise will be ~0.92x PI (MRS wavelet noise)
+// Noise matches PI (MRS wavelet noise, 4 layers with significance masking)
 // Star count will be ~3x PI (we detect more faint stars)
 ```
 
 ---
 
-## 7. Integration Recommendations
+## 8. Integration Recommendations
 
 ### Subframe inspector columns
 
@@ -497,7 +608,7 @@ Each reveals different quality issues:
 
 ---
 
-## 8. Public Exports
+## 9. Public Exports
 
 All types and functions are re-exported from the crate root:
 
@@ -530,7 +641,7 @@ use astroimage::{
 
 ---
 
-## 9. Migrating from v0.6.x to v0.7.0
+## 10. Migrating from v0.6.x to v0.7.0
 
 This section covers every change needed in the Athenaeum codebase to upgrade from
 rustafits v0.6.4 to v0.7.0.
@@ -548,7 +659,7 @@ rustafits v0.6.4 to v0.7.0.
 - Two-pass Moffat calibration (free-beta pass 1 → fixed-beta pass 2)
 - Mesh-grid background with auto cell size: `max(16, max(w,h)/32)`
 - Source-mask background re-estimation (always one pass after calibration)
-- MRS wavelet noise (default 1 layer)
+- MRS wavelet noise (default 4 layers, iterative significance masking)
 - Moffat → Gaussian → Moments fallback chain
 
 **New fields:**
@@ -558,7 +669,7 @@ rustafits v0.6.4 to v0.7.0.
 
 **Behavioral changes:**
 - `median_beta` is now always populated (`Some(...)`) — Moffat fitting can't be disabled
-- Default noise estimation changed from MAD to MRS wavelet (1 layer)
+- Default noise estimation changed from MAD to MRS wavelet (4 layers)
 - Default background changed from global to mesh-grid (auto cell size)
 - Accuracy vs PixInsight improved: FWHM -0.3% median (was +1.1%), ecc R²=0.984
 
@@ -568,7 +679,7 @@ rustafits v0.6.4 to v0.7.0.
 - `with_max_star_area(usize)` — default 2000
 - `with_saturation_fraction(f32)` — default 0.95
 - `with_max_stars(usize)` — default 200
-- `with_mrs_layers(usize)` — default 1
+- `with_mrs_layers(usize)` — default 4
 - `with_trail_threshold(f32)` — default 0.5
 - `without_debayer()` — skip OSC green interpolation
 - `with_thread_pool(Arc<ThreadPool>)` — custom rayon pool
@@ -677,7 +788,7 @@ Remove fields that no longer map to builder methods:
 | `iterative_background: u32` | Remove — always-on (one re-estimation) |
 | `moffat_beta: Option<f32>` | Remove — auto-derived from calibration |
 | `max_distortion: Option<f32>` | Remove — distortion filter removed |
-| `mrs_noise: u32` | Rename to `mrs_layers: u32`, change default from `0` to `1` |
+| `mrs_noise: u32` | Rename to `mrs_layers: u32`, change default from `0` to `4` |
 
 Remove the corresponding `default_*` helper functions (`default_true`, `default_one`,
 `default_mesh_64`, `default_mrs_0`).

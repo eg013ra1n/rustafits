@@ -365,7 +365,6 @@ pub fn b3_spline_smooth(
 /// # Panics
 ///
 /// Panics if `layer` is 0.
-#[cfg(test)]
 pub fn b3_spline_smooth_dilated(
     data: &[f32],
     width: usize,

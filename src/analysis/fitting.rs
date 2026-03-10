@@ -1,8 +1,14 @@
 /// Levenberg-Marquardt 2D elliptical Gaussian fitting (7-param).
 /// All internal computations in f64 for numerical stability.
 
-const MAX_ITER: usize = 50;
-const CONV_TOL: f64 = 1e-6;
+/// Default LM solver parameters for calibration pass (full precision).
+/// Used by the debug binary and tests; the library API passes values explicitly.
+#[allow(dead_code)]
+pub const CALIBRATION_MAX_ITER: usize = 50;
+#[allow(dead_code)]
+pub const CALIBRATION_CONV_TOL: f64 = 1e-6;
+#[allow(dead_code)]
+pub const CALIBRATION_MAX_REJECTS: usize = 5;
 
 /// 2D Gaussian model: f(x,y) = B + A * exp(-0.5 * Q(x,y))
 /// Q(x,y) = u^2/sx^2 + v^2/sy^2
@@ -30,6 +36,9 @@ pub struct PixelSample {
 
 /// Fit 2D elliptical Gaussian with 7 parameters (including theta).
 /// Caller provides per-axis sigma and theta initialisation from moments.
+///
+/// `max_iter`, `conv_tol`, `max_rejects` control LM solver convergence.
+/// Use `CALIBRATION_*` constants for full-precision calibration fits.
 pub fn fit_gaussian_2d(
     pixels: &[PixelSample],
     init_b: f64,
@@ -39,13 +48,16 @@ pub fn fit_gaussian_2d(
     init_sigma_x: f64,
     init_sigma_y: f64,
     init_theta: f64,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
 ) -> Option<Gaussian2DResult> {
     if pixels.len() < 10 {
         return None;
     }
 
     let mut params = [init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta];
-    let converged = lm_solve_2d(pixels, &mut params, true);
+    let converged = lm_solve_2d(pixels, &mut params, true, max_iter, conv_tol, max_rejects);
 
     let sigma_x = params[4].abs();
     let sigma_y = params[5].abs();
@@ -74,13 +86,14 @@ pub fn fit_gaussian_2d(
 }
 
 /// LM solver for 2D Gaussian. If `fit_theta` is true, uses 7 params; else 6 (theta=0).
-fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> bool {
+fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool, max_iter: usize, conv_tol: f64, max_rejects: usize) -> bool {
     let np = if fit_theta { 7 } else { 6 };
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
     let mut best_cost = residual_cost_2d(pixels, params, fit_theta);
     let mut prev_cost: f64;
     let mut converged = false;
+    let mut consecutive_rejects: usize = 0;
 
     // Scratch space for normal equations
     let mut jtj = vec![0.0_f64; np * np];
@@ -89,7 +102,7 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
     let mut mat = vec![0.0_f64; np * np];
     let mut new_params = [0.0_f64; 7];
 
-    for _ in 0..MAX_ITER {
+    for _ in 0..max_iter {
         // Zero out
         jtj.fill(0.0);
         jtr.fill(0.0);
@@ -188,6 +201,10 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
         {
             lambda *= nu;
             nu *= 2.0;
+            consecutive_rejects += 1;
+            if consecutive_rejects >= max_rejects {
+                break;
+            }
             continue;
         }
 
@@ -210,19 +227,28 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool) -> b
                 lambda *= (1.0_f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3));
                 nu = 2.0;
                 step_accepted = true;
+                consecutive_rejects = 0;
             } else {
                 lambda *= nu;
                 nu *= 2.0;
+                consecutive_rejects += 1;
+                if consecutive_rejects >= max_rejects {
+                    break;
+                }
             }
         } else {
             lambda *= nu;
             nu *= 2.0;
+            consecutive_rejects += 1;
+            if consecutive_rejects >= max_rejects {
+                break;
+            }
         }
 
         // Dual convergence criterion
         let param_norm = params[..np].iter().map(|p| p * p).sum::<f64>().sqrt();
         let delta_norm = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
-        let param_converged = delta_norm / param_norm.max(1e-12) < CONV_TOL;
+        let param_converged = delta_norm / param_norm.max(1e-12) < conv_tol;
         let residual_converged = if step_accepted && best_cost > 0.0 {
             (prev_cost - best_cost).abs() / best_cost < 1e-4
         } else {
@@ -351,8 +377,11 @@ pub fn fit_moffat_2d(
     init_sigma_x: f64,
     init_sigma_y: f64,
     init_theta: f64,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, None)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, None, max_iter, conv_tol, max_rejects)
 }
 
 /// Fit 2D elliptical Moffat with fixed beta (7 free parameters).
@@ -370,8 +399,11 @@ pub fn fit_moffat_2d_fixed_beta(
     init_sigma_y: f64,
     init_theta: f64,
     beta: f64,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, Some(beta))
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, Some(beta), max_iter, conv_tol, max_rejects)
 }
 
 /// Evaluate the 2D Moffat model at a single point.
@@ -401,6 +433,9 @@ fn fit_moffat_2d_impl(
     init_sigma_y: f64,
     init_theta: f64,
     fixed_beta: Option<f64>,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
 ) -> Option<Moffat2DResult> {
     if pixels.len() < 12 {
         return None;
@@ -413,7 +448,7 @@ fn fit_moffat_2d_impl(
     let alpha_y = init_sigma_y * 2.3548 / (2.0 * moffat_scale);
 
     let mut params = [init_b, init_a, init_x0, init_y0, alpha_x, alpha_y, init_theta, beta_init];
-    let converged = lm_solve_moffat_impl(pixels, &mut params, fixed_beta);
+    let converged = lm_solve_moffat_impl(pixels, &mut params, fixed_beta, max_iter, conv_tol, max_rejects);
 
     let alpha_x = params[4].abs();
     let alpha_y = params[5].abs();
@@ -449,13 +484,14 @@ fn fit_moffat_2d_impl(
 
 /// LM solver for 2D Moffat. When `fixed_beta` is `Some(b)`, beta is held constant
 /// and only 7 parameters are optimized. When `None`, all 8 parameters are free.
-fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: Option<f64>) -> bool {
+fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: Option<f64>, max_iter: usize, conv_tol: f64, max_rejects: usize) -> bool {
     let np = if fixed_beta.is_some() { 7 } else { 8 };
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
     let mut best_cost = residual_cost_moffat(pixels, params);
     let mut prev_cost: f64;
     let mut converged = false;
+    let mut consecutive_rejects: usize = 0;
 
     let mut jtj = vec![0.0_f64; np * np];
     let mut jtr = vec![0.0_f64; np];
@@ -463,7 +499,7 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
     let mut mat = vec![0.0_f64; np * np];
     let mut new_params = [0.0_f64; 8];
 
-    for _ in 0..MAX_ITER {
+    for _ in 0..max_iter {
         jtj.fill(0.0);
         jtr.fill(0.0);
 
@@ -572,6 +608,10 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
         {
             lambda *= nu;
             nu *= 2.0;
+            consecutive_rejects += 1;
+            if consecutive_rejects >= max_rejects {
+                break;
+            }
             continue;
         }
 
@@ -593,19 +633,28 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
                 lambda *= (1.0_f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3));
                 nu = 2.0;
                 step_accepted = true;
+                consecutive_rejects = 0;
             } else {
                 lambda *= nu;
                 nu *= 2.0;
+                consecutive_rejects += 1;
+                if consecutive_rejects >= max_rejects {
+                    break;
+                }
             }
         } else {
             lambda *= nu;
             nu *= 2.0;
+            consecutive_rejects += 1;
+            if consecutive_rejects >= max_rejects {
+                break;
+            }
         }
 
         // Dual convergence criterion
         let param_norm = params[..np].iter().map(|p| p * p).sum::<f64>().sqrt();
         let delta_norm = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
-        let param_converged = delta_norm / param_norm.max(1e-12) < CONV_TOL;
+        let param_converged = delta_norm / param_norm.max(1e-12) < conv_tol;
         let residual_converged = if step_accepted && best_cost > 0.0 {
             (prev_cost - best_cost).abs() / best_cost < 1e-4
         } else {
@@ -664,7 +713,7 @@ mod tests {
             }
         }
 
-        let result = fit_gaussian_2d(&pixels, 100.0, 5000.0, 10.0, 10.0, 3.0, 3.0, 0.0).unwrap();
+        let result = fit_gaussian_2d(&pixels, 100.0, 5000.0, 10.0, 10.0, 3.0, 3.0, 0.0, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
         assert!(result.converged);
         assert!((result.sigma_x - 3.0).abs() < 0.1, "sx: {}", result.sigma_x);
         assert!((result.sigma_y - 3.0).abs() < 0.1, "sy: {}", result.sigma_y);
@@ -695,7 +744,7 @@ mod tests {
             }
         }
 
-        let result = fit_gaussian_2d(&pixels, 50.0, 8000.0, 12.0, 12.0, 3.0, 3.0, 0.0).unwrap();
+        let result = fit_gaussian_2d(&pixels, 50.0, 8000.0, 12.0, 12.0, 3.0, 3.0, 0.0, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
         assert!(result.converged);
         let min_s = result.sigma_x.min(result.sigma_y);
         let max_s = result.sigma_x.max(result.sigma_y);
@@ -728,7 +777,7 @@ mod tests {
         }
 
         // Provide moments-based init: theta=π/4, per-axis sigmas close to truth
-        let result = fit_gaussian_2d(&pixels, 50.0, 8000.0, 12.0, 12.0, 2.0, 5.0, theta).unwrap();
+        let result = fit_gaussian_2d(&pixels, 50.0, 8000.0, 12.0, 12.0, 2.0, 5.0, theta, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
         assert!(result.converged, "should converge");
         let min_s = result.sigma_x.min(result.sigma_y);
         let max_s = result.sigma_x.max(result.sigma_y);
@@ -775,7 +824,7 @@ mod tests {
         // Init from Gaussian sigma ≈ FWHM / 2.3548, where Moffat FWHM = 2α√(2^(1/β)-1)
         let moffat_fwhm = 2.0 * alpha * (2.0_f64.powf(1.0 / beta) - 1.0).sqrt();
         let init_sigma = moffat_fwhm / 2.3548;
-        let result = fit_moffat_2d(&pixels, 100.0, 5000.0, 15.0, 15.0, init_sigma, init_sigma, 0.0).unwrap();
+        let result = fit_moffat_2d(&pixels, 100.0, 5000.0, 15.0, 15.0, init_sigma, init_sigma, 0.0, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
 
         assert!(result.converged, "should converge");
         assert!((result.alpha_x - alpha).abs() < 0.3, "alpha_x: {} expected ~{}", result.alpha_x, alpha);
@@ -806,8 +855,8 @@ mod tests {
         let true_fwhm = 2.0 * alpha * (2.0_f64.powf(1.0 / beta) - 1.0).sqrt();
         let init_sigma = true_fwhm / 2.3548;
 
-        let gauss = fit_gaussian_2d(&pixels, 50.0, 8000.0, 20.0, 20.0, init_sigma, init_sigma, 0.0).unwrap();
-        let moffat = fit_moffat_2d(&pixels, 50.0, 8000.0, 20.0, 20.0, init_sigma, init_sigma, 0.0).unwrap();
+        let gauss = fit_gaussian_2d(&pixels, 50.0, 8000.0, 20.0, 20.0, init_sigma, init_sigma, 0.0, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
+        let moffat = fit_moffat_2d(&pixels, 50.0, 8000.0, 20.0, 20.0, init_sigma, init_sigma, 0.0, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
 
         let gauss_fwhm = 2.3548 * (gauss.sigma_x * gauss.sigma_y).sqrt();
         let moffat_fwhm = (moffat.fwhm_x() * moffat.fwhm_y()).sqrt();
@@ -847,6 +896,7 @@ mod tests {
 
         let result = fit_moffat_2d_fixed_beta(
             &pixels, 100.0, 5000.0, 15.0, 15.0, init_sigma, init_sigma, 0.0, beta,
+            CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
         ).unwrap();
 
         assert!(result.converged, "should converge");
@@ -879,7 +929,7 @@ mod tests {
                 samples.push(PixelSample { x: x as f64, y: y as f64, value: val });
             }
         }
-        let result = fit_gaussian_2d(&samples, noise_bg, amplitude, 0.0, 0.0, sigma, sigma, 0.0);
+        let result = fit_gaussian_2d(&samples, noise_bg, amplitude, 0.0, 0.0, sigma, sigma, 0.0, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS);
         assert!(result.is_some(), "Faint star should produce a result");
         let result = result.unwrap();
         assert!(result.converged, "Faint star should converge");

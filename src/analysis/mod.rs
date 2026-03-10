@@ -105,7 +105,7 @@ pub struct AnalysisResult {
     pub noise: f32,
     /// Actual detection threshold used (ADU above background).
     pub detection_threshold: f32,
-    /// Total stars with valid PSF measurements (statistics computed from all).
+    /// Total stars detected (raw detection count, before measure cap).
     pub stars_detected: usize,
     /// Per-star metrics, sorted by flux descending, capped at max_stars.
     pub stars: Vec<StarMetrics>,
@@ -151,6 +151,14 @@ pub struct AnalysisConfig {
     trail_r_squared_threshold: f32,
     /// MRS wavelet noise layers (default 1).
     noise_layers: usize,
+    /// Max stars to PSF-fit for statistics. 0 = measure all.
+    measure_cap: usize,
+    /// LM max iterations for pass-2 measurement fits.
+    fit_max_iter: usize,
+    /// LM convergence tolerance for pass-2 measurement fits.
+    fit_tolerance: f64,
+    /// Consecutive LM step rejects before early bailout.
+    fit_max_rejects: usize,
 }
 
 /// Image analyzer with builder pattern.
@@ -170,7 +178,11 @@ impl ImageAnalyzer {
                 max_stars: 200,
                 apply_debayer: true,
                 trail_r_squared_threshold: 0.5,
-                noise_layers: 1,
+                noise_layers: 4,
+                measure_cap: 2000,
+                fit_max_iter: 25,
+                fit_tolerance: 1e-4,
+                fit_max_rejects: 5,
             },
             thread_pool: None,
         }
@@ -225,6 +237,34 @@ impl ImageAnalyzer {
     /// Default: 1.
     pub fn with_mrs_layers(mut self, layers: usize) -> Self {
         self.config.noise_layers = layers.max(1);
+        self
+    }
+
+    /// Max stars to PSF-fit for statistics. Default 2000.
+    /// Stars are sorted by flux (brightest first) before capping.
+    /// Set to 0 to measure all detected stars (catalog export mode).
+    pub fn with_measure_cap(mut self, n: usize) -> Self {
+        self.config.measure_cap = n;
+        self
+    }
+
+    /// LM max iterations for pass-2 measurement fits. Default 25.
+    /// Calibration pass always uses 50 iterations.
+    pub fn with_fit_max_iter(mut self, n: usize) -> Self {
+        self.config.fit_max_iter = n.max(1);
+        self
+    }
+
+    /// LM convergence tolerance for pass-2 measurement fits. Default 1e-4.
+    /// Calibration pass always uses 1e-6.
+    pub fn with_fit_tolerance(mut self, tol: f64) -> Self {
+        self.config.fit_tolerance = tol;
+        self
+    }
+
+    /// Consecutive LM step rejects before early bailout. Default 5.
+    pub fn with_fit_max_rejects(mut self, n: usize) -> Self {
+        self.config.fit_max_rejects = n.max(1);
         self
     }
 
@@ -403,6 +443,7 @@ impl ImageAnalyzer {
                 bg_result.background_map.as_deref(),
                 green_mask,
                 None, // free-beta Moffat
+                50, 1e-6, 5, // calibration always uses full precision
             );
 
             let mut beta_vals: Vec<f32> = cal_measured.iter().filter_map(|s| s.beta).collect();
@@ -529,28 +570,60 @@ impl ImageAnalyzer {
             return make_zero_result(0);
         }
 
-        // ── Stage 3: Fixed-beta Moffat on all stars ──────────────────────
+        // ── Stage 3: PSF Measurement (with measure cap) ─────────────────
+        let stars_detected = detected.len();
+
+        // Apply measure cap: only fit the brightest N stars (already sorted by flux)
+        let effective_cap = if self.config.measure_cap == 0 {
+            detected.len()
+        } else {
+            self.config.measure_cap
+        };
+        let to_measure = &detected[..detected.len().min(effective_cap)];
+
         let mut measured = metrics::measure_stars(
-            &lum, width, height, &detected,
+            &lum, width, height, to_measure,
             bg_result.background, bg_map_ref,
             green_mask, field_beta,
+            self.config.fit_max_iter,
+            self.config.fit_tolerance,
+            self.config.fit_max_rejects,
         );
 
         if measured.is_empty() {
-            return make_zero_result(0);
+            return make_zero_result(stars_detected);
         }
 
         // ── Stage 4: Metrics ─────────────────────────────────────────────
-        let stars_detected = measured.len();
 
-        let fwhm_vals: Vec<f32> = measured.iter().map(|s| s.fwhm).collect();
+        // Filter high-eccentricity stars from shape statistics (FWHM, ecc, HFR).
+        // Stars with ecc > 0.8 have unreliable PSF fits — elongated profiles
+        // inflate geometric-mean FWHM and skew eccentricity upward.
+        // SNR uses all stars (flux measurement is robust to elongation).
+        const STATS_ECC_MAX: f32 = 0.8;
+        let round_stars: Vec<&metrics::MeasuredStar> = measured.iter()
+            .filter(|s| s.eccentricity <= STATS_ECC_MAX)
+            .collect();
+
+        // Use round stars for shape stats, fall back to all if too few pass filter
+        let (fwhm_vals, ecc_vals, hfr_vals) = if round_stars.len() >= 3 {
+            (
+                round_stars.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
+                round_stars.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
+                round_stars.iter().map(|s| s.hfr).collect::<Vec<f32>>(),
+            )
+        } else {
+            (
+                measured.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
+                measured.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
+                measured.iter().map(|s| s.hfr).collect::<Vec<f32>>(),
+            )
+        };
         let median_fwhm = sigma_clipped_median(&fwhm_vals);
 
         snr::compute_star_snr(&lum, width, height, &mut measured, median_fwhm);
 
-        let ecc_vals: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
         let mut snr_vals: Vec<f32> = measured.iter().map(|s| s.snr).collect();
-        let hfr_vals: Vec<f32> = measured.iter().map(|s| s.hfr).collect();
 
         let median_eccentricity = sigma_clipped_median(&ecc_vals);
         let median_snr = find_median(&mut snr_vals);

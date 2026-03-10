@@ -45,9 +45,13 @@ let result = analyzer.analyze("light_001.fits")?;
 | `with_max_star_area(usize)` | 2000 | Maximum connected-component area in pixels. Filters extended objects like galaxies and nebulae. |
 | `with_saturation_fraction(f32)` | 0.95 | Reject stars with peak above this fraction of 65535. Clamped to 0.5-1.0. |
 | `with_max_stars(usize)` | 200 | Keep only the brightest N stars. Clamped to minimum 1. |
-| `with_mrs_layers(usize)` | 1 | MRS wavelet noise layers. Uses B3-spline a trous wavelet transform to isolate noise from nebulosity. Increase to 2 for very noisy data. |
+| `with_mrs_layers(usize)` | 4 | MRS wavelet noise layers. Uses iterative multiresolution support with B3-spline à trous wavelet to build a significance mask across scales, isolating pure noise from nebulosity and stars. |
 | `without_debayer()` | Debayer enabled | Skip green-channel interpolation for OSC images. By default, OSC images get native-resolution green interpolation + green-pixel-only fitting. This flag disables both, running analysis directly on the raw Bayer mosaic (faster but less accurate). |
 | `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection (Path A). Lower = more aggressive. The raw `trail_r_squared` is always reported regardless of this setting. Clamped to 0.0-1.0. |
+| `with_measure_cap(usize)` | 2000 | Max stars to PSF-fit for statistics. Stars are sorted by flux (brightest first) before capping. Set to 0 to measure all (catalog export mode). Dense fields (100K+ stars) benefit most from capping. |
+| `with_fit_max_iter(usize)` | 25 | LM max iterations for pass-2 measurement fits. Calibration pass always uses 50. |
+| `with_fit_tolerance(f64)` | 1e-4 | LM convergence tolerance for pass-2 measurement fits. Calibration pass always uses 1e-6. |
+| `with_fit_max_rejects(usize)` | 5 | Consecutive LM step rejects before early bailout. Stars that bail out fall through to the next method in the Moffat→Gaussian→Moments chain. |
 | `with_thread_pool(Arc<ThreadPool>)` | Global rayon pool | Route all parallel work through a custom rayon thread pool. |
 
 ### When to Adjust
@@ -57,7 +61,7 @@ let result = analyzer.analyze("light_001.fits")?;
 - **Hot pixel problems** — raise `min_star_area` to 8-10.
 - **Nebula regions** — lower `max_star_area` to avoid detecting bright nebula knots as stars.
 - **Speed over accuracy** — use `without_debayer()`.
-- **MRS wavelet layers** — increase `with_mrs_layers(2)` for very noisy data.
+- **MRS wavelet layers** — default 4 layers matches PixInsight. Decrease to 1 for speed if noise accuracy is not critical.
 - **OSC images** — green-channel interpolation and green-pixel-only fitting are applied automatically. No configuration needed.
 
 ## Analyzing Raw Data
@@ -94,7 +98,7 @@ be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
 | `background` | `f32` | Global background level in ADU. |
 | `noise` | `f32` | Background noise sigma in ADU. |
 | `detection_threshold` | `f32` | Actual detection threshold used (ADU above background). |
-| `stars_detected` | `usize` | Total stars with valid PSF measurements (statistics computed from all). |
+| `stars_detected` | `usize` | Total stars detected (raw detection count, before measure cap). |
 | `stars` | `Vec<StarMetrics>` | Per-star metrics, sorted by flux descending, capped at `max_stars`. |
 | `median_fwhm` | `f32` | Median FWHM across all measured stars (pixels). Good seeing: 2-3 px. |
 | `median_eccentricity` | `f32` | Median eccentricity. 0 = perfectly round. Values > 0.5 suggest tracking issues. |
