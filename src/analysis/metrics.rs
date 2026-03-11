@@ -22,6 +22,9 @@ pub struct MeasuredStar {
     pub beta: Option<f32>,
     /// Which PSF fitting method produced this measurement.
     pub fit_method: super::FitMethod,
+    /// Normalized fit residual: lower = better PSF fit.
+    /// 1.0 for moments fallback (lowest quality weight).
+    pub fit_residual: f32,
 }
 
 const FWHM_FACTOR: f32 = 2.3548;
@@ -292,6 +295,7 @@ fn measure_with_moments(
         theta: theta as f32,
         beta: None,
         fit_method: super::FitMethod::Moments,
+        fit_residual: 1.0, // no fit — lowest quality weight
     })
 }
 
@@ -490,6 +494,7 @@ fn measure_with_gaussian_fit(
         theta: theta as f32,
         beta: None,
         fit_method: super::FitMethod::Gaussian,
+        fit_residual: result.fit_residual as f32,
     })
 }
 
@@ -642,6 +647,7 @@ fn measure_with_moffat_fit(
         } else {
             super::FitMethod::FreeMoffat
         },
+        fit_residual: result.fit_residual as f32,
     })
 }
 

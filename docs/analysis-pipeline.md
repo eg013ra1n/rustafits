@@ -84,10 +84,10 @@ FITS / XISF File
        |
        v
 +-------------------------------+
-| Trail Detection               |  Rayleigh test on position angles (2 theta)
+| Trail Detection (Stage 1)     |  Rayleigh test on position angles (2 theta)
 | (image-level, advisory)       |  Dual-path: strong R^2 OR eccentricity-gated
 | -> trail_r_squared            |  Advisory only — never rejects, always continues
-| -> possibly_trailed flag      |  Computed on ALL detected candidates
+| -> rayleigh_trailed flag      |  Computed on ALL detected candidates (min 20)
 +-------------------------------+
        |
        v
@@ -104,9 +104,18 @@ FITS / XISF File
 | -> Eccentricity               |  Fallback chain: Moffat -> Gaussian -> Moments
 | -> HFR, theta                 |  FitMethod tracked per star (Moffat/Gaussian/Moments)
 | -> Moffat beta                |  Moments-based theta (always computed)
+| -> fit_residual               |  Normalized LM cost: sqrt(cost/n_px) / amplitude
 |                               |  OSC: only green CFA pixels fed to fitter
 |                               |  Stars that fail all fitting are excluded
 |                               |  LM: configurable max_iter/conv_tol/max_rejects
++-------------------------------+
+       |
+       v
++-------------------------------+
+| Trail Detection (Stage 2)     |  Refines trail flag using PSF-fit eccentricities
+|                               |  (more accurate than detection-stage moments)
+| -> possibly_trailed           |  rayleigh_trailed OR (fit_median_ecc > 0.55)
+|                               |  Catches non-coherent guiding issues (wind shake)
 +-------------------------------+
        |
        v
@@ -118,10 +127,10 @@ FITS / XISF File
        |
        v
 +-------------------------------+
-| Statistics (measured stars)   |  Computed from all measured stars (after cap)
-| -> median FWHM                |
-| -> median eccentricity        |  stars_detected = raw detection count (before cap)
-| -> median SNR, HFR            |
+| Statistics (measured stars)   |  Residual-weighted sigma-clipped medians
+| -> median FWHM                |  Weight: w = 1 / (1 + fit_residual)
+| -> median eccentricity        |  Trail-aware: bypass ecc<=0.8 filter when trailed
+| -> median SNR, HFR            |  stars_detected = raw detection count (before cap)
 | -> median Moffat beta         |
 +-------------------------------+
        |
@@ -173,21 +182,43 @@ All measured stars (after measure cap) contribute to statistics.
 | SNR              | `snr.rs`          | Per-star and image-wide SNR computations      |
 | Orchestration    | `mod.rs`          | Builder API, trail detection, pipeline wiring |
 
-## Trail Detection
+## Trail Detection (Two-Stage)
 
-Detects directional coherence across all detected stars using circular statistics
-on position angles. Computes an R^2 statistic and advisory `possibly_trailed` flag.
-The pipeline **always continues** to PSF measurement regardless of the flag — the
-caller decides whether to reject based on `trail_r_squared` and `possibly_trailed`.
+Detects satellite trails, tracking errors, wind shake, and vibration using circular
+statistics on star position angles and PSF-fit eccentricity. Reports an advisory
+flag and raw R² statistic — the caller decides whether to reject.
 
-Two detection paths cover different regimes:
+The pipeline **always continues** to PSF measurement regardless — the trail flag
+is advisory only.
+
+### Stage 1: Rayleigh Test (before PSF measurement)
+
+Uses the Rayleigh test on doubled position angles (2θ) from detection-stage moments.
+Requires ≥20 detected stars. Two paths cover different regimes:
 
 | Path | Condition | Catches |
 |------|-----------|---------|
-| A — Strong coherence | R^2 > threshold AND p < 0.01 | Trails with consistent theta (low-ecc knots) |
-| B — Eccentricity-gated | median ecc > 0.6 AND p < 0.05 | Undersampled trails (elongated blobs) |
+| A — Strong coherence | R̄² > threshold AND p < 0.01 | Coherent trails (RA drift) |
+| B — Eccentricity-gated | R̄² > 0.05 AND median_ecc > 0.6 AND p < 0.05 | Undersampled trails |
 
 The Path A threshold defaults to 0.5 and is configurable via `with_trail_threshold()`.
+
+### Stage 2: Post-Measurement Eccentricity (after PSF fitting)
+
+After PSF fitting, the median of accurate PSF-fit eccentricities is checked:
+- If `fit_median_ecc > 0.55`, the frame is flagged regardless of Rayleigh result.
+- Catches non-coherent guiding issues (wind shake, vibration) where angles are random
+  but all stars are clearly elongated.
+
+```
+possibly_trailed = rayleigh_trailed OR (fit_median_ecc > 0.55)
+```
+
+### Effect on Statistics
+
+When `possibly_trailed = true`, the ecc ≤ 0.8 filter is bypassed for FWHM,
+eccentricity, and HFR statistics. This ensures trailed frames report accurate
+(high) values rather than having the signal suppressed by the filter.
 
 See [Trail Detection](trail-rejection.md) for the full algorithm and rationale.
 
@@ -221,7 +252,7 @@ are now fixed defaults.
 | Fit max iter | 25 | `with_fit_max_iter(usize)` | LM max iterations for measurement pass (calibration always 50) |
 | Fit tolerance | 1e-4 | `with_fit_tolerance(f64)` | LM convergence tolerance for measurement pass (calibration always 1e-6) |
 | Fit max rejects | 5 | `with_fit_max_rejects(usize)` | LM consecutive reject bailout |
-| MRS noise layers | 4 | `with_mrs_layers(usize)` | Wavelet layers for iterative significance masking |
+| MRS noise layers | 4 | `with_mrs_layers(usize)` | Wavelet layers for significance masking |
 | Trail threshold | 0.5 | `with_trail_threshold(f32)` | R^2 threshold for trail advisory flag |
 | Debayer | auto | `with_debayer(bool)` | Force debayer on/off for OSC data |
 | Thread pool | None | `with_thread_pool(Arc<ThreadPool>)` | Optional shared Rayon thread pool |

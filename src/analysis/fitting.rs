@@ -10,6 +10,13 @@ pub const CALIBRATION_CONV_TOL: f64 = 1e-6;
 #[allow(dead_code)]
 pub const CALIBRATION_MAX_REJECTS: usize = 5;
 
+/// Result from Levenberg-Marquardt solver: convergence flag + final cost.
+#[allow(dead_code)]
+pub struct LmResult {
+    pub converged: bool,
+    pub final_cost: f64,
+}
+
 /// 2D Gaussian model: f(x,y) = B + A * exp(-0.5 * Q(x,y))
 /// Q(x,y) = u^2/sx^2 + v^2/sy^2
 /// u = (x-x0)*cos(theta) + (y-y0)*sin(theta)
@@ -25,6 +32,9 @@ pub struct Gaussian2DResult {
     pub sigma_y: f64,
     pub theta: f64,
     pub converged: bool,
+    /// Normalized fit residual: sqrt(cost / n_pixels) / amplitude.
+    /// Lower = better fit. 0 = perfect, ~1 = moments fallback.
+    pub fit_residual: f64,
 }
 
 /// Pixel coordinate + value for 2D fitting.
@@ -57,13 +67,16 @@ pub fn fit_gaussian_2d(
     }
 
     let mut params = [init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta];
-    let converged = lm_solve_2d(pixels, &mut params, true, max_iter, conv_tol, max_rejects);
+    let LmResult { converged, final_cost } = lm_solve_2d(pixels, &mut params, true, max_iter, conv_tol, max_rejects);
 
     let sigma_x = params[4].abs();
     let sigma_y = params[5].abs();
     if sigma_x < 0.3 || sigma_y < 0.3 || params[1] <= 0.0 {
         return None;
     }
+
+    // Normalized residual: RMS per pixel / amplitude (dimensionless)
+    let fit_residual = (final_cost / pixels.len() as f64).sqrt() / params[1].max(1e-10);
 
     // Normalize theta to [-π/2, π/2]
     let mut theta = params[6] % std::f64::consts::PI;
@@ -82,11 +95,12 @@ pub fn fit_gaussian_2d(
         sigma_y,
         theta,
         converged,
+        fit_residual,
     })
 }
 
 /// LM solver for 2D Gaussian. If `fit_theta` is true, uses 7 params; else 6 (theta=0).
-fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool, max_iter: usize, conv_tol: f64, max_rejects: usize) -> bool {
+fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool, max_iter: usize, conv_tol: f64, max_rejects: usize) -> LmResult {
     let np = if fit_theta { 7 } else { 6 };
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
@@ -260,7 +274,7 @@ fn lm_solve_2d(pixels: &[PixelSample], params: &mut [f64], fit_theta: bool, max_
         }
     }
 
-    converged
+    LmResult { converged, final_cost: best_cost }
 }
 
 fn residual_cost_2d(pixels: &[PixelSample], params: &[f64], fit_theta: bool) -> f64 {
@@ -351,6 +365,8 @@ pub struct Moffat2DResult {
     pub theta: f64,
     pub beta: f64,
     pub converged: bool,
+    /// Normalized fit residual: sqrt(cost / n_pixels) / amplitude.
+    pub fit_residual: f64,
 }
 
 impl Moffat2DResult {
@@ -448,7 +464,7 @@ fn fit_moffat_2d_impl(
     let alpha_y = init_sigma_y * 2.3548 / (2.0 * moffat_scale);
 
     let mut params = [init_b, init_a, init_x0, init_y0, alpha_x, alpha_y, init_theta, beta_init];
-    let converged = lm_solve_moffat_impl(pixels, &mut params, fixed_beta, max_iter, conv_tol, max_rejects);
+    let LmResult { converged, final_cost } = lm_solve_moffat_impl(pixels, &mut params, fixed_beta, max_iter, conv_tol, max_rejects);
 
     let alpha_x = params[4].abs();
     let alpha_y = params[5].abs();
@@ -460,6 +476,9 @@ fn fit_moffat_2d_impl(
     {
         return None;
     }
+
+    // Normalized residual: RMS per pixel / amplitude (dimensionless)
+    let fit_residual = (final_cost / pixels.len() as f64).sqrt() / params[1].max(1e-10);
 
     // Normalize theta to [-π/2, π/2]
     let mut theta = params[6] % std::f64::consts::PI;
@@ -479,12 +498,13 @@ fn fit_moffat_2d_impl(
         theta,
         beta,
         converged,
+        fit_residual,
     })
 }
 
 /// LM solver for 2D Moffat. When `fixed_beta` is `Some(b)`, beta is held constant
 /// and only 7 parameters are optimized. When `None`, all 8 parameters are free.
-fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: Option<f64>, max_iter: usize, conv_tol: f64, max_rejects: usize) -> bool {
+fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: Option<f64>, max_iter: usize, conv_tol: f64, max_rejects: usize) -> LmResult {
     let np = if fixed_beta.is_some() { 7 } else { 8 };
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
@@ -666,7 +686,7 @@ fn lm_solve_moffat_impl(pixels: &[PixelSample], params: &mut [f64], fixed_beta: 
         }
     }
 
-    converged
+    LmResult { converged, final_cost: best_cost }
 }
 
 fn residual_cost_moffat(pixels: &[PixelSample], params: &[f64]) -> f64 {
@@ -957,5 +977,49 @@ mod tests {
         let params = [100.0, 5000.0, 0.0, 0.0, 3.0, 3.0, 0.0, 3.0];
         let val = evaluate_moffat_2d(&params, 100.0, 100.0);
         assert!((val - 100.0).abs() < 1.0, "Far from center should approach background, got {}", val);
+    }
+
+    #[test]
+    fn test_gaussian_fit_residual_near_zero() {
+        // Perfect synthetic Gaussian → fit_residual should be ≈ 0
+        let size = 21;
+        let mut pixels = Vec::new();
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f64 - 10.0;
+                let dy = y as f64 - 10.0;
+                let v = 100.0 + 5000.0 * (-0.5 * (dx * dx + dy * dy) / 9.0).exp();
+                pixels.push(PixelSample { x: x as f64, y: y as f64, value: v });
+            }
+        }
+        let result = fit_gaussian_2d(&pixels, 100.0, 5000.0, 10.0, 10.0, 3.0, 3.0, 0.0,
+            CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
+        assert!(result.fit_residual < 0.001,
+            "Perfect Gaussian fit_residual should be ~0, got {}", result.fit_residual);
+    }
+
+    #[test]
+    fn test_moffat_fit_residual_near_zero() {
+        // Perfect synthetic Moffat → fit_residual should be ≈ 0
+        let size = 31;
+        let alpha = 3.0_f64;
+        let beta = 3.0_f64;
+        let mut pixels = Vec::new();
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f64 - 15.0;
+                let dy = y as f64 - 15.0;
+                let r2 = dx * dx + dy * dy;
+                let v = 100.0 + 5000.0 * (1.0 + r2 / (alpha * alpha)).powf(-beta);
+                pixels.push(PixelSample { x: x as f64, y: y as f64, value: v });
+            }
+        }
+        let moffat_fwhm = 2.0 * alpha * (2.0_f64.powf(1.0 / beta) - 1.0).sqrt();
+        let init_sigma = moffat_fwhm / 2.3548;
+        let result = fit_moffat_2d(&pixels, 100.0, 5000.0, 15.0, 15.0,
+            init_sigma, init_sigma, 0.0,
+            CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
+        assert!(result.fit_residual < 0.001,
+            "Perfect Moffat fit_residual should be ~0, got {}", result.fit_residual);
     }
 }

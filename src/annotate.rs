@@ -478,6 +478,7 @@ mod tests {
             theta: 0.0,
             beta: None,
             fit_method: crate::analysis::FitMethod::Gaussian,
+            fit_residual: 0.0,
         }
     }
 
@@ -568,6 +569,7 @@ mod tests {
             theta,
             beta: None,
             fit_method: crate::analysis::FitMethod::Gaussian,
+            fit_residual: 0.0,
         };
         let result = dummy_result(vec![star]);
         let config = AnnotationConfig::default();

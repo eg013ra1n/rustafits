@@ -15,7 +15,8 @@ use astroimage::analysis::fitting::{self, PixelSample,
 use astroimage::analysis::metrics;
 use astroimage::analysis::render;
 use astroimage::analysis::snr;
-use astroimage::analysis::{estimate_fwhm_from_stars, prepare_luminance, sigma_clipped_median};
+use astroimage::analysis::{estimate_fwhm_from_stars, prepare_luminance, sigma_clipped_median,
+    sigma_clipped_weighted_median};
 use astroimage::formats;
 
 fn main() {
@@ -605,6 +606,7 @@ fn cmd_fit(lum: &[f32], w: usize, h: usize, opts: &Opts) -> Result<()> {
         eprintln!("  sigma_x={:.3}  sigma_y={:.3}  theta={:.4} rad", g.sigma_x, g.sigma_y, g.theta);
         eprintln!("  FWHM_x={:.3}  FWHM_y={:.3}  FWHM={:.3}", fwhm_x, fwhm_y, fwhm);
         eprintln!("  Eccentricity:  {:.3}", ecc);
+        eprintln!("  Fit residual:  {:.6}", g.fit_residual);
     } else {
         eprintln!("  FAILED");
     }
@@ -633,6 +635,7 @@ fn cmd_fit(lum: &[f32], w: usize, h: usize, opts: &Opts) -> Result<()> {
         eprintln!("  alpha_x={:.3}  alpha_y={:.3}  theta={:.4} rad  beta={:.3}", m.alpha_x, m.alpha_y, m.theta, m.beta);
         eprintln!("  FWHM_x={:.3}  FWHM_y={:.3}  FWHM={:.3}", fwhm_x, fwhm_y, fwhm);
         eprintln!("  Eccentricity:  {:.3}", ecc);
+        eprintln!("  Fit residual:  {:.6}", m.fit_residual);
     } else {
         eprintln!("  FAILED");
     }
@@ -853,6 +856,7 @@ fn cmd_query(
         eprintln!("  sigma_x={:.3}  sigma_y={:.3}  theta={:.4} rad", g.sigma_x, g.sigma_y, g.theta);
         eprintln!("  FWHM_x={:.3}  FWHM_y={:.3}  FWHM={:.3}", fwhm_x, fwhm_y, fwhm);
         eprintln!("  Eccentricity:  {:.3}", ecc);
+        eprintln!("  Fit residual:  {:.6}", g.fit_residual);
     } else {
         eprintln!("  FAILED");
     }
@@ -881,6 +885,7 @@ fn cmd_query(
         eprintln!("  alpha_x={:.3}  alpha_y={:.3}  theta={:.4} rad  beta={:.3}", m.alpha_x, m.alpha_y, m.theta, m.beta);
         eprintln!("  FWHM_x={:.3}  FWHM_y={:.3}  FWHM={:.3}", fwhm_x, fwhm_y, fwhm);
         eprintln!("  Eccentricity:  {:.3}", ecc);
+        eprintln!("  Fit residual:  {:.6}", m.fit_residual);
     } else {
         eprintln!("  FAILED");
     }
@@ -1012,10 +1017,36 @@ fn cmd_pipeline(
         (pass1, initial_fwhm)
     };
 
+    // Trail detection (Rayleigh test on detection-stage moments)
+    const TRAIL_R_SQ_THRESHOLD: f64 = 0.5;
+    let (trail_r_squared, possibly_trailed) = if detected.len() >= 20 {
+        let n = detected.len();
+        let (sum_cos, sum_sin) =
+            detected.iter().fold((0.0f64, 0.0f64), |(sc, ss), s| {
+                let a = 2.0 * s.theta as f64;
+                (sc + a.cos(), ss + a.sin())
+            });
+        let r_sq = (sum_cos * sum_cos + sum_sin * sum_sin) / (n as f64 * n as f64);
+        let p = (-(n as f64) * r_sq).exp();
+        let mut eccs: Vec<f32> = detected.iter().map(|s| s.eccentricity).collect();
+        eccs.sort_unstable_by(|a, b| a.total_cmp(b));
+        let median_ecc = if eccs.len() % 2 == 1 {
+            eccs[eccs.len() / 2]
+        } else {
+            (eccs[eccs.len() / 2 - 1] + eccs[eccs.len() / 2]) * 0.5
+        };
+        let trailed = (r_sq > TRAIL_R_SQ_THRESHOLD && p < 0.01)
+            || (r_sq > 0.05 && median_ecc > 0.6 && p < 0.05);
+        (r_sq, trailed)
+    } else {
+        (0.0, false)
+    };
+
     eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
     eprintln!("  Pass 1: {} detections (FWHM=3.0)", pass1_count);
     eprintln!("  Measured FWHM: {:.3}px  Capped: {:.3}px", measured_fwhm, capped);
     eprintln!("  Final: {} detections (FWHM={:.2})", detected.len(), final_fwhm);
+    eprintln!("  Trail R²: {:.4}  Rayleigh trailed: {}", trail_r_squared, possibly_trailed);
 
     if let Some(ref dir) = opts.save_dir {
         let sigma = final_fwhm / 2.3548;
@@ -1060,15 +1091,53 @@ fn cmd_pipeline(
     eprintln!("\n=== Stage 4: Statistics ===");
     let t = Instant::now();
 
-    let fwhm_vals: Vec<f32> = measured.iter().map(|s| s.fwhm).collect();
-    let median_fwhm = sigma_clipped_median(&fwhm_vals);
+    // Refine trail detection using accurate PSF-fit eccentricities
+    let possibly_trailed = possibly_trailed || {
+        let mut fit_eccs: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
+        fit_eccs.sort_unstable_by(|a, b| a.total_cmp(b));
+        let med = if fit_eccs.len() % 2 == 1 {
+            fit_eccs[fit_eccs.len() / 2]
+        } else {
+            (fit_eccs[fit_eccs.len() / 2 - 1] + fit_eccs[fit_eccs.len() / 2]) * 0.5
+        };
+        med > 0.55
+    };
+    if possibly_trailed {
+        eprintln!("  Trailed: true (PSF-fit median ecc > 0.5)");
+    }
+
+    // FWHM/HFR: ecc ≤ 0.8 filter, bypass on trailed frames
+    const FWHM_ECC_MAX: f32 = 0.8;
+    let fwhm_filtered: Vec<&metrics::MeasuredStar> = if possibly_trailed {
+        measured.iter().collect()
+    } else {
+        let round: Vec<&metrics::MeasuredStar> = measured.iter()
+            .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
+            .collect();
+        if round.len() >= 3 { round } else { measured.iter().collect() }
+    };
+    let fwhm_vals: Vec<f32> = fwhm_filtered.iter().map(|s| s.fwhm).collect();
+    let hfr_vals: Vec<f32> = fwhm_filtered.iter().map(|s| s.hfr).collect();
+    let shape_weights: Vec<f32> = fwhm_filtered.iter()
+        .map(|s| 1.0 / (1.0 + s.fit_residual)).collect();
+    let median_fwhm = sigma_clipped_weighted_median(&fwhm_vals, &shape_weights);
+    let median_hfr = sigma_clipped_weighted_median(&hfr_vals, &shape_weights);
 
     snr::compute_star_snr(lum, w, h, &mut measured, median_fwhm);
 
-    let ecc_vals: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
-    let hfr_vals: Vec<f32> = measured.iter().map(|s| s.hfr).collect();
-    let median_ecc = sigma_clipped_median(&ecc_vals);
-    let median_hfr = sigma_clipped_median(&hfr_vals);
+    // Ecc: trail-aware cutoff
+    let ecc_filtered: Vec<&metrics::MeasuredStar> = if possibly_trailed {
+        measured.iter().collect()
+    } else {
+        let filtered: Vec<&metrics::MeasuredStar> = measured.iter()
+            .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
+            .collect();
+        if filtered.len() >= 3 { filtered } else { measured.iter().collect() }
+    };
+    let ecc_vals: Vec<f32> = ecc_filtered.iter().map(|s| s.eccentricity).collect();
+    let ecc_weights: Vec<f32> = ecc_filtered.iter()
+        .map(|s| 1.0 / (1.0 + s.fit_residual)).collect();
+    let median_ecc = sigma_clipped_weighted_median(&ecc_vals, &ecc_weights);
 
     let snr_weight = snr::compute_snr_weight(lum, bg.background, bg.noise);
     let psf_signal = snr::compute_psf_signal(&measured, bg.noise);
@@ -1170,13 +1239,14 @@ fn cmd_dump(
     }
 
     // TSV header to stdout
-    println!("x\ty\tpeak\tflux\tfwhm_x\tfwhm_y\tfwhm\tecc\thfr\tsnr\ttheta\tbeta");
+    println!("x\ty\tpeak\tflux\tfwhm_x\tfwhm_y\tfwhm\tecc\thfr\tsnr\ttheta\tbeta\tfit_res");
     for s in &measured {
         println!(
-            "{:.3}\t{:.3}\t{:.1}\t{:.1}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.1}\t{:.4}\t{}",
+            "{:.3}\t{:.3}\t{:.1}\t{:.1}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.1}\t{:.4}\t{}\t{:.4}",
             s.x, s.y, s.peak, s.flux,
             s.fwhm_x, s.fwhm_y, s.fwhm, s.eccentricity, s.hfr, s.snr, s.theta,
             s.beta.map_or("-".to_string(), |b| format!("{:.3}", b)),
+            s.fit_residual,
         );
     }
 
@@ -1221,6 +1291,13 @@ fn cmd_dump(
             percentile(&beta_s, pcts[2]), percentile(&beta_s, pcts[3]),
             percentile(&beta_s, pcts[4]));
     }
+
+    let mut fitres_s: Vec<f32> = measured.iter().map(|s| s.fit_residual).collect();
+    fitres_s.sort_by(|a, b| a.total_cmp(b));
+    eprintln!("  FitR  {:>7.4} {:>7.4} {:>7.4} {:>7.4} {:>7.4}",
+        percentile(&fitres_s, pcts[0]), percentile(&fitres_s, pcts[1]),
+        percentile(&fitres_s, pcts[2]), percentile(&fitres_s, pcts[3]),
+        percentile(&fitres_s, pcts[4]));
 
     eprintln!();
     eprintln!("{} stars written to stdout", count);
@@ -1382,6 +1459,30 @@ fn analyze_one_file(
         (pass1, initial_fwhm)
     };
 
+    // Trail detection (Rayleigh test on detection-stage moments)
+    const TRAIL_R_SQ_THRESHOLD: f64 = 0.5;
+    let possibly_trailed = if detected.len() >= 20 {
+        let n = detected.len();
+        let (sum_cos, sum_sin) =
+            detected.iter().fold((0.0f64, 0.0f64), |(sc, ss), s| {
+                let a = 2.0 * s.theta as f64;
+                (sc + a.cos(), ss + a.sin())
+            });
+        let r_sq = (sum_cos * sum_cos + sum_sin * sum_sin) / (n as f64 * n as f64);
+        let p = (-(n as f64) * r_sq).exp();
+        let mut eccs: Vec<f32> = detected.iter().map(|s| s.eccentricity).collect();
+        eccs.sort_unstable_by(|a, b| a.total_cmp(b));
+        let median_ecc = if eccs.len() % 2 == 1 {
+            eccs[eccs.len() / 2]
+        } else {
+            (eccs[eccs.len() / 2 - 1] + eccs[eccs.len() / 2]) * 0.5
+        };
+        (r_sq > TRAIL_R_SQ_THRESHOLD && p < 0.01)
+            || (r_sq > 0.05 && median_ecc > 0.6 && p < 0.05)
+    } else {
+        false
+    };
+
     // Two-pass calibration: free-beta on bright calibration stars, fixed-beta on all
     let calibration_stars: Vec<DetectedStar> = detected
         .iter()
@@ -1411,9 +1512,11 @@ fn analyze_one_file(
         None
     };
 
-    // Pass 2: fixed-beta on all stars
+    // Pass 2: fixed-beta on brightest N stars (measure cap)
+    let effective_cap = if opts.measure_cap == 0 { detected.len() } else { opts.measure_cap };
+    let to_measure = &detected[..detected.len().min(effective_cap)];
     let mut measured = metrics::measure_stars(
-        &lum, w, h, &detected,
+        &lum, w, h, to_measure,
         bg.background, bg_map_ref,
         green_mask.as_deref(),
         field_beta,
@@ -1432,26 +1535,53 @@ fn analyze_one_file(
         });
     }
 
-    // Filter high-eccentricity stars from shape statistics (matching pipeline)
-    const STATS_ECC_MAX: f32 = 0.8;
-    let round: Vec<&metrics::MeasuredStar> = measured.iter()
-        .filter(|s| s.eccentricity <= STATS_ECC_MAX)
-        .collect();
-    let (fwhm_vals, ecc_vals) = if round.len() >= 3 {
-        (
-            round.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
-            round.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
-        )
-    } else {
-        (
-            measured.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
-            measured.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
-        )
+    // Refine trail detection using accurate PSF-fit eccentricities
+    let possibly_trailed = possibly_trailed || {
+        let mut fit_eccs: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
+        fit_eccs.sort_unstable_by(|a, b| a.total_cmp(b));
+        let med = if fit_eccs.len() % 2 == 1 {
+            fit_eccs[fit_eccs.len() / 2]
+        } else {
+            (fit_eccs[fit_eccs.len() / 2 - 1] + fit_eccs[fit_eccs.len() / 2]) * 0.5
+        };
+        med > 0.55
     };
-    let median_fwhm = sigma_clipped_median(&fwhm_vals);
+
+    // Fit-residual-weighted statistics (matching pipeline):
+    // FWHM: ecc ≤ 0.8 filter — on trailed frames bypass it (almost all stars are elongated)
+    const FWHM_ECC_MAX: f32 = 0.8;
+    let fwhm_filtered: Vec<&metrics::MeasuredStar> = if possibly_trailed {
+        measured.iter().collect()
+    } else {
+        let round: Vec<&metrics::MeasuredStar> = measured.iter()
+            .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
+            .collect();
+        if round.len() >= 3 { round } else { measured.iter().collect() }
+    };
+    let (fwhm_vals, shape_weights) = (
+        fwhm_filtered.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
+        fwhm_filtered.iter().map(|s| 1.0 / (1.0 + s.fit_residual)).collect::<Vec<f32>>(),
+    );
+    let median_fwhm = sigma_clipped_weighted_median(&fwhm_vals, &shape_weights);
     snr::compute_star_snr(&lum, w, h, &mut measured, median_fwhm);
 
-    let median_ecc = sigma_clipped_median(&ecc_vals);
+    // Eccentricity: on normal frames, ecc ≤ 0.8 cutoff removes noise from
+    // faint detections. On trailed frames, elongation IS the signal — bypass
+    // the cutoff so the reported ecc reflects actual frame quality.
+    let ecc_use_all = possibly_trailed;
+    let ecc_filtered: Vec<&metrics::MeasuredStar> = if ecc_use_all {
+        measured.iter().collect()
+    } else {
+        let filtered: Vec<&metrics::MeasuredStar> = measured.iter()
+            .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
+            .collect();
+        if filtered.len() >= 3 { filtered } else { measured.iter().collect() }
+    };
+    let (ecc_vals, ecc_weights) = (
+        ecc_filtered.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
+        ecc_filtered.iter().map(|s| 1.0 / (1.0 + s.fit_residual)).collect::<Vec<f32>>(),
+    );
+    let median_ecc = sigma_clipped_weighted_median(&ecc_vals, &ecc_weights);
     let mean_fwhm: f64 = fwhm_vals.iter().map(|&v| v as f64).sum::<f64>() / fwhm_vals.len() as f64;
     let mean_ecc: f64 = ecc_vals.iter().map(|&v| v as f64).sum::<f64>() / ecc_vals.len() as f64;
     let snr_vals: Vec<f32> = measured.iter().map(|s| s.snr).collect();

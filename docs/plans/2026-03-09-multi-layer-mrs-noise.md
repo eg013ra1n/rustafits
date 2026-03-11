@@ -40,7 +40,7 @@ Expected: SUCCESS (no warnings about the function being unused — it will be us
 git add src/analysis/convolution.rs
 git commit -m "feat: expose b3_spline_smooth_dilated for multi-layer MRS"
 ```
-
+i
 ---
 
 ### Task 2: Write failing unit test for multi-layer MRS

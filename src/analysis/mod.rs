@@ -89,6 +89,9 @@ pub struct StarMetrics {
     pub beta: Option<f32>,
     /// Which PSF fitting method produced this measurement.
     pub fit_method: FitMethod,
+    /// Normalized fit residual (quality weight: w = 1/(1+r)).
+    /// Lower = better fit. 1.0 for moments fallback.
+    pub fit_residual: f32,
 }
 
 /// Full analysis result for an image.
@@ -124,12 +127,15 @@ pub struct AnalysisResult {
     /// Per-frame SNR: background / noise (linear ratio).
     /// Use for stacking prediction: stacked_snr = sqrt(sum(frame_snr_i²)).
     pub frame_snr: f32,
-    /// Rayleigh R² statistic for directional coherence of star position angles.
+    /// Rayleigh R̄² (squared mean resultant length) for directional coherence
+    /// of star position angles. Uses 2θ doubling for axial orientation data.
     /// 0.0 = uniform (no trail), 1.0 = all stars aligned (strong trail).
-    /// Computed from detection-stage stamp moments on 2θ.
+    /// A threshold of 0.5 corresponds to R̄ ≈ 0.71 (strong coherence).
     pub trail_r_squared: f32,
     /// True if the image is likely trailed, based on the Rayleigh test.
-    /// Uses configurable R² threshold (default 0.5) and eccentricity gate.
+    /// Fires when R̄² > threshold with significant p-value, or when R̄² > 0.05
+    /// with high median eccentricity (catches non-coherent guiding issues).
+    /// Requires ≥20 detected stars for statistical reliability.
     pub possibly_trailed: bool,
     /// Measured FWHM from adaptive two-pass detection (pixels).
     /// This is the FWHM used for the final matched filter kernel.
@@ -149,7 +155,7 @@ pub struct AnalysisConfig {
     max_stars: usize,
     apply_debayer: bool,
     trail_r_squared_threshold: f32,
-    /// MRS wavelet noise layers (default 1).
+    /// MRS wavelet noise layers (default 4).
     noise_layers: usize,
     /// Max stars to PSF-fit for statistics. 0 = measure all.
     measure_cap: usize,
@@ -234,7 +240,7 @@ impl ImageAnalyzer {
 
     /// Set MRS wavelet noise layers.
     /// Uses à trous B3-spline wavelet to isolate noise from nebulosity/gradients.
-    /// Default: 1.
+    /// Default: 4.
     pub fn with_mrs_layers(mut self, layers: usize) -> Self {
         self.config.noise_layers = layers.max(1);
         self
@@ -528,7 +534,9 @@ impl ImageAnalyzer {
         let detection_threshold = self.config.detection_sigma * bg_result.noise;
 
         // ── Trail detection (Rayleigh test on detection-stage moments) ────
-        let (trail_r_squared, possibly_trailed) = if detected.len() >= 5 {
+        // Uses 2θ doubling for axial orientation data. R̄² = squared mean
+        // resultant length; p ≈ exp(-n·R̄²) is the asymptotic Rayleigh p-value.
+        let (trail_r_squared, possibly_trailed) = if detected.len() >= 20 {
             let n = detected.len();
             let (sum_cos, sum_sin) =
                 detected.iter().fold((0.0f64, 0.0f64), |(sc, ss), s| {
@@ -539,10 +547,14 @@ impl ImageAnalyzer {
             let p = (-(n as f64) * r_sq).exp();
             let mut eccs: Vec<f32> = detected.iter().map(|s| s.eccentricity).collect();
             eccs.sort_unstable_by(|a, b| a.total_cmp(b));
-            let median_ecc = eccs[eccs.len() / 2];
+            let median_ecc = if eccs.len() % 2 == 1 {
+                eccs[eccs.len() / 2]
+            } else {
+                (eccs[eccs.len() / 2 - 1] + eccs[eccs.len() / 2]) * 0.5
+            };
             let threshold = self.config.trail_r_squared_threshold as f64;
-            let trailed = (r_sq > threshold && p < 0.01)
-                || (median_ecc > 0.6 && p < 0.05);
+            let trailed = (r_sq > threshold && p < 0.01)       // strong angle coherence
+                || (r_sq > 0.05 && median_ecc > 0.6 && p < 0.05); // moderate coherence + high ecc
             (r_sq as f32, trailed)
         } else {
             (0.0, false)
@@ -596,38 +608,61 @@ impl ImageAnalyzer {
 
         // ── Stage 4: Metrics ─────────────────────────────────────────────
 
-        // Filter high-eccentricity stars from shape statistics (FWHM, ecc, HFR).
-        // Stars with ecc > 0.8 have unreliable PSF fits — elongated profiles
-        // inflate geometric-mean FWHM and skew eccentricity upward.
-        // SNR uses all stars (flux measurement is robust to elongation).
-        const STATS_ECC_MAX: f32 = 0.8;
-        let round_stars: Vec<&metrics::MeasuredStar> = measured.iter()
-            .filter(|s| s.eccentricity <= STATS_ECC_MAX)
-            .collect();
-
-        // Use round stars for shape stats, fall back to all if too few pass filter
-        let (fwhm_vals, ecc_vals, hfr_vals) = if round_stars.len() >= 3 {
-            (
-                round_stars.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
-                round_stars.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
-                round_stars.iter().map(|s| s.hfr).collect::<Vec<f32>>(),
-            )
-        } else {
-            (
-                measured.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
-                measured.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
-                measured.iter().map(|s| s.hfr).collect::<Vec<f32>>(),
-            )
+        // Refine trail detection using accurate PSF-fit eccentricities.
+        // Detection-stage moments are noisy; PSF-fit ecc is reliable.
+        let possibly_trailed = possibly_trailed || {
+            let mut fit_eccs: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
+            fit_eccs.sort_unstable_by(|a, b| a.total_cmp(b));
+            let med = if fit_eccs.len() % 2 == 1 {
+                fit_eccs[fit_eccs.len() / 2]
+            } else {
+                (fit_eccs[fit_eccs.len() / 2 - 1] + fit_eccs[fit_eccs.len() / 2]) * 0.5
+            };
+            med > 0.55
         };
-        let median_fwhm = sigma_clipped_median(&fwhm_vals);
+
+        // FWHM & HFR: ecc ≤ 0.8 filter — elongated profiles inflate
+        // geometric-mean FWHM. On trailed frames bypass it.
+        const FWHM_ECC_MAX: f32 = 0.8;
+        let fwhm_filtered: Vec<&metrics::MeasuredStar> = if possibly_trailed {
+            measured.iter().collect()
+        } else {
+            let round: Vec<&metrics::MeasuredStar> = measured.iter()
+                .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
+                .collect();
+            if round.len() >= 3 { round } else { measured.iter().collect() }
+        };
+        let (fwhm_vals, hfr_vals, shape_weights) = (
+            fwhm_filtered.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
+            fwhm_filtered.iter().map(|s| s.hfr).collect::<Vec<f32>>(),
+            fwhm_filtered.iter().map(|s| 1.0 / (1.0 + s.fit_residual)).collect::<Vec<f32>>(),
+        );
+        let median_fwhm = sigma_clipped_weighted_median(&fwhm_vals, &shape_weights);
+
+        // Eccentricity: on normal frames, ecc ≤ 0.8 cutoff removes noise from
+        // faint detections. On trailed frames, elongation IS the signal — bypass
+        // the cutoff so the reported ecc reflects actual frame quality.
+        let ecc_use_all = possibly_trailed;
+        let ecc_filtered: Vec<&metrics::MeasuredStar> = if ecc_use_all {
+            measured.iter().collect()
+        } else {
+            let filtered: Vec<&metrics::MeasuredStar> = measured.iter()
+                .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
+                .collect();
+            if filtered.len() >= 3 { filtered } else { measured.iter().collect() }
+        };
+        let ecc_vals: Vec<f32> = ecc_filtered.iter().map(|s| s.eccentricity).collect();
+        let ecc_weights: Vec<f32> = ecc_filtered.iter()
+            .map(|s| 1.0 / (1.0 + s.fit_residual))
+            .collect();
 
         snr::compute_star_snr(&lum, width, height, &mut measured, median_fwhm);
 
         let mut snr_vals: Vec<f32> = measured.iter().map(|s| s.snr).collect();
 
-        let median_eccentricity = sigma_clipped_median(&ecc_vals);
+        let median_eccentricity = sigma_clipped_weighted_median(&ecc_vals, &ecc_weights);
         let median_snr = find_median(&mut snr_vals);
-        let median_hfr = sigma_clipped_median(&hfr_vals);
+        let median_hfr = sigma_clipped_weighted_median(&hfr_vals, &shape_weights);
         let psf_signal = snr::compute_psf_signal(&measured, bg_result.noise);
 
         // Median beta: use field_beta from calibration, or compute from all stars
@@ -648,6 +683,7 @@ impl ImageAnalyzer {
                 fwhm_x: m.fwhm_x, fwhm_y: m.fwhm_y, fwhm: m.fwhm,
                 eccentricity: m.eccentricity, snr: m.snr, hfr: m.hfr,
                 theta: m.theta, beta: m.beta, fit_method: m.fit_method,
+                fit_residual: m.fit_residual,
             })
             .collect();
 
@@ -701,6 +737,78 @@ pub fn sigma_clipped_median(values: &[f32]) -> f32 {
         return find_median(&mut values.to_vec());
     }
     find_median(&mut v)
+}
+
+/// Weighted median: walk sorted (value, weight) pairs until cumulative weight >= total/2.
+///
+/// Returns 0.0 if inputs are empty or total weight is zero.
+pub fn weighted_median(values: &[f32], weights: &[f32]) -> f32 {
+    if values.is_empty() || values.len() != weights.len() {
+        return 0.0;
+    }
+    let mut pairs: Vec<(f32, f32)> = values.iter().copied()
+        .zip(weights.iter().copied())
+        .filter(|(_, w)| *w > 0.0)
+        .collect();
+    if pairs.is_empty() {
+        return 0.0;
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: f32 = pairs.iter().map(|(_, w)| w).sum();
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let half = total * 0.5;
+    let mut cumulative = 0.0_f32;
+    for &(val, w) in &pairs {
+        cumulative += w;
+        if cumulative >= half {
+            return val;
+        }
+    }
+    pairs.last().unwrap().0
+}
+
+/// Sigma-clipped weighted median: 2-iteration 3σ MAD clipping, then weighted median.
+///
+/// Combines outlier rejection (via MAD) with continuous quality weighting.
+/// Falls back to plain weighted median if fewer than 3 values survive clipping.
+pub fn sigma_clipped_weighted_median(values: &[f32], weights: &[f32]) -> f32 {
+    if values.is_empty() || values.len() != weights.len() {
+        return 0.0;
+    }
+    let mut v: Vec<f32> = values.to_vec();
+    let mut w: Vec<f32> = weights.to_vec();
+    for _ in 0..2 {
+        if v.len() < 3 {
+            break;
+        }
+        let med = weighted_median(&v, &w);
+        let abs_devs: Vec<f32> = v.iter().map(|&x| (x - med).abs()).collect();
+        // Unweighted MAD for clipping threshold (weights affect median, not clip boundary)
+        let mut sorted_devs = abs_devs.clone();
+        sorted_devs.sort_by(|a, b| a.total_cmp(b));
+        let mad = sorted_devs[sorted_devs.len() / 2];
+        let sigma_mad = 1.4826 * mad;
+        if sigma_mad < 1e-10 {
+            break;
+        }
+        let clip = 3.0 * sigma_mad;
+        let mut new_v = Vec::with_capacity(v.len());
+        let mut new_w = Vec::with_capacity(w.len());
+        for (val, wt) in v.iter().zip(w.iter()) {
+            if (*val - med).abs() <= clip {
+                new_v.push(*val);
+                new_w.push(*wt);
+            }
+        }
+        v = new_v;
+        w = new_w;
+    }
+    if v.is_empty() {
+        return weighted_median(values, weights);
+    }
+    weighted_median(&v, &w)
 }
 
 /// Estimate FWHM from the brightest detected stars by extracting stamps
@@ -851,4 +959,48 @@ pub fn prepare_luminance(
     };
 
     (lum, width, height, channels, green_mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_weighted_median_equal_weights() {
+        // Equal weights → same as unweighted median
+        let vals = [1.0_f32, 3.0, 5.0, 7.0, 9.0];
+        let wts = [1.0_f32; 5];
+        let wm = weighted_median(&vals, &wts);
+        assert!((wm - 5.0).abs() < 0.01, "Equal-weight median should be 5, got {}", wm);
+    }
+
+    #[test]
+    fn test_weighted_median_skewed_weights() {
+        // Heavy weight on low value should pull median down
+        let vals = [1.0_f32, 10.0];
+        let wts = [9.0_f32, 1.0]; // 90% weight on 1.0
+        let wm = weighted_median(&vals, &wts);
+        assert!((wm - 1.0).abs() < 0.01, "Skewed-weight median should be 1, got {}", wm);
+    }
+
+    #[test]
+    fn test_weighted_median_empty() {
+        let wm = weighted_median(&[], &[]);
+        assert_eq!(wm, 0.0);
+    }
+
+    #[test]
+    fn test_weighted_median_single() {
+        let wm = weighted_median(&[42.0], &[1.0]);
+        assert!((wm - 42.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_sigma_clipped_weighted_median_basic() {
+        // With an outlier, sigma clipping should reject it
+        let vals = [3.0_f32, 3.1, 3.0, 3.2, 3.0, 100.0]; // 100.0 is outlier
+        let wts = [1.0_f32; 6];
+        let scwm = sigma_clipped_weighted_median(&vals, &wts);
+        assert!(scwm < 4.0, "Outlier should be clipped, got {}", scwm);
+    }
 }

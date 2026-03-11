@@ -79,7 +79,7 @@ Input: star stamp (background-subtracted pixels + positions)
 +------------------------------+
        |
        v
-  Gaussian2DResult { B, A, x0, y0, sigma_x, sigma_y, theta }
+  Gaussian2DResult { B, A, x0, y0, sigma_x, sigma_y, theta, fit_residual }
 ```
 
 ### Levenberg-Marquardt Algorithm
@@ -261,7 +261,7 @@ Input: star stamp (background-subtracted pixels + positions)
 +------------------------------+
        |
        v
-  Moffat2DResult { b, a, x0, y0, alpha_x, alpha_y, theta, beta, converged }
+  Moffat2DResult { b, a, x0, y0, alpha_x, alpha_y, theta, beta, converged, fit_residual }
 ```
 
 ### Jacobian (8-parameter, free beta)
@@ -347,6 +347,7 @@ Windowed moments (last resort)
 ```
 
 The `FitMethod` enum on each `StarMetrics` records which method produced the result.
+Each star also carries a `fit_residual` (normalized LM cost, see [Fit Residual](#fit-residual-quality-metric)) used as a quality weight for frame-level statistics.
 
 | Aspect | Moffat (primary) | Gaussian (fallback) | Moments (last resort) |
 |--------|-------------------|---------------------|-----------------------|
@@ -354,6 +355,7 @@ The `FitMethod` enum on each `StarMetrics` records which method produced the res
 | Parameters | 8 (free) or 7 (fixed beta) | 7 | N/A |
 | Min samples | 12 | 10 | 1 |
 | Reports beta | Yes | No | No |
+| fit_residual | From LM cost | From LM cost | Fixed 1.0 |
 | Accuracy | Highest | Good | Lowest |
 
 ---
@@ -418,3 +420,42 @@ the measurement:
 | Ellipticity trigger | 0.1    | Below this, rotation angle adds no value      |
 | Min pixel samples   | 10/12  | Gaussian / Moffat minimum for overdetermined system |
 | Arithmetic          | f64    | Avoid float32 precision loss in normal eqns   |
+
+---
+
+## Fit Residual (Quality Metric)
+
+Both LM solvers return an `LmResult { converged: bool, final_cost: f64 }` struct
+where `final_cost = Σ(data - model)²` is the sum of squared residuals at convergence.
+
+The fit residual is normalized to be dimensionless and comparable across stars of
+different brightness:
+
+```
+fit_residual = sqrt(final_cost / n_pixels) / amplitude
+```
+
+- `sqrt(final_cost / n_pixels)` = RMS residual per pixel (ADU)
+- Dividing by `amplitude` (peak above background) makes the metric scale-invariant
+
+### Typical Values
+
+| Fit quality | fit_residual | Description |
+|-------------|-------------|-------------|
+| Excellent | < 0.05 | Clean bright star, well-modeled PSF |
+| Good | 0.05 – 0.15 | Typical star with some noise |
+| Marginal | 0.15 – 0.50 | Faint star or slight model mismatch |
+| Moments fallback | 1.0 (fixed) | No fit available — lowest quality weight |
+
+### Use in Statistics
+
+The fit residual is used as a continuous quality weight for frame-level statistics:
+
+```
+weight = 1 / (1 + fit_residual)
+```
+
+This replaces the binary accept/reject approach with a smooth degradation: well-fit
+stars (residual ~ 0) get weight ~ 1.0, poorly-fit stars get proportionally less
+influence. Combined with sigma-clipped weighted median, this improves agreement with
+PixInsight's quality-weighted statistics.

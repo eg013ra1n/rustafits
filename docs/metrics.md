@@ -95,7 +95,9 @@ The pipeline uses a two-pass calibration approach:
 
 When a Moffat fit fails, the pipeline falls back to Gaussian, then to windowed moments.
 Each star's `fit_method` field records which method produced the result (`FreeMoffat`,
-`FixedMoffat`, `Gaussian`, or `Moments`).
+`FixedMoffat`, `Gaussian`, or `Moments`). Each star also carries a `fit_residual` —
+a normalized LM cost used as a quality weight for frame-level statistics
+(see [fitting.md](fitting.md#fit-residual-quality-metric)).
 
 ### Method 2: 2D Gaussian Fit
 
@@ -275,6 +277,7 @@ Formula:
 
 | Parameter        | Value     | Rationale                               |
 |------------------|-----------|-----------------------------------------|
+| fit_residual     | f32       | Normalized LM residual (lower = better fit) |
 | Stamp radius min | 8 px      | Enough pixels for reliable moments      |
 | Stamp radius max | 50 px     | Limit memory and computation            |
 | Stamp scale      | 4 * sigma | Captures >99.9% of Gaussian energy      |
