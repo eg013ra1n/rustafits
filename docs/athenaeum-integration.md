@@ -71,7 +71,7 @@ let result = ImageAnalyzer::new()
 |-------|------|-------------|
 | `width`, `height` | `usize` | Image dimensions (native resolution). |
 | `stars` | `Vec<StarMetrics>` | Per-star metrics, sorted by flux descending. |
-| `stars_detected` | `usize` | Total stars with valid PSF measurements. |
+| `stars_detected` | `usize` | Total stars detected (before measure cap). |
 | `median_fwhm` | `f32` | Median FWHM (pixels). Good seeing: 2-3 px. |
 | `median_eccentricity` | `f32` | Median eccentricity. 0 = round, >0.5 = elongated. |
 | `median_snr` | `f32` | Median per-star SNR. |
@@ -82,7 +82,7 @@ let result = ImageAnalyzer::new()
 | `frame_snr` | `f32` | Per-frame SNR: background / noise. For stacking: `stacked_snr = sqrt(sum(frame_snr_i²))`. |
 | `trail_r_squared` | `f32` | Rayleigh R² for directional coherence. 0 = no trail, 1 = strong trail. |
 | `median_beta` | `Option<f32>` | Median Moffat β. Always `Some(...)` with default settings (Moffat is always-on). |
-| `possibly_trailed` | `bool` | Advisory trail flag (dual-path Rayleigh test). |
+| `possibly_trailed` | `bool` | Advisory trail flag (two-stage: Rayleigh + PSF-fit ecc). |
 
 ### Key `StarMetrics` Fields
 
@@ -99,6 +99,7 @@ let result = ImageAnalyzer::new()
 | `flux` | `f32` | Total background-subtracted flux (ADU). |
 | `beta` | `Option<f32>` | Moffat β shape parameter. `None` if Gaussian fit. |
 | `fit_method` | `FitMethod` | Which fitting method produced this measurement. |
+| `fit_residual` | `f32` | Normalized fit quality (lower = better). 1.0 for moments fallback. |
 
 ### Analyzer Builder Methods
 
@@ -111,7 +112,11 @@ let result = ImageAnalyzer::new()
 | `with_max_stars(usize)` | 200 | Keep only the brightest N stars in returned result. |
 | `with_mrs_layers(usize)` | 4 | MRS wavelet noise layers with iterative significance masking. |
 | `without_debayer()` | debayer on | Skip green-channel interpolation for OSC. |
-| `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection. |
+| `with_trail_threshold(f32)` | 0.5 | R² threshold for Rayleigh trail detection (Stage 1 Path A). |
+| `with_measure_cap(usize)` | 2000 | Max stars to PSF-fit. 0 = measure all. Dense fields benefit most. |
+| `with_fit_max_iter(usize)` | 25 | LM max iterations for measurement pass (calibration always 50). |
+| `with_fit_tolerance(f64)` | 1e-4 | LM convergence tolerance for measurement pass (calibration always 1e-6). |
+| `with_fit_max_rejects(usize)` | 5 | LM consecutive reject bailout. |
 | `with_thread_pool(pool)` | global | Route parallel work to a custom rayon pool. |
 
 ### Recommended Settings
@@ -124,13 +129,21 @@ handles gradients, vignetting, and nebulosity out of the box.
 // Recommended production configuration
 let result = ImageAnalyzer::new()
     .with_max_stars(500)             // Return top 500 for annotation
+    .with_measure_cap(2000)          // PSF-fit top 2000 brightest (default)
     .with_thread_pool(pool.clone())
     .analyze("light.fits")?;
 ```
 
 This uses the defaults: two-pass Moffat calibration, mesh-grid background (auto cell
-size), MRS wavelet noise (4 layers with significance masking), detection sigma 5.0. These defaults are well-tested
+size), MRS wavelet noise (4 layers with significance masking), detection sigma 5.0,
+measure cap 2000, fit-residual-weighted statistics. These defaults are well-tested
 across all image types (mono, OSC, dense fields, nebulae).
+
+**Measure cap:** The `measure_cap` (default 2000) limits how many stars undergo
+PSF fitting. Stars are sorted by flux (brightest first) before capping. Statistics
+(FWHM, eccentricity, HFR) are computed from the measured population, while
+`stars_detected` reports the raw detection count. For very dense fields (>10K stars),
+this provides ~5x speedup with negligible accuracy impact. Set to 0 to measure all.
 
 ### PixInsight-Compatible Settings
 
@@ -145,12 +158,12 @@ let result = ImageAnalyzer::new()
     .analyze("light.fits")?;
 ```
 
-#### Expected accuracy vs PixInsight (file-by-file, 77 frames)
+#### Expected accuracy vs PixInsight (file-by-file, 77 M42 frames)
 
 | Metric | Accuracy vs PI | Notes |
 |--------|----------------|-------|
-| **FWHM** | -0.3% median bias | Near-perfect match |
-| **Eccentricity** | -0.067 offset, R²=0.984 | Systematic methodology difference (see below) |
+| **FWHM** | R²=0.995, -0.3% median bias | Near-perfect match (fit-residual-weighted) |
+| **Eccentricity** | R²=0.943, -0.069 median offset | Systematic methodology difference (see below) |
 | **Noise** | ~PI | MRS wavelet noise (default 4 layers, significance masking) |
 | **Star count** | ~3x PI | We detect more faint stars |
 
@@ -158,17 +171,29 @@ let result = ImageAnalyzer::new()
 
 Our eccentricity comes from the **Moffat/Gaussian fit** axis ratio: `e = sqrt(1 - (b/a)^2)`.
 PixInsight likely uses **image moments** for eccentricity, which gives systematically
-higher values (mean offset ~+0.067). The frame-to-frame correlation is excellent
-(R²=0.984), meaning relative rankings are correct — only the absolute scale differs.
+higher values (mean offset ~+0.069). The frame-to-frame correlation is excellent
+(R²=0.943), meaning relative rankings are correct — only the absolute scale differs.
 
 If Athenaeum displays eccentricity alongside PI values, consider noting this
 calibration difference, or applying a linear correction for display purposes.
 
+#### Fit-residual weighting
+
+Statistics (FWHM, eccentricity, HFR) are computed using **sigma-clipped weighted
+medians** where each star's weight is `1 / (1 + fit_residual)`. Well-fit stars
+(low residual) contribute more than poorly-fit or moments-fallback stars. This
+continuous quality weighting is analogous to PixInsight's StarResidual weighting
+and is the primary reason for the improved R² values vs v0.7.1.
+
 #### When to use each setting
 
-| Setting | Use when |
-|---------|----------|
-| `with_mrs_layers(n)` | Default 4 layers matches PixInsight. Decrease to 1 for speed if noise accuracy is not critical. |
+| Setting | Default | Use when |
+|---------|---------|----------|
+| `with_mrs_layers(n)` | 4 | Default matches PixInsight. Decrease to 1 for speed if noise accuracy is not critical. |
+| `with_measure_cap(n)` | 2000 | Default is fast and accurate. Increase for very dense fields if top-2000 isn't representative. Set 0 for no limit. |
+| `with_fit_max_iter(n)` | 25 | Increase to 50 for maximum accuracy at the cost of speed. |
+| `with_fit_tolerance(tol)` | 1e-4 | Decrease to 1e-6 for tighter convergence (slower). |
+| `with_trail_threshold(t)` | 0.5 | Lower to 0.3 for more aggressive trail detection (more false positives). Raise to 0.7 for fewer flags. |
 
 For general-purpose Athenaeum use, the defaults give the best overall results:
 accurate FWHM, stable eccentricity, and high star counts for field coverage.
@@ -306,28 +331,50 @@ For each detected star:
 
 ---
 
-## 4. Trail Detection
+## 4. Trail Detection (Two-Stage)
 
 Trail detection is **advisory** — the pipeline always computes full metrics and
 reports trail status via `trail_r_squared` and `possibly_trailed`.
+
+> **Changed in v0.7.3:** Trail detection is now **two-stage**. Stage 1 uses the
+> Rayleigh test on detection-stage moments (angle coherence). Stage 2 refines the
+> result after PSF fitting using accurate fitted eccentricity — catching non-coherent
+> guiding issues (wind shake, vibration) that the angle-based test cannot detect.
+> Minimum star count raised from 5 to 20.
 
 ### `trail_r_squared`
 
 | Value | Meaning |
 |-------|---------|
-| 0.0 | Uniform angles (no trail) or < 5 stars |
-| 0.01-0.15 | Typical undersampled round stars |
+| 0.0 | Uniform angles (no trail) or < 20 stars |
+| 0.01-0.15 | Typical undersampled round stars (grid-induced) |
 | 0.15-0.40 | Oversampled with field-angle effects (coma, curvature) |
 | 0.50-0.70 | Suspicious — possible mild trailing |
-| 0.70-1.00 | Strong trail |
+| 0.70-1.00 | Strong coherent trail |
 
 ### `possibly_trailed`
 
-Set to `true` when either path fires:
-- **Path A**: R² > threshold AND p < 0.01
-- **Path B**: median detection-stage ecc > 0.6 AND p < 0.05
+Two-stage detection — set to `true` when any stage fires:
 
-The threshold defaults to 0.5, configurable via `with_trail_threshold()`.
+**Stage 1 — Rayleigh test (before PSF measurement):**
+- **Path A**: R̄² > threshold AND p < 0.01 (catches coherent trails: RA drift)
+- **Path B**: R̄² > 0.05 AND median detection-stage ecc > 0.6 AND p < 0.05 (catches undersampled trails)
+- Requires ≥20 detected stars. The threshold defaults to 0.5, configurable via `with_trail_threshold()`.
+
+**Stage 2 — PSF-fit eccentricity (after PSF measurement):**
+- If median PSF-fit eccentricity > 0.55, the frame is flagged regardless of Rayleigh result.
+- Catches **non-coherent guiding issues** (wind shake, vibration, periodic error) where
+  star elongation angles are random but all stars are clearly elongated.
+
+```
+possibly_trailed = rayleigh_trailed OR (fit_median_ecc > 0.55)
+```
+
+### Effect on Statistics
+
+When `possibly_trailed = true`, the ecc ≤ 0.8 filter is **bypassed** for FWHM,
+eccentricity, and HFR statistics. This ensures trailed frames report accurate (high)
+eccentricity values rather than having the signal suppressed by the filter.
 
 ---
 
@@ -443,13 +490,15 @@ For batch frame ranking where speed matters more than maximum accuracy:
 ```rust
 let analyzer = ImageAnalyzer::new()
     .with_mrs_layers(1)       // 1 layer: ~15% faster background stage
-    .with_max_stars(50)       // fewer star records returned (stats still use all)
+    .with_measure_cap(500)    // PSF-fit only top 500 brightest
+    .with_max_stars(50)       // fewer star records returned (stats still use all measured)
     .with_thread_pool(pool.clone());
 ```
 
 | Optimization | Speedup | Trade-off |
 |---|---|---|
 | `with_mrs_layers(1)` | ~10-15% | Less accurate noise on nebula-rich fields |
+| `with_measure_cap(500)` | ~3x on dense fields | Statistics from top 500 only (usually fine) |
 | `with_max_stars(50)` | Negligible | Fewer star records in output (medians unchanged) |
 | Shared pool + concurrency 2 | ~15-25% vs no pool + concurrency 4 | Requires pool setup |
 
@@ -497,20 +546,25 @@ let image = ImageConverter::new()
     .process("light_001.fits")?;
 
 // Defaults handle everything: two-pass Moffat calibration,
-// mesh-grid background (auto cell size), MRS wavelet noise (4 layers)
+// mesh-grid background (auto cell size), MRS wavelet noise (4 layers),
+// measure cap 2000, fit-residual-weighted statistics, two-stage trail detection
 let result = ImageAnalyzer::new()
     .with_max_stars(500)             // Return top 500 stars for annotation
     .with_thread_pool(pool.clone())
     .analyze("light_001.fits")?;
 
 // Display metrics in subframe inspector
-println!("Stars: {}  FWHM: {:.2}  Ecc: {:.3}  HFR: {:.2}  R²: {:.3}",
+println!("Stars: {} (detected: {})  FWHM: {:.2}  Ecc: {:.3}  HFR: {:.2}  R²: {:.3}",
     result.stars.len(),
+    result.stars_detected,
     result.median_fwhm,
     result.median_eccentricity,
     result.median_hfr,
     result.trail_r_squared,
 );
+if result.possibly_trailed {
+    println!("  WARNING: possibly trailed (R²={:.3})", result.trail_r_squared);
+}
 if let Some(beta) = result.median_beta {
     println!("  Moffat beta: {:.2}", beta);
 }
@@ -543,14 +597,16 @@ is needed. To increase wavelet layers for nebula-rich fields:
 ```rust
 let result = ImageAnalyzer::new()
     .with_mrs_layers(4)              // Default: 4-layer significance masking
+    .with_measure_cap(2000)          // Default: PSF-fit top 2000 brightest
     .with_max_stars(500)
     .with_thread_pool(pool.clone())
     .analyze("light_001.fits")?;
 
-// FWHM will be within ~0.3% of PI SubframeSelector
-// Eccentricity will be ~0.067 lower than PI (methodology difference)
+// FWHM: R²=0.995 vs PI, -0.3% median bias (fit-residual-weighted)
+// Eccentricity: R²=0.943 vs PI, ~0.069 lower (methodology difference)
 // Noise matches PI (MRS wavelet noise, 4 layers with significance masking)
 // Star count will be ~3x PI (we detect more faint stars)
+// Trail detection: two-stage (Rayleigh + PSF-fit ecc > 0.55)
 ```
 
 ---
@@ -567,7 +623,7 @@ Core metrics — always available:
 | Eccentricity | `median_eccentricity` | `{:.3}` | Median eccentricity. 0=round, >0.5=elongated |
 | HFR | `median_hfr` | `{:.2}` | Half-flux radius in pixels |
 | Stars | `stars.len()` | integer | Stars returned (capped at `max_stars`) |
-| Stars Detected | `stars_detected` | integer | Total stars with valid PSF fits |
+| Stars Detected | `stars_detected` | integer | Total stars detected (before measure cap) |
 | Moffat β | `median_beta` | `{:.2}` | Moffat shape param. Typical: 2-5. Always present with defaults |
 | Background | `background` | `{:.0}` | Global background level (ADU) |
 | Noise | `noise` | `{:.1}` | Background noise sigma (ADU) |
@@ -605,6 +661,9 @@ Each reveals different quality issues:
 - Display `possibly_trailed` as a warning icon, not auto-reject
 - Allow sorting/filtering by `trail_r_squared`
 - Consider exposing trail threshold in preferences (default 0.5, range 0.3-0.8)
+- Two-stage detection catches both coherent (RA drift) and non-coherent (wind shake) issues
+- When `possibly_trailed = true`, eccentricity values are accurate (not suppressed by filter)
+- Consider showing trail type hint: high R² = directional trail, low R² + high ecc = guiding issue
 
 ---
 
@@ -673,7 +732,7 @@ rustafits v0.6.4 to v0.7.0.
 - Default background changed from global to mesh-grid (auto cell size)
 - Accuracy vs PixInsight improved: FWHM -0.3% median (was +1.1%), ecc R²=0.984
 
-**Remaining builder methods (unchanged):**
+**Remaining builder methods (unchanged from v0.7.0):**
 - `with_detection_sigma(f32)` — default 5.0
 - `with_min_star_area(usize)` — default 5
 - `with_max_star_area(usize)` — default 2000
@@ -683,6 +742,12 @@ rustafits v0.6.4 to v0.7.0.
 - `with_trail_threshold(f32)` — default 0.5
 - `without_debayer()` — skip OSC green interpolation
 - `with_thread_pool(Arc<ThreadPool>)` — custom rayon pool
+
+**New in v0.7.3:**
+- `with_measure_cap(usize)` — default 2000, max stars to PSF-fit (0 = all)
+- `with_fit_max_iter(usize)` — default 25, LM iterations for measurement pass
+- `with_fit_tolerance(f64)` — default 1e-4, LM convergence tolerance
+- `with_fit_max_rejects(usize)` — default 5, LM consecutive reject bailout
 
 ### 9.1 Dependency Version Bump
 
@@ -821,7 +886,7 @@ Update the description to note it defaults to 1 (always-on).
 Update the `AnalysisConfig` interface and `DEFAULT_ANALYSIS_CONFIG` to match:
 - Remove `use_gaussian_fit`, `background_mesh_size`, `use_moffat_fit`,
   `iterative_background`, `moffat_beta`, `max_distortion`
-- Rename `mrs_noise` → `mrs_layers`, default `1`
+- Rename `mrs_noise` → `mrs_layers`, default `4`
 
 ### 9.8 `median_beta` is Now Always Present
 
@@ -834,3 +899,100 @@ strictly required — but the conditional check can be simplified:
   be removed (beta is always present now)
 - `LightsAnalysisTable.tsx`: `hasBeta` will always be `true` — the Beta column will
   always show
+
+---
+
+## 11. Migrating from v0.7.1 to v0.7.3
+
+This section covers changes from rustafits v0.7.1 to v0.7.3.
+
+### 11.0 Release Summary — What Changed
+
+**Non-breaking additions:**
+- `StarMetrics.fit_residual: f32` — new field, normalized fit quality metric
+- `with_measure_cap(usize)` — new builder method (default 2000)
+- `with_fit_max_iter(usize)` — new builder method (default 25)
+- `with_fit_tolerance(f64)` — new builder method (default 1e-4)
+- `with_fit_max_rejects(usize)` — new builder method (default 5)
+
+**Behavioral changes (no API breakage):**
+- Trail detection is now two-stage (Rayleigh + PSF-fit eccentricity > 0.55)
+- Minimum star count for Rayleigh test raised from 5 to 20
+- Statistics use fit-residual-weighted sigma-clipped medians (was unweighted)
+- FWHM/ecc/HFR statistics bypass ecc ≤ 0.8 filter on trailed frames
+- `stars_detected` now reports raw detection count (before measure cap)
+- FWHM R² improved from 0.972 to 0.995 vs PixInsight
+- Eccentricity R² improved from 0.916 to 0.943 vs PixInsight
+
+### 11.1 Dependency Version Bump
+
+| File | Change |
+|------|--------|
+| `crates/athenaeum-core/Cargo.toml` | `rustafits = "0.7"` (no change needed if using `"0.7"`) |
+
+### 11.2 New `StarMetrics.fit_residual` Field
+
+`fit_residual: f32` is new on `StarMetrics`. Lower values = better fit quality.
+
+- Moffat/Gaussian fits: `sqrt(Σ(data-model)² / n_pixels) / amplitude` (typically 0.01-0.50)
+- Moments fallback: fixed `1.0`
+- **Optional:** expose in per-star UI if Athenaeum shows individual star metrics
+- **Optional:** store in DB if star-level quality analysis is desired
+
+### 11.3 New Builder Methods (All Optional)
+
+All new methods have sensible defaults — no changes required unless tuning is desired.
+
+| Method | Default | When to expose in Athenaeum settings |
+|--------|---------|--------------------------------------|
+| `with_measure_cap(n)` | 2000 | If users analyze very dense fields (>10K stars) and want full coverage |
+| `with_fit_max_iter(n)` | 25 | Advanced tuning only — increase for marginal accuracy gain |
+| `with_fit_tolerance(tol)` | 1e-4 | Advanced tuning only |
+| `with_fit_max_rejects(n)` | 5 | Advanced tuning only |
+
+**Recommended:** Add `measure_cap` to `AnalysisConfig` with default 2000. The other
+three are advanced and can be left at defaults unless users report fitting issues.
+
+### 11.4 Trail Detection Changes
+
+`possibly_trailed` now fires in two stages:
+1. Rayleigh test on detection-stage angles (unchanged logic, but min stars raised to 20)
+2. **New:** post-measurement check — if median PSF-fit eccentricity > 0.55
+
+**UI impact:**
+- More frames may be flagged as trailed (wind shake / vibration now caught)
+- `trail_r_squared` may be low (< 0.1) on frames flagged only by Stage 2 — this is correct
+  (non-coherent issues have random angles, hence low R²)
+- Consider showing a tooltip: "High eccentricity detected (guiding issue)" when
+  `possibly_trailed = true` but `trail_r_squared < 0.3`
+
+### 11.5 Statistics Accuracy Changes
+
+Frame-level statistics (FWHM, eccentricity, HFR) are now computed using
+**fit-residual-weighted sigma-clipped medians**. This is a transparent improvement —
+the fields and types are unchanged, only the values are more accurate.
+
+**Impact on stored data:** If Athenaeum stores historical frame analysis results,
+re-analyzing existing frames will produce slightly different FWHM/ecc/HFR values.
+Consider noting the analysis version in the database to track this.
+
+### 11.6 `AnalysisConfig` Additions
+
+**File:** `crates/athenaeum-core/src/analysis/config.rs`
+
+Add new optional fields:
+
+```rust
+pub measure_cap: u32,      // default 2000
+```
+
+**File:** `src/types/analysis-config.ts`
+
+```typescript
+measure_cap: number;  // default 2000
+```
+
+**File:** `src/components/analysis/AnalysisSettingsPanel.tsx`
+
+Optional: Add "Measure Cap" input (range 0-10000, step 100). Description:
+"Maximum stars to PSF-fit. 0 = measure all. Default 2000."
