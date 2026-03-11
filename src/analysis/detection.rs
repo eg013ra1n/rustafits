@@ -112,9 +112,9 @@ pub fn detect_stars(
     let grid_h = (height + cell_size - 1) / cell_size;
     let mut grid: Vec<Vec<usize>> = vec![Vec::new(); grid_w * grid_h];
 
-    let mut peak_positions: Vec<(usize, usize)> = Vec::new();
+    let mut peak_positions: Vec<(usize, usize, f32)> = Vec::new();
 
-    for (i, &(px, py, _)) in peaks.iter().enumerate() {
+    for (i, &(px, py, conv_val)) in peaks.iter().enumerate() {
         let gx = px / cell_size;
         let gy = py / cell_size;
 
@@ -131,7 +131,7 @@ pub fn detect_stars(
                     let (kx, ky, _) = peaks[kept_idx];
                     let dx = px as f32 - kx as f32;
                     let dy = py as f32 - ky as f32;
-                    if dx * dx + dy * dy < sup_radius_sq {
+                    if dx * dx + dy * dy <= sup_radius_sq {
                         is_suppressed = true;
                         break 'outer;
                     }
@@ -141,7 +141,7 @@ pub fn detect_stars(
 
         if !is_suppressed {
             grid[gy * grid_w + gx].push(i);
-            peak_positions.push((px, py));
+            peak_positions.push((px, py, conv_val));
         }
     }
 
@@ -200,13 +200,13 @@ pub fn detect_stars(
     }
 
     // Collect components: only those near a detected peak
-    // Build map of label → peak positions (for deblending multi-peak components)
+    // Build map of label → peak positions + conv values (for multi-peak detection)
     use std::collections::HashMap;
-    let mut peak_map: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
-    for &(px, py) in &peak_positions {
+    let mut peak_map: HashMap<u32, Vec<(usize, usize, f32)>> = HashMap::new();
+    for &(px, py, conv_val) in &peak_positions {
         let l = labels[py * width + px];
         if l > 0 {
-            peak_map.entry(l).or_default().push((px, py));
+            peak_map.entry(l).or_default().push((px, py, conv_val));
         } else {
             // Peak might be just off — check neighbors, add to first found label
             'search: for dy in -1i32..=1 {
@@ -216,7 +216,7 @@ pub fn detect_stars(
                     if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
                         let l2 = labels[ny as usize * width + nx as usize];
                         if l2 > 0 {
-                            peak_map.entry(l2).or_default().push((px, py));
+                            peak_map.entry(l2).or_default().push((px, py, conv_val));
                             break 'search;
                         }
                     }
@@ -236,43 +236,41 @@ pub fn detect_stars(
         }
     }
 
-    // Validate components, deblend multi-peak blobs, and compute centroids
+    // Validate components and compute centroids.
+    // Multi-peak components (blended stars) are skipped entirely — blended profiles
+    // produce unreliable FWHM/eccentricity. (PixInsight StarDetector uses the same approach.)
+    // Only count peaks with >30% of the component's strongest convolution response;
+    // weaker peaks are noise artifacts, not genuine blended stars.
     let mut stars = Vec::new();
     for (label, pixels) in &components {
         let peaks = &peak_map[label];
-        if peaks.len() <= 1 || pixels.len() > params.max_star_area {
-            // Single peak, or component too large to be merged stars: process as whole.
-            // Extended objects (comet comae, nebulae) create huge CCL blobs with many
-            // convolution peaks — deblending would produce false detections.
-            if let Some(star) = process_component(pixels, data, width, height, background, bg_map, params) {
-                stars.push(star);
-            }
-        } else {
-            // Multi-peak with reasonable per-peak size: split by nearest peak (Voronoi tessellation)
-            let mut subs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); peaks.len()];
-            for &(x, y) in pixels {
-                let nearest = peaks
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, &(px, py))| {
-                        let dx = x as i32 - px as i32;
-                        let dy = y as i32 - py as i32;
-                        (dx * dx + dy * dy) as u32
-                    })
-                    .unwrap()
-                    .0;
-                subs[nearest].push((x, y));
-            }
-            for sub in &subs {
-                if let Some(star) = process_component(sub, data, width, height, background, bg_map, params) {
-                    stars.push(star);
-                }
-            }
+        let max_conv = peaks.iter().map(|p| p.2).fold(0.0_f32, f32::max);
+        let significant_peaks = peaks.iter().filter(|p| p.2 > 0.3 * max_conv).count();
+        if significant_peaks > 1 {
+            continue;
+        }
+        if let Some(star) = process_component(pixels, data, width, height, background, bg_map, params) {
+            stars.push(star);
         }
     }
 
-    // Sort by flux descending (useful for two-pass FWHM estimation on top-20 brightest)
+    // Post-detection centroid dedup: belt-and-suspenders safety net catches any
+    // remaining duplicates from NMS edge cases.
+    let dedup_radius = (fwhm * 0.5).max(1.5_f32);
+    let dedup_radius_sq = dedup_radius * dedup_radius;
     stars.sort_by(|a, b| b.flux.total_cmp(&a.flux));
+    let mut deduped: Vec<DetectedStar> = Vec::with_capacity(stars.len());
+    for star in stars.drain(..) {
+        let is_dup = deduped.iter().any(|k| {
+            let dx = star.x - k.x;
+            let dy = star.y - k.y;
+            dx * dx + dy * dy <= dedup_radius_sq
+        });
+        if !is_dup {
+            deduped.push(star);
+        }
+    }
+    stars = deduped;
 
     stars
 }
@@ -509,7 +507,8 @@ mod tests {
             saturation_limit: 0.95 * 65535.0,
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
+        let fwhm = 3.0 * 2.3548; // sigma=3.0 → fwhm≈7.06
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm);
 
         // Should detect all 5 stars
         assert!(
@@ -595,9 +594,10 @@ mod tests {
     }
 
     #[test]
-    fn test_deblend_close_stars() {
+    fn test_skip_blended_close_stars() {
         // Two stars 8px apart with sigma=1.5 — their wings overlap at 1.5σ threshold,
-        // merging into one CCL component. Deblending should split them.
+        // merging into one CCL component with two peaks. With the PI approach, the
+        // multi-peak component is skipped entirely (blended profiles are unreliable).
         let width = 100;
         let height = 100;
         let background = 1000.0;
@@ -618,30 +618,65 @@ mod tests {
 
         let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
 
-        assert!(
-            stars.len() >= 2,
-            "Expected at least 2 deblended stars, got {} (centroids: {:?})",
-            stars.len(),
+        // With multi-peak skip, blended pair may produce 0 detections (if CCL merges
+        // them) or 2 (if CCL keeps them separate). Either way: no duplicates.
+        let mut dup_count = 0;
+        for (i, a) in stars.iter().enumerate() {
+            for b in stars.iter().skip(i + 1) {
+                let dx = a.x - b.x;
+                let dy = a.y - b.y;
+                if (dx * dx + dy * dy).sqrt() < 3.0 {
+                    dup_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            dup_count, 0,
+            "No duplicate detections expected, got {} close pairs (centroids: {:?})",
+            dup_count,
             stars.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>()
         );
+    }
 
-        // Each true star should have a detection within 2px
-        for &(sx, sy, _, _) in &star_defs {
-            let closest = stars
-                .iter()
-                .map(|s| {
-                    let dx = s.x - sx;
-                    let dy = s.y - sy;
-                    (dx * dx + dy * dy).sqrt()
-                })
-                .min_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap();
-            assert!(
-                closest < 2.0,
-                "Star at ({}, {}) not found within 2px (closest={})",
-                sx, sy, closest
-            );
-        }
+    #[test]
+    fn test_no_duplicate_detections() {
+        // Single bright star — must produce exactly 1 detection, never a duplicate.
+        let width = 100;
+        let height = 100;
+        let background = 1000.0;
+        let noise = 30.0;
+        let star_defs = vec![
+            (50.0, 50.0, 10000.0, 2.5),
+        ];
+
+        let data = make_star_field(width, height, &star_defs, background, noise);
+
+        let params = DetectionParams {
+            detection_sigma: 5.0,
+            min_star_area: 3,
+            max_star_area: 2000,
+            saturation_limit: 0.95 * 65535.0,
+        };
+
+        let fwhm = 2.5 * 2.3548; // sigma=2.5
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm);
+
+        // Count detections within one FWHM of the true position
+        let near: Vec<_> = stars
+            .iter()
+            .filter(|s| {
+                let dx = s.x - 50.0;
+                let dy = s.y - 50.0;
+                (dx * dx + dy * dy).sqrt() < fwhm
+            })
+            .collect();
+
+        assert_eq!(
+            near.len(), 1,
+            "Expected exactly 1 detection near (50,50), got {} (centroids: {:?})",
+            near.len(),
+            stars.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>()
+        );
     }
 
     #[test]

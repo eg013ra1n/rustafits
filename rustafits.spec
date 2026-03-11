@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.7.3
+Version:        0.7.5
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,11 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Thu Mar 12 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.7.5-1
+- Fix duplicate star detections: replace Voronoi deblending with multi-peak skip
+- Fix NMS boundary off-by-one in star detection
+- Add post-detection centroid dedup safety net
+
 * Tue Mar 11 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.7.3-1
 - Add fit-residual-weighted statistics for improved PixInsight agreement
 - Add two-stage trail detection (Rayleigh + PSF-fit eccentricity)
