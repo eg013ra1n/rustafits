@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.6.4
+Version:        0.7.3
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,14 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Tue Mar 11 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.7.3-1
+- Add fit-residual-weighted statistics for improved PixInsight agreement
+- Add two-stage trail detection (Rayleigh + PSF-fit eccentricity)
+- Add trail-aware statistics (bypass ecc filter on trailed frames)
+- Add LmResult struct with fit_residual from LM solvers
+- Fix Rayleigh test: add R² floor, proper even-length median, raise min stars to 20
+- Update all documentation for new pipeline features
+
 * Sun Mar 08 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.6.4-1
 - Add MRS wavelet noise estimation (B3-spline à trous transform)
 - Add fixed-beta Moffat PSF fitting (7 free parameters)
