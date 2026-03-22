@@ -921,17 +921,22 @@ git add src/analysis/ && git commit -m "test: adjust thresholds after optimizati
 
 - [ ] **Step 1: Benchmark before vs after**
 
-If you have access to a batch of FITS frames (M42 dataset):
+M42 dataset (77 frames) is at `tests/pix_tests/LIGHTS/`:
+
 ```bash
-time for f in /path/to/frames/*.fits; do cargo run --release --features debug-pipeline -- measure "$f" 2>/dev/null; done
+time for f in tests/pix_tests/LIGHTS/*.fits; do cargo run --release --features debug-pipeline -- measure "$f" 2>/dev/null; done
 ```
 
-Otherwise, benchmark on the 4 test files with timing:
+Also benchmark on the 4 standard test files:
+
 ```bash
 time cargo run --release --features debug-pipeline -- measure tests/cocoon.fits 2>/dev/null
+time cargo run --release --features debug-pipeline -- measure tests/mono.fits 2>/dev/null
+time cargo run --release --features debug-pipeline -- measure tests/osc.fits 2>/dev/null
+time cargo run --release --features debug-pipeline -- measure tests/test.xisf 2>/dev/null
 ```
 
-Expected: ~2x speedup or better compared to pre-optimization timing.
+Expected: ~2x speedup or better compared to pre-optimization timing on the M42 batch.
 
 - [ ] **Step 2: Document results**
 
