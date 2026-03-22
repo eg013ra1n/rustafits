@@ -185,7 +185,7 @@ impl ImageAnalyzer {
                 apply_debayer: true,
                 trail_r_squared_threshold: 0.5,
                 noise_layers: 4,
-                measure_cap: 2000,
+                measure_cap: 500,
                 fit_max_iter: 25,
                 fit_tolerance: 1e-4,
                 fit_max_rejects: 5,
