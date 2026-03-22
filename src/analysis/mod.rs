@@ -451,6 +451,8 @@ impl ImageAnalyzer {
                 green_mask,
                 None, // free-beta Moffat
                 50, 1e-6, 5, // calibration always uses full precision
+                None,   // no screening for calibration
+                false,  // not trailed
             );
 
             let mut beta_vals: Vec<f32> = cal_measured.iter().filter_map(|s| s.beta).collect();
@@ -602,6 +604,8 @@ impl ImageAnalyzer {
             self.config.fit_max_iter,
             self.config.fit_tolerance,
             self.config.fit_max_rejects,
+            Some(field_fwhm),     // enable moments screening
+            possibly_trailed,      // bypass ecc gate on trailed frames
         );
 
         if measured.is_empty() {
