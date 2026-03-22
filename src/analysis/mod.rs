@@ -589,16 +589,53 @@ impl ImageAnalyzer {
         // ── Stage 3: PSF Measurement (with measure cap) ─────────────────
         let stars_detected = detected.len();
 
-        // Apply measure cap: only fit the brightest N stars (already sorted by flux)
+        // Apply measure cap with spatial grid balancing.
+        // Divide image into 4×4 grid, round-robin select from each cell
+        // to ensure spatial coverage across the field.
         let effective_cap = if self.config.measure_cap == 0 {
             detected.len()
         } else {
             self.config.measure_cap
         };
-        let to_measure = &detected[..detected.len().min(effective_cap)];
+
+        let to_measure: Vec<detection::DetectedStar> = if detected.len() <= effective_cap {
+            detected.clone()
+        } else {
+            debug_assert!(
+                detected.windows(2).all(|w| w[0].flux >= w[1].flux),
+                "detected stars must be sorted by flux descending"
+            );
+            const GRID_N: usize = 4;
+            let cell_w = width as f32 / GRID_N as f32;
+            let cell_h = height as f32 / GRID_N as f32;
+            let mut buckets: Vec<Vec<&detection::DetectedStar>> =
+                vec![Vec::new(); GRID_N * GRID_N];
+
+            for star in &detected {
+                let gx = ((star.x / cell_w) as usize).min(GRID_N - 1);
+                let gy = ((star.y / cell_h) as usize).min(GRID_N - 1);
+                buckets[gy * GRID_N + gx].push(star);
+            }
+
+            let mut selected: Vec<detection::DetectedStar> = Vec::with_capacity(effective_cap);
+            let mut idx = vec![0usize; GRID_N * GRID_N];
+            loop {
+                let mut added_any = false;
+                for cell in 0..(GRID_N * GRID_N) {
+                    if selected.len() >= effective_cap { break; }
+                    if idx[cell] < buckets[cell].len() {
+                        selected.push(buckets[cell][idx[cell]].clone());
+                        idx[cell] += 1;
+                        added_any = true;
+                    }
+                }
+                if !added_any || selected.len() >= effective_cap { break; }
+            }
+            selected
+        };
 
         let mut measured = metrics::measure_stars(
-            &lum, width, height, to_measure,
+            &lum, width, height, &to_measure,
             bg_result.background, bg_map_ref,
             green_mask, field_beta,
             self.config.fit_max_iter,
