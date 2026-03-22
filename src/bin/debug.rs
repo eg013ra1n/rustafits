@@ -309,7 +309,7 @@ fn run_detection(
     let pass1 = detection::detect_stars(
         lum, w, h,
         bg.background, bg.noise,
-        bg_map_ref, noise_map_ref, &det_params, initial_fwhm,
+        bg_map_ref, noise_map_ref, &det_params, initial_fwhm, None,
     );
 
     let measured_fwhm = estimate_fwhm_from_stars(
@@ -324,7 +324,7 @@ fn run_detection(
         let d = detection::detect_stars(
             lum, w, h,
             bg.background, bg.noise,
-            bg_map_ref, noise_map_ref, &det_params, capped,
+            bg_map_ref, noise_map_ref, &det_params, capped, None,
         );
         (d, capped)
     } else {
@@ -997,7 +997,7 @@ fn cmd_pipeline(
     let pass1 = detection::detect_stars(
         lum, w, h,
         bg.background, bg.noise,
-        bg_map_ref, noise_map_ref, &det_params, initial_fwhm,
+        bg_map_ref, noise_map_ref, &det_params, initial_fwhm, None,
     );
     let pass1_count = pass1.len();
 
@@ -1012,7 +1012,7 @@ fn cmd_pipeline(
         let d = detection::detect_stars(
             lum, w, h,
             bg.background, bg.noise,
-            bg_map_ref, noise_map_ref, &det_params, capped,
+            bg_map_ref, noise_map_ref, &det_params, capped, None,
         );
         (d, capped)
     } else {
@@ -1443,7 +1443,7 @@ fn analyze_one_file(
     let pass1 = detection::detect_stars(
         &lum, w, h,
         bg.background, bg.noise,
-        bg_map_ref, noise_map_ref, &det_params, initial_fwhm,
+        bg_map_ref, noise_map_ref, &det_params, initial_fwhm, None,
     );
     let measured_fwhm = estimate_fwhm_from_stars(
         &lum, w, h, &pass1, bg.background, bg_map_ref,
@@ -1456,7 +1456,7 @@ fn analyze_one_file(
         let d = detection::detect_stars(
             &lum, w, h,
             bg.background, bg.noise,
-            bg_map_ref, noise_map_ref, &det_params, capped,
+            bg_map_ref, noise_map_ref, &det_params, capped, None,
         );
         (d, capped)
     } else {
