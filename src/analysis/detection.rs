@@ -270,7 +270,7 @@ pub fn detect_stars(
                             + conv[(py + 1) * width + px]
                             + conv[(py + 1) * width + px + 1];
                         let sharpness = (cp - neighbors_sum / 8.0) / cp;
-                        if sharpness < 0.2 || sharpness > 0.9 {
+                        if sharpness < 0.1 || sharpness > 0.9 {
                             continue;
                         }
                     }

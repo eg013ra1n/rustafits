@@ -68,7 +68,7 @@ pub fn measure_stars(
     // Re-run with screening disabled (field_fwhm = None).
     if field_fwhm.is_some() && !possibly_trailed
         && result.len() < stars.len() / 2
-        && stars.len() >= 10
+        && stars.len() >= 3
     {
         return stars
             .par_iter()
