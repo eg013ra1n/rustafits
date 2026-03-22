@@ -422,6 +422,7 @@ impl ImageAnalyzer {
                 &lum, width, height,
                 bg_result.background, bg_result.noise,
                 bg_map, noise_map, &det_params, initial_fwhm,
+                None,
             )
         };
 
@@ -527,6 +528,7 @@ impl ImageAnalyzer {
                 &lum, width, height,
                 bg_result.background, bg_result.noise,
                 bg_map, noise_map, &det_params, final_fwhm,
+                Some(field_fwhm),
             )
         };
 

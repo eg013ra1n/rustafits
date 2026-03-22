@@ -1,6 +1,7 @@
 /// Star detection: DAOFIND-inspired matched filter + connected component labeling.
 
 /// A detected star candidate before metric computation.
+#[derive(Clone)]
 pub struct DetectedStar {
     /// Intensity-weighted centroid X (subpixel).
     pub x: f32,
@@ -45,6 +46,7 @@ impl Default for DetectionParams {
 /// `bg_map`: optional per-pixel background map (from mesh-grid estimation).
 /// `noise_map`: optional per-pixel noise map for adaptive thresholds.
 /// `fwhm`: estimated FWHM for matched filter kernel (pixels).
+/// `field_fwhm`: calibrated field FWHM from Pass 1 (used by Pass 2 filters; None in Pass 1).
 pub fn detect_stars(
     data: &[f32],
     width: usize,
@@ -55,6 +57,7 @@ pub fn detect_stars(
     noise_map: Option<&[f32]>,
     params: &DetectionParams,
     fwhm: f32,
+    _field_fwhm: Option<f32>,
 ) -> Vec<DetectedStar> {
     // Stage 1: Separable Gaussian convolution + peak detection
     let sigma = fwhm / 2.3548;
@@ -508,7 +511,7 @@ mod tests {
         };
 
         let fwhm = 3.0 * 2.3548; // sigma=3.0 → fwhm≈7.06
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm, None);
 
         // Should detect all 5 stars
         assert!(
@@ -573,7 +576,7 @@ mod tests {
             ..DetectionParams::default()
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0, None);
 
         // Should detect the real star but not the hot pixel
         assert!(
@@ -616,7 +619,7 @@ mod tests {
             saturation_limit: 0.95 * 65535.0,
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0, None);
 
         // With multi-peak skip, blended pair may produce 0 detections (if CCL merges
         // them) or 2 (if CCL keeps them separate). Either way: no duplicates.
@@ -659,7 +662,7 @@ mod tests {
         };
 
         let fwhm = 2.5 * 2.3548; // sigma=2.5
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm, None);
 
         // Count detections within one FWHM of the true position
         let near: Vec<_> = stars
@@ -726,7 +729,7 @@ mod tests {
             saturation_limit: 0.95 * 65535.0,
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0, None);
 
         // All 5 real stars should be detected
         for &(sx, sy, _, _) in &star_defs {
