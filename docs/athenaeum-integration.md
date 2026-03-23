@@ -996,3 +996,118 @@ measure_cap: number;  // default 2000
 
 Optional: Add "Measure Cap" input (range 0-10000, step 100). Description:
 "Maximum stars to PSF-fit. 0 = measure all. Default 2000."
+
+---
+
+## 12. Migration from v0.7.5 to v0.8.0
+
+### 12.1 Summary
+
+v0.8.0 optimizes the analysis pipeline for speed and robustness. The API is fully
+backward-compatible — no breaking changes. The behavioral changes are:
+
+1. **Default `measure_cap` changed from 2000 to 500.** This is the biggest impact.
+2. **New detection-stage filters** reject nebula knots, edge stars, and extended sources.
+3. **Moments-based pre-screening** rejects non-stellar candidates before expensive LM fitting.
+4. **Spatial grid selection** balances measured stars across the field.
+
+### 12.2 measure_cap Default Change (Action Required)
+
+The library default for `measure_cap` changed from **2000 to 500**.
+
+**If athenaeum uses `ImageAnalyzer::new()` without calling `.with_measure_cap()`:**
+The analysis will now measure ~500 stars instead of ~2000. This produces the same
+quality aggregate statistics (median FWHM, eccentricity, HFR) but with fewer per-star
+entries in `result.stars`. Frame ranking/sorting is unaffected.
+
+**If athenaeum stores per-star catalogs or uses `result.stars` for star matching:**
+Update the default in `AnalysisConfig` from 2000 to 500, or explicitly call
+`.with_measure_cap(500)` to match the new library default.
+
+**If athenaeum already calls `.with_measure_cap(n)` with an explicit value:**
+No change needed — the explicit value overrides the default.
+
+**Recommended action:** Update `AnalysisConfig.measure_cap` default from 2000 to 500.
+
+### 12.3 Detection Filter Changes (No Action Required)
+
+Three new morphological filters run automatically during Pass 2 detection:
+
+| Filter | What it rejects | Threshold |
+|--------|----------------|-----------|
+| Sharpness | Nebula knots (too diffuse), cosmic rays (too sharp) | [0.1, 0.9] |
+| Concentration index | Extended/diffuse sources | [0.15, 0.75] |
+| Edge margin | Stars within 2*FWHM of image edge | max(2*FWHM, 8px) |
+
+These filters are always active in Pass 2 and cannot be disabled. They improve
+the quality of `result.stars` by removing non-stellar detections that previously
+appeared as measured stars with poor fit residuals.
+
+**Impact on `result.stars_detected`:** May be slightly lower than before on frames
+with significant nebulosity (nebula knots no longer counted as stars).
+
+**Impact on aggregate statistics:** Generally improved — fewer junk detections
+means cleaner medians.
+
+### 12.4 Moments Pre-Screening (No Action Required)
+
+Before expensive LM fitting, each candidate is now screened using cheap image
+moments (~500x faster than LM). Candidates are rejected if:
+
+- Moment-FWHM outside [0.7x, 2.5x] the calibrated field FWHM
+- Moment eccentricity > 0.8 (bypassed on trailed frames)
+- Peak/mean sharpness outside [0.3, 5.0]
+
+Safety fallback: if screening rejects >50% of candidates (and the frame is not
+trailed and has >=3 stars), screening is disabled and all candidates are measured.
+This prevents over-filtering on unusual frames (extreme defocus, wind shake).
+
+**No API changes.** The screening is internal to `measure_stars`.
+
+### 12.5 Spatial Grid Selection (No Action Required)
+
+When `measure_cap` limits the number of stars measured, the selection now uses a
+4x4 spatial grid with round-robin selection instead of pure brightness ranking.
+This ensures spatial coverage across the field (prevents all measured stars from
+clustering near the field center where optical quality is best).
+
+**Impact:** `result.stars` will contain stars from all parts of the image, not
+just the brightest ones near the center. This improves the representativeness of
+aggregate statistics (median FWHM now reflects the full field, including edge
+aberrations).
+
+### 12.6 Performance Expectations
+
+With the default `measure_cap=500` and moments pre-screening:
+
+| Scenario | v0.7.5 | v0.8.0 | Speedup |
+|----------|--------|--------|---------|
+| Typical frame (6252x4176, ~7000 detected stars) | ~1.3s analysis | ~0.2-0.3s analysis | ~5x |
+| Dense field (>10000 detected stars) | ~2.0s+ analysis | ~0.3-0.4s analysis | ~5-6x |
+| Sparse field (<200 detected stars) | ~0.3s analysis | ~0.3s analysis | ~1x (no change) |
+
+**Note:** These are analysis-only times. Total conversion time (FITS read + stretch +
+JPEG encode) adds ~1.5s regardless of analysis settings.
+
+### 12.7 Accuracy Impact
+
+PixInsight comparison (77-frame M42 dataset):
+
+| Metric | v0.7.5 | v0.8.0 |
+|--------|--------|--------|
+| FWHM R² | 0.995 | 0.977 |
+| Ecc R² | 0.943 | 0.946 |
+
+Eccentricity agreement improved slightly. FWHM agreement decreased due to the
+spatial grid selection including more edge-of-field stars (which have larger FWHM
+from optical aberrations). The per-frame FWHM tracking remains very close — the R²
+reduction is driven by a few outlier frames.
+
+### 12.8 Athenaeum Checklist
+
+- [ ] Update rustafits dependency to v0.8.0
+- [ ] Update `AnalysisConfig.measure_cap` default from 2000 to 500
+- [ ] Update `measure_cap` UI control description: "Default 500 (was 2000)"
+- [ ] Re-test batch analysis performance (expect ~5x speedup on analysis-heavy workloads)
+- [ ] Verify frame ranking still works correctly with new star selection
+- [ ] Optional: re-analyze stored frames to update statistics with new filtering

@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.7.5
+Version:        0.8.0
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,12 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Mon Mar 24 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.0-1
+- Add detection-stage morphological filters (sharpness, concentration index, edge margin)
+- Add moments-based pre-screening gate before LM fitting
+- Add spatial grid selection for balanced star measurement
+- Lower default measure_cap from 2000 to 500
+
 * Thu Mar 12 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.7.5-1
 - Fix duplicate star detections: replace Voronoi deblending with multi-peak skip
 - Fix NMS boundary off-by-one in star detection
