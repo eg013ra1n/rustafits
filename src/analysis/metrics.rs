@@ -47,15 +47,42 @@ pub fn measure_stars(
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
+    field_fwhm: Option<f32>,
+    possibly_trailed: bool,
 ) -> Vec<MeasuredStar> {
     use rayon::prelude::*;
 
-    stars
+    let result: Vec<MeasuredStar> = stars
         .par_iter()
         .filter_map(|star| {
-            measure_single_star(data, width, height, star, background, bg_map, green_mask, field_beta, max_iter, conv_tol, max_rejects)
+            measure_single_star(
+                data, width, height, star, background, bg_map, green_mask,
+                field_beta, max_iter, conv_tol, max_rejects,
+                field_fwhm, possibly_trailed,
+            )
         })
-        .collect()
+        .collect();
+
+    // Safety fallback: if moments screening rejected >50% of candidates,
+    // the eccentricity gate may be too aggressive (extreme wind shake).
+    // Re-run with screening disabled (field_fwhm = None).
+    if field_fwhm.is_some() && !possibly_trailed
+        && result.len() < stars.len() / 2
+        && stars.len() >= 3
+    {
+        return stars
+            .par_iter()
+            .filter_map(|star| {
+                measure_single_star(
+                    data, width, height, star, background, bg_map, green_mask,
+                    field_beta, max_iter, conv_tol, max_rejects,
+                    None, false,  // disable screening
+                )
+            })
+            .collect();
+    }
+
+    result
 }
 
 fn measure_single_star(
@@ -70,6 +97,8 @@ fn measure_single_star(
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
+    field_fwhm: Option<f32>,
+    possibly_trailed: bool,
 ) -> Option<MeasuredStar> {
     // Estimate sigma from the star's area: area ≈ π*(2σ)² for a Gaussian at low_threshold
     let estimated_sigma = (star.area as f32 / std::f32::consts::PI).sqrt() * 0.5;
@@ -110,6 +139,75 @@ fn measure_single_star(
     // Centroid relative to stamp origin
     let rel_cx = star.x - x0 as f32;
     let rel_cy = star.y - y0 as f32;
+
+    // ── Moments pre-screening gate ──────────────────────────────────
+    if let Some(ff) = field_fwhm {
+        let mut mcx = rel_cx as f64;
+        let mut mcy = rel_cy as f64;
+        let fit_r = 5.0_f64.max(4.0 * estimated_sigma as f64);
+        let fit_r_sq = fit_r * fit_r;
+
+        let mut mxx = 0.0_f64;
+        let mut myy = 0.0_f64;
+        let mut mxy = 0.0_f64;
+
+        for _ in 0..2 {
+            mxx = 0.0; myy = 0.0; mxy = 0.0;
+            let mut sw = 0.0_f64;
+            let mut swx = 0.0_f64;
+            let mut swy = 0.0_f64;
+
+            for sy in 0..stamp_h {
+                for sx in 0..stamp_w {
+                    let dx = sx as f64 - mcx;
+                    let dy = sy as f64 - mcy;
+                    if dx * dx + dy * dy > fit_r_sq { continue; }
+                    let val = stamp[sy * stamp_w + sx].max(0.0) as f64;
+                    if val <= 0.0 { continue; }
+                    sw += val;
+                    swx += val * sx as f64;
+                    swy += val * sy as f64;
+                    mxx += val * dx * dx;
+                    myy += val * dy * dy;
+                    mxy += val * dx * dy;
+                }
+            }
+
+            if sw < 1e-10 { return None; }
+            mcx = swx / sw;
+            mcy = swy / sw;
+            mxx /= sw;
+            myy /= sw;
+            mxy /= sw;
+        }
+
+        let trace = mxx + myy;
+        let det = mxx * myy - mxy * mxy;
+        let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
+        let l1 = (trace + disc) * 0.5;
+        let l2 = (trace - disc) * 0.5;
+
+        if l1 > 0.0 && l2 > 0.0 {
+            let moment_fwhm = (2.3548 * (l1.sqrt() * l2.sqrt())) as f32;
+            let moment_ecc = (1.0 - l2 / l1).max(0.0).sqrt() as f32;
+
+            if moment_fwhm < 0.7 * ff || moment_fwhm > 2.5 * ff {
+                return None;
+            }
+
+            if !possibly_trailed && moment_ecc > 0.8 {
+                return None;
+            }
+
+            let mean_flux = star.flux / star.area as f32;
+            if mean_flux > 0.0 {
+                let peak_sharpness = star.peak / mean_flux;
+                if peak_sharpness < 0.3 || peak_sharpness > 5.0 {
+                    return None;
+                }
+            }
+        }
+    }
 
     // Build stamp-local green mask: true at real green CFA positions
     let stamp_mask: Option<Vec<bool>> = green_mask.map(|gm| {
@@ -1015,5 +1113,70 @@ mod tests {
             result.theta,
             theta
         );
+    }
+
+    fn make_star_image(
+        width: usize, height: usize,
+        star_x: f32, star_y: f32,
+        amp: f32, sigma: f32,
+        background: f32,
+    ) -> Vec<f32> {
+        let mut data = vec![background; width * height];
+        let r = (4.0 * sigma).ceil() as i32;
+        let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let px = star_x as i32 + dx;
+                let py = star_y as i32 + dy;
+                if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
+                    let ddx = px as f32 - star_x;
+                    let ddy = py as f32 - star_y;
+                    data[py as usize * width + px as usize] +=
+                        amp * (-inv_2s2 * (ddx * ddx + ddy * ddy)).exp();
+                }
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_moments_screening_rejects_extended() {
+        let width = 200;
+        let height = 200;
+        let background = 1000.0;
+        let field_fwhm = 4.7_f32;
+        let data = make_star_image(width, height, 100.0, 100.0, 5000.0, 10.0, background);
+        let star = DetectedStar {
+            x: 100.0, y: 100.0, peak: 5000.0, flux: 50000.0,
+            area: 200, theta: 0.0, eccentricity: 0.0,
+        };
+        let result = measure_single_star(
+            &data, width, height, &star, background, None, None,
+            Some(1.0), 25, 1e-4, 5,
+            Some(field_fwhm), false,
+        );
+        assert!(result.is_none(), "Extended source should be rejected by moments screening");
+    }
+
+    #[test]
+    fn test_moments_screening_accepts_real_star() {
+        let width = 200;
+        let height = 200;
+        let background = 1000.0;
+        let field_fwhm = 4.7_f32;
+        let data = make_star_image(width, height, 100.0, 100.0, 5000.0, 2.0, background);
+        // Use realistic flux/area for a Gaussian with sigma=2, amp=5000:
+        // total flux ~ 2*pi*sigma^2*amp ~ 125664, area ~ pi*(2*sigma)^2 ~ 50
+        // peak_sharpness = 5000 / (125664/50) = 1.99 — within [0.3, 5.0]
+        let star = DetectedStar {
+            x: 100.0, y: 100.0, peak: 5000.0, flux: 125664.0,
+            area: 50, theta: 0.0, eccentricity: 0.1,
+        };
+        let result = measure_single_star(
+            &data, width, height, &star, background, None, None,
+            Some(1.0), 25, 1e-4, 5,
+            Some(field_fwhm), false,
+        );
+        assert!(result.is_some(), "Real star should pass moments screening");
     }
 }

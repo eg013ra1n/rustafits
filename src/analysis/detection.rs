@@ -1,6 +1,7 @@
 /// Star detection: DAOFIND-inspired matched filter + connected component labeling.
 
 /// A detected star candidate before metric computation.
+#[derive(Clone)]
 pub struct DetectedStar {
     /// Intensity-weighted centroid X (subpixel).
     pub x: f32,
@@ -45,6 +46,7 @@ impl Default for DetectionParams {
 /// `bg_map`: optional per-pixel background map (from mesh-grid estimation).
 /// `noise_map`: optional per-pixel noise map for adaptive thresholds.
 /// `fwhm`: estimated FWHM for matched filter kernel (pixels).
+/// `field_fwhm`: calibrated field FWHM from Pass 1 (used by Pass 2 filters; None in Pass 1).
 pub fn detect_stars(
     data: &[f32],
     width: usize,
@@ -55,6 +57,7 @@ pub fn detect_stars(
     noise_map: Option<&[f32]>,
     params: &DetectionParams,
     fwhm: f32,
+    field_fwhm: Option<f32>,
 ) -> Vec<DetectedStar> {
     // Stage 1: Separable Gaussian convolution + peak detection
     let sigma = fwhm / 2.3548;
@@ -250,6 +253,73 @@ pub fn detect_stars(
             continue;
         }
         if let Some(star) = process_component(pixels, data, width, height, background, bg_map, params) {
+            // ── Pass 2 filters (when field_fwhm is provided) ──
+            if let Some(ff) = field_fwhm {
+                // 1. Sharpness: (conv[peak] - mean(conv[8_neighbors])) / conv[peak]
+                let &(px, py, _) = peaks.iter().max_by(|a, b| a.2.total_cmp(&b.2)).unwrap();
+                if px >= 1 && py >= 1 && px < width - 1 && py < height - 1 {
+                    let cp = conv[py * width + px];
+                    if cp > 0.0 {
+                        let neighbors_sum =
+                            conv[(py - 1) * width + px - 1]
+                            + conv[(py - 1) * width + px]
+                            + conv[(py - 1) * width + px + 1]
+                            + conv[py * width + px - 1]
+                            + conv[py * width + px + 1]
+                            + conv[(py + 1) * width + px - 1]
+                            + conv[(py + 1) * width + px]
+                            + conv[(py + 1) * width + px + 1];
+                        let sharpness = (cp - neighbors_sum / 8.0) / cp;
+                        if sharpness < 0.1 || sharpness > 0.9 {
+                            continue;
+                        }
+                    }
+                }
+
+                // 2. Concentration index: flux(1σ) / flux(3σ) from raw bg-subtracted pixels
+                let field_sigma = ff / 2.3548;
+                let ci_inner_r_sq = field_sigma * field_sigma;
+                let ci_outer_r = 3.0 * field_sigma;
+                let ci_outer_r_sq = ci_outer_r * ci_outer_r;
+                let ci_radius = ci_outer_r.ceil() as i32;
+                let scx = star.x.round() as i32;
+                let scy = star.y.round() as i32;
+
+                let mut flux_inner = 0.0_f64;
+                let mut flux_outer = 0.0_f64;
+                for dy in -ci_radius..=ci_radius {
+                    let py2 = scy + dy;
+                    if py2 < 0 || py2 >= height as i32 { continue; }
+                    for dx in -ci_radius..=ci_radius {
+                        let px2 = scx + dx;
+                        if px2 < 0 || px2 >= width as i32 { continue; }
+                        let r_sq = (dx * dx + dy * dy) as f32;
+                        if r_sq > ci_outer_r_sq { continue; }
+                        let bg = bg_map.map_or(background, |m| m[py2 as usize * width + px2 as usize]);
+                        let val = (data[py2 as usize * width + px2 as usize] - bg).max(0.0) as f64;
+                        flux_outer += val;
+                        if r_sq <= ci_inner_r_sq {
+                            flux_inner += val;
+                        }
+                    }
+                }
+                if flux_outer > 0.0 {
+                    let ci = flux_inner / flux_outer;
+                    if ci < 0.15 || ci > 0.75 {
+                        continue;
+                    }
+                }
+
+                // 3. Edge margin: reject stars whose centroid is within 2*FWHM of any edge
+                let margin = (2.0 * ff).max(8.0);
+                if star.x < margin || star.y < margin
+                    || star.x > (width as f32 - margin)
+                    || star.y > (height as f32 - margin)
+                {
+                    continue;
+                }
+            }
+
             stars.push(star);
         }
     }
@@ -508,7 +578,7 @@ mod tests {
         };
 
         let fwhm = 3.0 * 2.3548; // sigma=3.0 → fwhm≈7.06
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm, None);
 
         // Should detect all 5 stars
         assert!(
@@ -573,7 +643,7 @@ mod tests {
             ..DetectionParams::default()
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0, None);
 
         // Should detect the real star but not the hot pixel
         assert!(
@@ -616,7 +686,7 @@ mod tests {
             saturation_limit: 0.95 * 65535.0,
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0, None);
 
         // With multi-peak skip, blended pair may produce 0 detections (if CCL merges
         // them) or 2 (if CCL keeps them separate). Either way: no duplicates.
@@ -659,7 +729,7 @@ mod tests {
         };
 
         let fwhm = 2.5 * 2.3548; // sigma=2.5
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, fwhm, None);
 
         // Count detections within one FWHM of the true position
         let near: Vec<_> = stars
@@ -726,7 +796,7 @@ mod tests {
             saturation_limit: 0.95 * 65535.0,
         };
 
-        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0);
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0, None);
 
         // All 5 real stars should be detected
         for &(sx, sy, _, _) in &star_defs {
@@ -761,5 +831,90 @@ mod tests {
             coma_detections.len(),
             coma_detections.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_sharpness_rejects_diffuse_blob() {
+        let width = 200;
+        let height = 200;
+        let background = 1000.0;
+        let noise = 30.0;
+        let star_defs = vec![
+            (50.0, 50.0, 5000.0, 2.0),   // real star
+            (130.0, 130.0, 3000.0, 15.0), // diffuse blob
+        ];
+        let data = make_star_field(width, height, &star_defs, background, noise);
+        let params = DetectionParams {
+            detection_sigma: 3.0,
+            min_star_area: 5,
+            max_star_area: 2000,
+            saturation_limit: 0.95 * 65535.0,
+        };
+        let field_fwhm = 2.0 * 2.3548;
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 3.0, Some(field_fwhm));
+        let has_real = stars.iter().any(|s| {
+            let dx = s.x - 50.0;
+            let dy = s.y - 50.0;
+            (dx * dx + dy * dy).sqrt() < 3.0
+        });
+        assert!(has_real, "Real star at (50,50) should be detected");
+        let has_blob = stars.iter().any(|s| {
+            let dx = s.x - 130.0;
+            let dy = s.y - 130.0;
+            (dx * dx + dy * dy).sqrt() < 20.0
+        });
+        assert!(!has_blob, "Diffuse blob should be rejected by sharpness/CI filters");
+    }
+
+    #[test]
+    fn test_edge_margin_rejects_near_border_stars() {
+        let width = 200;
+        let height = 200;
+        let background = 1000.0;
+        let noise = 30.0;
+        // Use sigma=1.5 stars (sharp point sources) so sharpness/CI filters pass.
+        // field_fwhm = 1.5 * 2.3548 ≈ 3.53; edge margin = max(2 * 3.53, 8) = 8.0.
+        // Edge star at x=5 is within margin=8, center star at x=100 is safely inside.
+        let field_fwhm = 1.5 * 2.3548;
+        let star_defs = vec![
+            (5.0, 100.0, 8000.0, 1.5),  // near left edge (x < margin=8)
+            (100.0, 100.0, 8000.0, 1.5), // safely inside
+        ];
+        let data = make_star_field(width, height, &star_defs, background, noise);
+        let params = DetectionParams {
+            detection_sigma: 3.0,
+            ..DetectionParams::default()
+        };
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, field_fwhm, Some(field_fwhm));
+        let has_center = stars.iter().any(|s| {
+            let dx = s.x - 100.0;
+            let dy = s.y - 100.0;
+            (dx * dx + dy * dy).sqrt() < 3.0
+        });
+        assert!(has_center, "Center star at (100,100) should be detected");
+        let has_edge = stars.iter().any(|s| {
+            let dx = s.x - 5.0;
+            let dy = s.y - 100.0;
+            (dx * dx + dy * dy).sqrt() < 3.0
+        });
+        assert!(!has_edge, "Edge star at (5,100) should be rejected by edge margin");
+    }
+
+    #[test]
+    fn test_pass1_no_filtering() {
+        // With field_fwhm=None (Pass 1), no sharpness/CI/edge filters apply
+        let width = 200;
+        let height = 200;
+        let background = 1000.0;
+        let noise = 30.0;
+        let star_defs = vec![
+            (50.0, 50.0, 5000.0, 2.0),
+            (10.0, 50.0, 5000.0, 2.0),  // near edge — should NOT be rejected in Pass 1
+        ];
+        let data = make_star_field(width, height, &star_defs, background, noise);
+        let params = DetectionParams { detection_sigma: 3.0, ..DetectionParams::default() };
+        let stars = detect_stars(&data, width, height, background, noise, None, None, &params, 4.7, None);
+        // Both stars should be detected in Pass 1
+        assert!(stars.len() >= 2, "Pass 1 (None) should not apply edge/sharpness filters, got {} stars", stars.len());
     }
 }

@@ -309,7 +309,7 @@ fn run_detection(
     let pass1 = detection::detect_stars(
         lum, w, h,
         bg.background, bg.noise,
-        bg_map_ref, noise_map_ref, &det_params, initial_fwhm,
+        bg_map_ref, noise_map_ref, &det_params, initial_fwhm, None,
     );
 
     let measured_fwhm = estimate_fwhm_from_stars(
@@ -324,7 +324,7 @@ fn run_detection(
         let d = detection::detect_stars(
             lum, w, h,
             bg.background, bg.noise,
-            bg_map_ref, noise_map_ref, &det_params, capped,
+            bg_map_ref, noise_map_ref, &det_params, capped, None,
         );
         (d, capped)
     } else {
@@ -404,6 +404,7 @@ fn cmd_measure(
         green_mask,
         None, // free-beta for debug measure
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
+        None, false,
     );
     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -716,6 +717,7 @@ fn cmd_query(
         green_mask,
         None, // free-beta for debug query
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
+        None, false,
     );
 
     if measured.is_empty() {
@@ -995,7 +997,7 @@ fn cmd_pipeline(
     let pass1 = detection::detect_stars(
         lum, w, h,
         bg.background, bg.noise,
-        bg_map_ref, noise_map_ref, &det_params, initial_fwhm,
+        bg_map_ref, noise_map_ref, &det_params, initial_fwhm, None,
     );
     let pass1_count = pass1.len();
 
@@ -1010,7 +1012,7 @@ fn cmd_pipeline(
         let d = detection::detect_stars(
             lum, w, h,
             bg.background, bg.noise,
-            bg_map_ref, noise_map_ref, &det_params, capped,
+            bg_map_ref, noise_map_ref, &det_params, capped, None,
         );
         (d, capped)
     } else {
@@ -1078,6 +1080,7 @@ fn cmd_pipeline(
         green_mask,
         None, // free-beta for pipeline debug
         opts.fit_max_iter, opts.fit_tolerance, opts.fit_max_rejects,
+        None, false,
     );
     eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
     eprintln!("  Measured: {} / {} detected", measured.len(), detected.len());
@@ -1214,6 +1217,7 @@ fn cmd_dump(
         green_mask,
         None, // free-beta for debug dump
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
+        None, false,
     );
 
     if measured.is_empty() {
@@ -1439,7 +1443,7 @@ fn analyze_one_file(
     let pass1 = detection::detect_stars(
         &lum, w, h,
         bg.background, bg.noise,
-        bg_map_ref, noise_map_ref, &det_params, initial_fwhm,
+        bg_map_ref, noise_map_ref, &det_params, initial_fwhm, None,
     );
     let measured_fwhm = estimate_fwhm_from_stars(
         &lum, w, h, &pass1, bg.background, bg_map_ref,
@@ -1452,7 +1456,7 @@ fn analyze_one_file(
         let d = detection::detect_stars(
             &lum, w, h,
             bg.background, bg.noise,
-            bg_map_ref, noise_map_ref, &det_params, capped,
+            bg_map_ref, noise_map_ref, &det_params, capped, None,
         );
         (d, capped)
     } else {
@@ -1501,6 +1505,7 @@ fn analyze_one_file(
             green_mask.as_deref(),
             None, // free-beta
             CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
+            None, false,
         );
         let beta_vals: Vec<f32> = cal_measured.iter().filter_map(|s| s.beta).collect();
         if beta_vals.len() >= 3 {
@@ -1521,6 +1526,7 @@ fn analyze_one_file(
         green_mask.as_deref(),
         field_beta,
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
+        None, false,
     );
 
     let snr_weight = snr::compute_snr_weight(&lum, bg.background, bg.noise) as f64;
