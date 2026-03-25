@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.8.0
+Version:        0.8.2
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,18 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Tue Mar 25 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.2-1
+- Replace CCL with proximity-based blend detection (2-5x faster)
+- Parallelize background mesh cell statistics with rayon
+- Switch default noise estimation from MRS wavelet to fast MAD
+- Remove source-mask background re-estimation (redundant)
+- Remove green mask from PSF fitting — fit all pixels in interpolated image
+- Add neighbor count filter in peak detection (rejects isolated noise peaks)
+- Fix OSC FWHM underestimation — restore green interpolation for Bayer data
+- Fix trail detection: remove PSF-ecc override, use Rayleigh test only
+- Add 5% peak threshold in stamp-based star processing
+- Use FWHM-based sigma estimation for measurement stamps
+
 * Mon Mar 24 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.0-1
 - Add detection-stage morphological filters (sharpness, concentration index, edge margin)
 - Add moments-based pre-screening gate before LM fitting

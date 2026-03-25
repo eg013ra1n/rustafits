@@ -2,7 +2,7 @@ use rayon::prelude::*;
 
 use crate::types::BayerPattern;
 
-/// Green-channel interpolation for CFA analysis (matches Siril's `interpolate_nongreen`).
+/// Green-channel interpolation for CFA analysis.
 ///
 /// Produces a single-channel f32 image at **native resolution** where green CFA
 /// pixels keep their original values and non-green pixels (R, B) are replaced

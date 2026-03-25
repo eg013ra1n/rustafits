@@ -342,8 +342,7 @@ impl ImageAnalyzer {
         let channels = meta.channels;
 
         // OSC green interpolation: replace R/B pixels with weighted average of
-        // neighboring green values (matching Siril's interpolate_nongreen).
-        // PSF fitting uses all pixels — no green mask.
+        // neighboring green values.  PSF fitting uses all pixels — no green mask.
         if self.config.apply_debayer
             && meta.bayer_pattern != BayerPattern::None
             && channels == 1
@@ -369,7 +368,7 @@ impl ImageAnalyzer {
         let height = meta.height;
         let channels = meta.channels;
 
-        // OSC green interpolation (matching Siril's interpolate_nongreen).
+        // OSC green interpolation for Bayer data.
         if self.config.apply_debayer
             && meta.bayer_pattern != BayerPattern::None
             && channels == 1

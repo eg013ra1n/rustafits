@@ -129,7 +129,7 @@ FITS / XISF File
 +-------------------------------+
 | Statistics (measured stars)   |  Residual-weighted sigma-clipped medians
 | -> median FWHM                |  Weight: w = 1 / (1 + fit_residual)
-| -> median eccentricity        |  Trail-aware: bypass ecc<=0.8 filter when trailed
+| -> median eccentricity        |  ecc<=0.8 filter for FWHM/HFR (bypass when trailed)
 | -> median SNR, HFR            |  stars_detected = raw detection count (before cap)
 | -> median Moffat beta         |
 +-------------------------------+

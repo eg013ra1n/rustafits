@@ -162,20 +162,24 @@ let result = ImageAnalyzer::new()
 
 | Metric | Accuracy vs PI | Notes |
 |--------|----------------|-------|
-| **FWHM** | R²=0.995, -0.3% median bias | Near-perfect match (fit-residual-weighted) |
-| **Eccentricity** | R²=0.943, -0.069 median offset | Systematic methodology difference (see below) |
-| **Noise** | ~PI | MRS wavelet noise (default 4 layers, significance masking) |
-| **Star count** | ~3x PI | We detect more faint stars |
+| **FWHM** | R²=0.989, -1.9% median bias | Near-perfect match |
+| **Eccentricity** | R²=0.981, -0.07 median offset | Excellent correlation |
+| **Noise** | 1.001x PI | MAD noise (default); MRS wavelet optional |
+| **Star count** | ~0.6x PI | Conservative detection with neighbor count filter |
+
+#### OSC (Bayer) handling
+
+OSC images are green-interpolated before detection and PSF fitting: non-green
+(R/B) pixels are replaced with a distance-weighted average of neighboring green
+values. All pixels in the interpolated image are used for PSF fitting — no
+green mask. This produces accurate FWHM values for Bayer-pattern data.
 
 #### Eccentricity methodology note
 
-Our eccentricity comes from the **Moffat/Gaussian fit** axis ratio: `e = sqrt(1 - (b/a)^2)`.
-PixInsight likely uses **image moments** for eccentricity, which gives systematically
-higher values (mean offset ~+0.069). The frame-to-frame correlation is excellent
-(R²=0.943), meaning relative rankings are correct — only the absolute scale differs.
-
-If Athenaeum displays eccentricity alongside PI values, consider noting this
-calibration difference, or applying a linear correction for display purposes.
+Eccentricity is computed from the **Moffat/Gaussian fit** axis ratio:
+`e = sqrt(1 - (b/a)^2)`. Frame-level eccentricity uses a sigma-clipped
+weighted median with fit-residual weighting. The R²=0.981 correlation with
+PixInsight indicates excellent relative ranking agreement.
 
 #### Fit-residual weighting
 

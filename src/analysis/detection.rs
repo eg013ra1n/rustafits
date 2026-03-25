@@ -91,8 +91,7 @@ pub fn detect_stars(
             }
             // 8-neighbor comparison + minimum neighbor count above threshold.
             // Requiring ≥3 neighbors above threshold rejects isolated noise peaks
-            // while keeping real stars (which have extended PSF wings).  Matches
-            // Siril's star_finder.c:329 candidate validation.
+            // while keeping real stars (which have extended PSF wings).
             let neighbors = [
                 conv[(y - 1) * width + x - 1],
                 conv[(y - 1) * width + x],

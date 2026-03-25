@@ -1,3 +1,18 @@
+rustafits (0.8.2-1) unstable; urgency=medium
+
+  * Replace CCL with proximity-based blend detection (2-5x faster pipeline)
+  * Parallelize background mesh cell statistics with rayon
+  * Switch default noise estimation from MRS wavelet to fast MAD
+  * Remove redundant source-mask background re-estimation
+  * Remove green mask from PSF fitting — fit all pixels in interpolated image
+  * Add neighbor count filter in peak detection (rejects isolated noise peaks)
+  * Fix OSC FWHM underestimation — restore green interpolation for Bayer data
+  * Fix trail detection: use Rayleigh angle coherence test only
+  * Add 5% peak threshold in stamp-based star processing
+  * Use FWHM-based sigma estimation for measurement stamps
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Tue, 25 Mar 2026 12:00:00 +0300
+
 rustafits (0.8.0-1) unstable; urgency=medium
 
   * Add DAOFIND sharpness filter for Pass 2 detection (rejects nebula knots)

@@ -153,15 +153,16 @@ Stage 1 (detection-stage, before PSF measurement):
     else:
         rayleigh_trailed = false
 
-Stage 2 (after PSF measurement):
-    fit_median_ecc = median of all measured star eccentricities
-    possibly_trailed = rayleigh_trailed || (fit_median_ecc > 0.55)
 ```
 
+**Note (v0.8.2):** The previous Stage 2 PSF-ecc override (`fit_median_ecc > 0.55`)
+has been removed. Trail detection now uses the Rayleigh angle coherence test only.
+High eccentricity without directional coherence indicates optical aberration (coma,
+tilt) or wind shake — not tracking drift — and should not trigger trail mode.
+
 When `possibly_trailed` is true, the statistics computation bypasses the
-eccentricity ≤ 0.8 filter for FWHM and eccentricity medians. This ensures
-that trailed frames report accurate (high) eccentricity values rather than
-being suppressed by the filter.
+eccentricity ≤ 0.8 filter for FWHM and HFR medians. This ensures that
+trailed frames report accurate (high) values rather than being suppressed.
 
 ---
 
@@ -172,11 +173,11 @@ When `possibly_trailed = true`:
 | Statistic | Normal frames | Trailed frames |
 |-----------|--------------|----------------|
 | FWHM | ecc ≤ 0.8 filter + residual weighting | No ecc filter, residual weighting only |
-| Eccentricity | ecc ≤ 0.8 filter + residual weighting | No ecc filter, residual weighting only |
+| Eccentricity | Residual weighting | Residual weighting |
 | HFR | ecc ≤ 0.8 filter + residual weighting | No ecc filter, residual weighting only |
 | SNR, beta | Always unfiltered | Always unfiltered |
 
-This prevents the ecc ≤ 0.8 cutoff from silently suppressing the eccentricity
+This prevents the ecc ≤ 0.8 cutoff from silently suppressing the FWHM/HFR
 signal on genuinely trailed frames.
 
 ---
