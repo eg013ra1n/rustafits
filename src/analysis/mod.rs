@@ -341,11 +341,16 @@ impl ImageAnalyzer {
         let height = meta.height;
         let channels = meta.channels;
 
-        // OSC: detect and fit on raw Bayer data (no green interpolation).
-        // The Moffat/Gaussian model fits through the Bayer checkerboard — the
-        // color pattern is high-frequency noise that the low-frequency PSF model
-        // ignores. This matches Siril's approach and naturally suppresses false
-        // detections from noise (the Bayer pattern raises the effective noise floor).
+        // OSC green interpolation: replace R/B pixels with weighted average of
+        // neighboring green values (matching Siril's interpolate_nongreen).
+        // PSF fitting uses all pixels — no green mask.
+        if self.config.apply_debayer
+            && meta.bayer_pattern != BayerPattern::None
+            && channels == 1
+        {
+            data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
+        }
+
         self.run_analysis(&data, width, height, channels)
     }
 
@@ -364,9 +369,14 @@ impl ImageAnalyzer {
         let height = meta.height;
         let channels = meta.channels;
 
-        // Green-channel interpolation for OSC: produces a smooth full-resolution
-        // mono image from the Bayer mosaic.  PSF fitting uses all pixels (no green
-        // OSC: use raw Bayer data — no green interpolation (matches Siril).
+        // OSC green interpolation (matching Siril's interpolate_nongreen).
+        if self.config.apply_debayer
+            && meta.bayer_pattern != BayerPattern::None
+            && channels == 1
+        {
+            data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
+        }
+
         self.run_analysis(&data, width, height, channels)
     }
 
@@ -620,18 +630,9 @@ impl ImageAnalyzer {
 
         // ── Stage 4: Metrics ─────────────────────────────────────────────
 
-        // Refine trail detection using accurate PSF-fit eccentricities.
-        // Detection-stage moments are noisy; PSF-fit ecc is reliable.
-        let possibly_trailed = possibly_trailed || {
-            let mut fit_eccs: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
-            fit_eccs.sort_unstable_by(|a, b| a.total_cmp(b));
-            let med = if fit_eccs.len() % 2 == 1 {
-                fit_eccs[fit_eccs.len() / 2]
-            } else {
-                (fit_eccs[fit_eccs.len() / 2 - 1] + fit_eccs[fit_eccs.len() / 2]) * 0.5
-            };
-            med > 0.55
-        };
+        // Trail detection uses only the Rayleigh test (Stage 1) on detection-stage
+        // angles.  High PSF eccentricity alone is NOT trailing — it can be optical
+        // aberration (coma, tilt) or wind shake without coherent direction.
 
         // FWHM & HFR: ecc ≤ 0.8 filter — elongated profiles inflate
         // geometric-mean FWHM. On trailed frames bypass it.
@@ -954,7 +955,14 @@ pub fn prepare_luminance(
     let height = meta.height;
     let channels = meta.channels;
 
-    // No green interpolation — use raw Bayer data for analysis (matches Siril).
+    // OSC green interpolation (matching Siril's interpolate_nongreen).
+    // No green mask — PSF fitting uses all pixels in the interpolated image.
+    if apply_debayer
+        && meta.bayer_pattern != BayerPattern::None
+        && channels == 1
+    {
+        data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
+    }
     let green_mask: Option<Vec<bool>> = None;
 
     let lum = if channels == 3 {

@@ -89,17 +89,26 @@ pub fn detect_stars(
             if c <= local_threshold {
                 continue;
             }
-            // 8-neighbor comparison
-            let is_max = c > conv[(y - 1) * width + x - 1]
-                && c > conv[(y - 1) * width + x]
-                && c > conv[(y - 1) * width + x + 1]
-                && c > conv[y * width + x - 1]
-                && c > conv[y * width + x + 1]
-                && c > conv[(y + 1) * width + x - 1]
-                && c > conv[(y + 1) * width + x]
-                && c > conv[(y + 1) * width + x + 1];
+            // 8-neighbor comparison + minimum neighbor count above threshold.
+            // Requiring ≥3 neighbors above threshold rejects isolated noise peaks
+            // while keeping real stars (which have extended PSF wings).  Matches
+            // Siril's star_finder.c:329 candidate validation.
+            let neighbors = [
+                conv[(y - 1) * width + x - 1],
+                conv[(y - 1) * width + x],
+                conv[(y - 1) * width + x + 1],
+                conv[y * width + x - 1],
+                conv[y * width + x + 1],
+                conv[(y + 1) * width + x - 1],
+                conv[(y + 1) * width + x],
+                conv[(y + 1) * width + x + 1],
+            ];
+            let is_max = neighbors.iter().all(|&v| c > v);
             if is_max {
-                peaks.push((x, y, c));
+                let above = neighbors.iter().filter(|&&v| v > local_threshold).count();
+                if above >= 3 {
+                    peaks.push((x, y, c));
+                }
             }
         }
     }

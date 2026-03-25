@@ -1104,20 +1104,8 @@ fn cmd_pipeline(
     eprintln!("\n=== Stage 4: Statistics ===");
     let t = Instant::now();
 
-    // Refine trail detection using accurate PSF-fit eccentricities
-    let possibly_trailed = possibly_trailed || {
-        let mut fit_eccs: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
-        fit_eccs.sort_unstable_by(|a, b| a.total_cmp(b));
-        let med = if fit_eccs.len() % 2 == 1 {
-            fit_eccs[fit_eccs.len() / 2]
-        } else {
-            (fit_eccs[fit_eccs.len() / 2 - 1] + fit_eccs[fit_eccs.len() / 2]) * 0.5
-        };
-        med > 0.55
-    };
-    if possibly_trailed {
-        eprintln!("  Trailed: true (PSF-fit median ecc > 0.5)");
-    }
+    // Trail detection uses only the Rayleigh test on detection-stage angles.
+    // High PSF ecc alone is not trailing (could be optical aberration or wind shake).
 
     // FWHM/HFR: ecc ≤ 0.8 filter, bypass on trailed frames
     const FWHM_ECC_MAX: f32 = 0.8;
@@ -1552,18 +1540,6 @@ fn analyze_one_file(
             frame_snr, snr_weight, median_snr: 0.0,
         });
     }
-
-    // Refine trail detection using accurate PSF-fit eccentricities
-    let possibly_trailed = possibly_trailed || {
-        let mut fit_eccs: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
-        fit_eccs.sort_unstable_by(|a, b| a.total_cmp(b));
-        let med = if fit_eccs.len() % 2 == 1 {
-            fit_eccs[fit_eccs.len() / 2]
-        } else {
-            (fit_eccs[fit_eccs.len() / 2 - 1] + fit_eccs[fit_eccs.len() / 2]) * 0.5
-        };
-        med > 0.55
-    };
 
     // Fit-residual-weighted statistics (matching pipeline):
     // FWHM: ecc ≤ 0.8 filter — on trailed frames bypass it (almost all stars are elongated)
