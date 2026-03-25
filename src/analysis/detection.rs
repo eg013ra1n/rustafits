@@ -104,9 +104,13 @@ pub fn detect_stars(
         }
     }
 
-    // Non-maximum suppression using spatial hashing
+    // Non-maximum suppression using spatial hashing.
+    // Suppression radius = measurement stamp radius (max(8, 4σ+1)) so sidelobes
+    // are removed before blend detection (which rejects both peaks unconditionally).
     peaks.sort_by(|a, b| b.2.total_cmp(&a.2));
-    let sup_radius = radius;
+    let nms_sigma = fwhm / 2.3548;
+    let nms_blend_r = (4.0 * nms_sigma + 2.0).max(9.0).ceil() as usize;
+    let sup_radius = radius.max(nms_blend_r);
     let sup_radius_sq = (sup_radius * sup_radius) as f32;
     let cell_size = sup_radius.max(1);
 
@@ -150,8 +154,11 @@ pub fn detect_stars(
 
     // ── Stage 2: Proximity-based blend rejection + stamp metrics ────────
     // Two peaks within blend_radius share overlapping PSFs — skip both.
-    // Replaces full-image CCL with O(N) spatial grid queries.
-    let blend_radius = 2.0 * fwhm;
+    // blend_radius must cover the measurement stamp radius (max(8, 4σ) in metrics.rs)
+    // so that no neighbor falls inside a star's fitting region.
+    let sigma = fwhm / 2.3548;
+    let meas_stamp_r = (4.0 * sigma + 2.0).max(9.0);
+    let blend_radius = meas_stamp_r.max(2.0 * fwhm);
     let blend_radius_sq = blend_radius * blend_radius;
     let blend_cell = blend_radius.ceil().max(1.0) as usize;
     let blend_grid_w = (width + blend_cell - 1) / blend_cell;
@@ -164,12 +171,11 @@ pub fn detect_stars(
         blend_grid[gy * blend_grid_w + gx].push(i);
     }
 
-    // Mark blended peaks: two peaks within blend_radius that are both significant
-    // (weaker > 30% of stronger) indicate genuinely blended stars — skip both.
-    // If the weaker peak is below 30%, it's a sidelobe/artifact — only suppress it.
+    // Mark blended peaks: any two peaks within blend_radius reject both.
+    // NMS already handles sidelobes — after NMS, surviving close pairs are
+    // genuine separate stars whose overlapping PSFs corrupt measurements.
     let mut blended = vec![false; peak_positions.len()];
-    let blend_sig_ratio = 0.3_f32;
-    for (i, &(px, py, conv_i)) in peak_positions.iter().enumerate() {
+    for (i, &(px, py, _)) in peak_positions.iter().enumerate() {
         if blended[i] { continue; }
         let gx = px / blend_cell;
         let gy = py / blend_cell;
@@ -182,33 +188,22 @@ pub fn detect_stars(
         for ngy in gy_lo..gy_hi {
             for ngx in gx_lo..gx_hi {
                 for &j in &blend_grid[ngy * blend_grid_w + ngx] {
-                    if j <= i || blended[j] { continue; }
-                    let (jx, jy, conv_j) = peak_positions[j];
+                    if j <= i { continue; }
+                    let (jx, jy, _) = peak_positions[j];
                     let dx = px as f32 - jx as f32;
                     let dy = py as f32 - jy as f32;
                     if dx * dx + dy * dy <= blend_radius_sq {
-                        let stronger = conv_i.max(conv_j);
-                        let weaker = conv_i.min(conv_j);
-                        if weaker > blend_sig_ratio * stronger {
-                            // Genuinely blended — reject both
-                            blended[i] = true;
-                            blended[j] = true;
-                        } else {
-                            // Sidelobe — suppress only the weaker peak
-                            if conv_j < conv_i {
-                                blended[j] = true;
-                            } else {
-                                blended[i] = true;
-                            }
-                        }
+                        blended[i] = true;
+                        blended[j] = true;
                     }
                 }
             }
         }
     }
 
-    // Process non-blended peaks via stamp-based metrics
-    let stamp_r = ((2.0 * fwhm) as i32).max(5);
+    // Process non-blended peaks via stamp-based metrics.
+    // Stamp radius = 1×FWHM (smaller than blend_radius to avoid neighbor contamination).
+    let stamp_r = (fwhm.ceil() as i32).max(3);
     let mut stars = Vec::new();
     for (i, &(px, py, _conv_val)) in peak_positions.iter().enumerate() {
         if blended[i] { continue; }
@@ -330,17 +325,9 @@ fn process_peak_stamp(
 
     let bg_at = |x: usize, y: usize| bg_map.map_or(background, |m| m[y * width + x]);
 
+    // First pass: find peak value in stamp
     let mut peak = 0.0_f32;
     let mut raw_peak = 0.0_f32;
-    let mut sum_w = 0.0_f64;
-    let mut sum_wx = 0.0_f64;
-    let mut sum_wy = 0.0_f64;
-    let mut flux = 0.0_f64;
-    let mut area = 0_usize;
-
-    // Use noise-level threshold: pixels must be above local background + small margin
-    let noise_floor = background * 0.02;
-
     for dy in -stamp_r..=stamp_r {
         let py = (cy_i + dy) as usize;
         for dx in -stamp_r..=stamp_r {
@@ -348,17 +335,36 @@ fn process_peak_stamp(
             let raw = data[py * width + px];
             let bg = bg_at(px, py);
             let val = raw - bg;
-            if val <= noise_floor { continue; }
-
-            area += 1;
             if val > peak { peak = val; }
             if raw > raw_peak { raw_peak = raw; }
+        }
+    }
 
-            let w = (val.max(0.0) as f64).powi(2);
+    if peak <= 0.0 { return None; }
+
+    // Second pass: compute metrics using 5% of peak threshold.
+    // Only includes pixels that clearly belong to THIS star, not neighbors.
+    let threshold = peak * 0.05;
+    let mut sum_w = 0.0_f64;
+    let mut sum_wx = 0.0_f64;
+    let mut sum_wy = 0.0_f64;
+    let mut flux = 0.0_f64;
+    let mut area = 0_usize;
+
+    for dy in -stamp_r..=stamp_r {
+        let py = (cy_i + dy) as usize;
+        for dx in -stamp_r..=stamp_r {
+            let px = (cx_i + dx) as usize;
+            let bg = bg_at(px, py);
+            let val = data[py * width + px] - bg;
+            if val <= threshold { continue; }
+
+            area += 1;
+            let w = (val as f64).powi(2);
             sum_w += w;
             sum_wx += w * px as f64;
             sum_wy += w * py as f64;
-            flux += val.max(0.0) as f64;
+            flux += val as f64;
         }
     }
 
@@ -387,7 +393,9 @@ fn process_peak_stamp(
         for dx in -stamp_r..=stamp_r {
             let px = (cx_i + dx) as usize;
             let bg = bg_at(px, py);
-            let v = (data[py * width + px] - bg).max(0.0) as f64;
+            let v = data[py * width + px] - bg;
+            if v <= threshold { continue; }
+            let v = v as f64;
             sf += v;
             six += v * px as f64;
             siy += v * py as f64;

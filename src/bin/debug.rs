@@ -98,7 +98,7 @@ fn parse_args() -> Result<Opts> {
         stamp_radius: 15,
         near: None,
         no_debayer: false,
-        mrs_layers: 4,
+        mrs_layers: 0,
         measure_cap: 2000,
         fit_max_iter: 25,
         fit_tolerance: 1e-4,
@@ -242,7 +242,9 @@ fn cmd_background(lum: &[f32], w: usize, h: usize, opts: &Opts) -> Result<()> {
     let cell_size = background::auto_cell_size(w, h);
     let mut bg = background::estimate_background_mesh(lum, w, h, cell_size);
     let mad_noise = bg.noise;
-    bg.noise = background::estimate_noise_mrs(lum, w, h, opts.mrs_layers.max(1)).max(0.001);
+    if opts.mrs_layers > 0 {
+        bg.noise = background::estimate_noise_mrs(lum, w, h, opts.mrs_layers.max(1)).max(0.001);
+    }
     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!();
@@ -291,7 +293,9 @@ fn run_detection(
 )> {
     let cell_size = background::auto_cell_size(w, h);
     let mut bg = background::estimate_background_mesh(lum, w, h, cell_size);
-    bg.noise = background::estimate_noise_mrs(lum, w, h, opts.mrs_layers.max(1)).max(0.001);
+    if opts.mrs_layers > 0 {
+        bg.noise = background::estimate_noise_mrs(lum, w, h, opts.mrs_layers.max(1)).max(0.001);
+    }
 
     let det_params = DetectionParams {
         detection_sigma: opts.sigma,
@@ -401,7 +405,7 @@ fn cmd_measure(
     let mut measured = metrics::measure_stars(
         lum, w, h, &detected,
         bg.background, bg.background_map.as_deref(),
-        green_mask,
+        None, // no green mask — fit all pixels in interpolated image
         None, // free-beta for debug measure
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
         None, false,
@@ -714,7 +718,7 @@ fn cmd_query(
     let mut measured = metrics::measure_stars(
         lum, w, h, &detected,
         bg.background, bg.background_map.as_deref(),
-        green_mask,
+        None, // no green mask — fit all pixels
         None, // free-beta for debug query
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
         None, false,
@@ -964,11 +968,17 @@ fn cmd_pipeline(
     let cell_size = background::auto_cell_size(w, h);
     let mut bg = background::estimate_background_mesh(lum, w, h, cell_size);
     let mad_noise = bg.noise;
-    bg.noise = background::estimate_noise_mrs(lum, w, h, opts.mrs_layers.max(1)).max(0.001);
+    if opts.mrs_layers > 0 {
+        bg.noise = background::estimate_noise_mrs(lum, w, h, opts.mrs_layers.max(1)).max(0.001);
+    }
     eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
     eprintln!("  Cell size: {} (auto)", cell_size);
-    eprintln!("  Background: {:.2}  MRS noise: {:.2}", bg.background, bg.noise);
-    eprintln!("  MAD noise:  {:.2} (ratio {:.2}x)", mad_noise, mad_noise / bg.noise.max(0.001));
+    if opts.mrs_layers > 0 {
+        eprintln!("  Background: {:.2}  MRS noise: {:.2}", bg.background, bg.noise);
+        eprintln!("  MAD noise:  {:.2} (ratio {:.2}x)", mad_noise, mad_noise / bg.noise.max(0.001));
+    } else {
+        eprintln!("  Background: {:.2}  MAD noise: {:.2} (MRS skipped)", bg.background, bg.noise);
+    }
 
     if let Some(ref dir) = opts.save_dir {
         if let Some(ref bg_map) = bg.background_map {
@@ -1077,7 +1087,7 @@ fn cmd_pipeline(
     let mut measured = metrics::measure_stars(
         lum, w, h, to_measure,
         bg.background, bg_map_ref,
-        green_mask,
+        None, // no green mask — fit all pixels
         None, // free-beta for pipeline debug
         opts.fit_max_iter, opts.fit_tolerance, opts.fit_max_rejects,
         None, false,
@@ -1214,7 +1224,7 @@ fn cmd_dump(
     let mut measured = metrics::measure_stars(
         lum, w, h, &detected,
         bg.background, bg.background_map.as_deref(),
-        green_mask,
+        None, // no green mask — fit all pixels
         None, // free-beta for debug dump
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
         None, false,
@@ -1427,7 +1437,9 @@ fn analyze_one_file(
     // Background
     let cell_size = background::auto_cell_size(w, h);
     let mut bg = background::estimate_background_mesh(&lum, w, h, cell_size);
-    bg.noise = background::estimate_noise_mrs(&lum, w, h, opts.mrs_layers.max(1)).max(0.001);
+    if opts.mrs_layers > 0 {
+        bg.noise = background::estimate_noise_mrs(&lum, w, h, opts.mrs_layers.max(1)).max(0.001);
+    }
 
     // Detection
     let det_params = DetectionParams {
@@ -1502,7 +1514,7 @@ fn analyze_one_file(
         let cal_measured = metrics::measure_stars(
             &lum, w, h, &calibration_stars,
             bg.background, bg_map_ref,
-            green_mask.as_deref(),
+            None, // no green mask — fit all pixels
             None, // free-beta
             CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
             None, false,
@@ -1523,7 +1535,7 @@ fn analyze_one_file(
     let mut measured = metrics::measure_stars(
         &lum, w, h, to_measure,
         bg.background, bg_map_ref,
-        green_mask.as_deref(),
+        None, // no green mask — fit all pixels
         field_beta,
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
         None, false,

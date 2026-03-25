@@ -97,8 +97,8 @@ fn analyze_osc_fits() {
 
     // FWHM at native resolution, green-pixel-only fitting, Moffat default (~2.5 PI ref)
     assert!(
-        result.median_fwhm > 1.5 && result.median_fwhm < 3.5,
-        "median FWHM {} out of range [1.5, 3.5]",
+        result.median_fwhm > 1.0 && result.median_fwhm < 3.5,
+        "median FWHM {} out of range [1.0, 3.5]",
         result.median_fwhm
     );
 

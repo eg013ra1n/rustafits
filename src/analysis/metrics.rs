@@ -100,8 +100,12 @@ fn measure_single_star(
     field_fwhm: Option<f32>,
     possibly_trailed: bool,
 ) -> Option<MeasuredStar> {
-    // Estimate sigma from the star's area: area ≈ π*(2σ)² for a Gaussian at low_threshold
-    let estimated_sigma = (star.area as f32 / std::f32::consts::PI).sqrt() * 0.5;
+    // Estimate sigma: prefer field_fwhm if available, fall back to area-based estimate
+    let estimated_sigma = if let Some(ff) = field_fwhm {
+        ff / 2.3548
+    } else {
+        (star.area as f32 / std::f32::consts::PI).sqrt() * 0.5
+    };
     let estimated_sigma = estimated_sigma.max(1.0).min(20.0);
 
     // Stamp radius: capture >99.9% of Gaussian flux
