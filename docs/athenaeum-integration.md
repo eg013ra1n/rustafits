@@ -110,10 +110,10 @@ let result = ImageAnalyzer::new()
 | `with_max_star_area(usize)` | 2000 | Max area (filters galaxies/nebulae). |
 | `with_saturation_fraction(f32)` | 0.95 | Reject stars above this fraction of 65535. |
 | `with_max_stars(usize)` | 200 | Keep only the brightest N stars in returned result. |
-| `with_mrs_layers(usize)` | 4 | MRS wavelet noise layers with iterative significance masking. |
+| `with_mrs_layers(usize)` | 0 | MRS wavelet noise layers. 0 = fast MAD noise. 4 = MRS wavelet. |
 | `without_debayer()` | debayer on | Skip green-channel interpolation for OSC. |
-| `with_trail_threshold(f32)` | 0.5 | R² threshold for Rayleigh trail detection (Stage 1 Path A). |
-| `with_measure_cap(usize)` | 2000 | Max stars to PSF-fit. 0 = measure all. Dense fields benefit most. |
+| `with_trail_threshold(f32)` | 0.5 | R² threshold for Rayleigh trail detection. |
+| `with_measure_cap(usize)` | 500 | Max stars to PSF-fit. 0 = measure all. |
 | `with_fit_max_iter(usize)` | 25 | LM max iterations for measurement pass (calibration always 50). |
 | `with_fit_tolerance(f64)` | 1e-4 | LM convergence tolerance for measurement pass (calibration always 1e-6). |
 | `with_fit_max_rejects(usize)` | 5 | LM consecutive reject bailout. |
@@ -129,21 +129,19 @@ handles gradients, vignetting, and nebulosity out of the box.
 // Recommended production configuration
 let result = ImageAnalyzer::new()
     .with_max_stars(500)             // Return top 500 for annotation
-    .with_measure_cap(2000)          // PSF-fit top 2000 brightest (default)
     .with_thread_pool(pool.clone())
     .analyze("light.fits")?;
 ```
 
 This uses the defaults: two-pass Moffat calibration, mesh-grid background (auto cell
-size), MRS wavelet noise (4 layers with significance masking), detection sigma 5.0,
-measure cap 2000, fit-residual-weighted statistics. These defaults are well-tested
-across all image types (mono, OSC, dense fields, nebulae).
+size), MAD noise estimation, detection sigma 5.0, measure cap 500,
+fit-residual-weighted statistics. These defaults are well-tested across all image
+types (mono, OSC, dense fields, nebulae). Pipeline runs ~250-750ms per 26 MP frame.
 
-**Measure cap:** The `measure_cap` (default 2000) limits how many stars undergo
+**Measure cap:** The `measure_cap` (default 500) limits how many stars undergo
 PSF fitting. Stars are sorted by flux (brightest first) before capping. Statistics
 (FWHM, eccentricity, HFR) are computed from the measured population, while
-`stars_detected` reports the raw detection count. For very dense fields (>10K stars),
-this provides ~5x speedup with negligible accuracy impact. Set to 0 to measure all.
+`stars_detected` reports the raw detection count. Set to 0 to measure all.
 
 ### PixInsight-Compatible Settings
 
@@ -193,14 +191,14 @@ and is the primary reason for the improved R² values vs v0.7.1.
 
 | Setting | Default | Use when |
 |---------|---------|----------|
-| `with_mrs_layers(n)` | 4 | Default matches PixInsight. Decrease to 1 for speed if noise accuracy is not critical. |
-| `with_measure_cap(n)` | 2000 | Default is fast and accurate. Increase for very dense fields if top-2000 isn't representative. Set 0 for no limit. |
+| `with_mrs_layers(n)` | 0 (MAD) | Default uses fast MAD noise. Set to 4 for MRS wavelet (more robust against nebulosity, ~200ms slower). |
+| `with_measure_cap(n)` | 500 | Default is fast and accurate. Increase for very dense fields. Set 0 for no limit. |
 | `with_fit_max_iter(n)` | 25 | Increase to 50 for maximum accuracy at the cost of speed. |
 | `with_fit_tolerance(tol)` | 1e-4 | Decrease to 1e-6 for tighter convergence (slower). |
 | `with_trail_threshold(t)` | 0.5 | Lower to 0.3 for more aggressive trail detection (more false positives). Raise to 0.7 for fewer flags. |
 
-For general-purpose Athenaeum use, the defaults give the best overall results:
-accurate FWHM, stable eccentricity, and high star counts for field coverage.
+For general-purpose use, the defaults give the best overall results:
+accurate FWHM, stable eccentricity, fast pipeline (~250-750ms per frame).
 
 ### Analyzing pre-loaded data
 
