@@ -1,4 +1,4 @@
-/// Star detection: DAOFIND-inspired matched filter + connected component labeling.
+/// Star detection: DAOFIND-inspired matched filter + proximity blend rejection.
 
 /// A detected star candidate before metric computation.
 #[derive(Clone)]
@@ -38,7 +38,7 @@ impl Default for DetectionParams {
     }
 }
 
-/// Detect stars in an image using DAOFIND-style matched filter + CCL.
+/// Detect stars in an image using DAOFIND-style matched filter + proximity blend rejection.
 ///
 /// `data`: single-channel f32 image (raw ADU values, NOT background-subtracted).
 /// `background`: global background level.
@@ -89,24 +89,37 @@ pub fn detect_stars(
             if c <= local_threshold {
                 continue;
             }
-            // 8-neighbor comparison
-            let is_max = c > conv[(y - 1) * width + x - 1]
-                && c > conv[(y - 1) * width + x]
-                && c > conv[(y - 1) * width + x + 1]
-                && c > conv[y * width + x - 1]
-                && c > conv[y * width + x + 1]
-                && c > conv[(y + 1) * width + x - 1]
-                && c > conv[(y + 1) * width + x]
-                && c > conv[(y + 1) * width + x + 1];
+            // 8-neighbor comparison + minimum neighbor count above threshold.
+            // Requiring ≥3 neighbors above threshold rejects isolated noise peaks
+            // while keeping real stars (which have extended PSF wings).  Matches
+            // Siril's star_finder.c:329 candidate validation.
+            let neighbors = [
+                conv[(y - 1) * width + x - 1],
+                conv[(y - 1) * width + x],
+                conv[(y - 1) * width + x + 1],
+                conv[y * width + x - 1],
+                conv[y * width + x + 1],
+                conv[(y + 1) * width + x - 1],
+                conv[(y + 1) * width + x],
+                conv[(y + 1) * width + x + 1],
+            ];
+            let is_max = neighbors.iter().all(|&v| c > v);
             if is_max {
-                peaks.push((x, y, c));
+                let above = neighbors.iter().filter(|&&v| v > local_threshold).count();
+                if above >= 3 {
+                    peaks.push((x, y, c));
+                }
             }
         }
     }
 
-    // Non-maximum suppression using spatial hashing
+    // Non-maximum suppression using spatial hashing.
+    // Suppression radius = measurement stamp radius (max(8, 4σ+1)) so sidelobes
+    // are removed before blend detection (which rejects both peaks unconditionally).
     peaks.sort_by(|a, b| b.2.total_cmp(&a.2));
-    let sup_radius = radius;
+    let nms_sigma = fwhm / 2.3548;
+    let nms_blend_r = (4.0 * nms_sigma + 2.0).max(9.0).ceil() as usize;
+    let sup_radius = radius.max(nms_blend_r);
     let sup_radius_sq = (sup_radius * sup_radius) as f32;
     let cell_size = sup_radius.max(1);
 
@@ -148,115 +161,67 @@ pub fn detect_stars(
         }
     }
 
-    // Stage 2: CCL with Union-Find on thresholded original image
-    let low_threshold_global = 1.5 * noise; // Lower threshold to capture star wings
+    // ── Stage 2: Proximity-based blend rejection + stamp metrics ────────
+    // Two peaks within blend_radius share overlapping PSFs — skip both.
+    // blend_radius must cover the measurement stamp radius (max(8, 4σ) in metrics.rs)
+    // so that no neighbor falls inside a star's fitting region.
+    let sigma = fwhm / 2.3548;
+    let meas_stamp_r = (4.0 * sigma + 2.0).max(9.0);
+    let blend_radius = meas_stamp_r.max(2.0 * fwhm);
+    let blend_radius_sq = blend_radius * blend_radius;
+    let blend_cell = blend_radius.ceil().max(1.0) as usize;
+    let blend_grid_w = (width + blend_cell - 1) / blend_cell;
+    let blend_grid_h = (height + blend_cell - 1) / blend_cell;
 
-    // Build binary mask and label via two-pass CCL
-    let mut labels = vec![0u32; width * height];
-    let mut parent = vec![0u32; 1]; // Index 0 unused (label 0 = background)
-    let mut next_label = 1u32;
+    let mut blend_grid: Vec<Vec<usize>> = vec![Vec::new(); blend_grid_w * blend_grid_h];
+    for (i, &(px, py, _)) in peak_positions.iter().enumerate() {
+        let gx = (px / blend_cell).min(blend_grid_w - 1);
+        let gy = (py / blend_cell).min(blend_grid_h - 1);
+        blend_grid[gy * blend_grid_w + gx].push(i);
+    }
 
-    // First pass
-    for y in 0..height {
-        for x in 0..width {
-            let bg = bg_map.map_or(background, |m| m[y * width + x]);
-            let val = data[y * width + x] - bg;
-            let low_threshold = if let Some(nm) = noise_map {
-                1.5 * nm[y * width + x]
-            } else {
-                low_threshold_global
-            };
-            if !val.is_finite() || val <= low_threshold {
-                continue;
-            }
+    // Mark blended peaks: any two peaks within blend_radius reject both.
+    // NMS already handles sidelobes — after NMS, surviving close pairs are
+    // genuine separate stars whose overlapping PSFs corrupt measurements.
+    let mut blended = vec![false; peak_positions.len()];
+    for (i, &(px, py, _)) in peak_positions.iter().enumerate() {
+        if blended[i] { continue; }
+        let gx = px / blend_cell;
+        let gy = py / blend_cell;
+        let search_r = (blend_radius / blend_cell as f32).ceil() as usize + 1;
+        let gx_lo = gx.saturating_sub(search_r);
+        let gy_lo = gy.saturating_sub(search_r);
+        let gx_hi = (gx + search_r + 1).min(blend_grid_w);
+        let gy_hi = (gy + search_r + 1).min(blend_grid_h);
 
-            let idx = y * width + x;
-            let left_label = if x > 0 { labels[idx - 1] } else { 0 };
-            let top_label = if y > 0 { labels[idx - width] } else { 0 };
-
-            match (left_label, top_label) {
-                (0, 0) => {
-                    labels[idx] = next_label;
-                    parent.push(next_label);
-                    next_label += 1;
-                }
-                (l, 0) | (0, l) => {
-                    labels[idx] = find(&mut parent, l);
-                }
-                (l, t) => {
-                    let rl = find(&mut parent, l);
-                    let rt = find(&mut parent, t);
-                    labels[idx] = rl.min(rt);
-                    if rl != rt {
-                        union(&mut parent, rl, rt);
+        for ngy in gy_lo..gy_hi {
+            for ngx in gx_lo..gx_hi {
+                for &j in &blend_grid[ngy * blend_grid_w + ngx] {
+                    if j <= i { continue; }
+                    let (jx, jy, _) = peak_positions[j];
+                    let dx = px as f32 - jx as f32;
+                    let dy = py as f32 - jy as f32;
+                    if dx * dx + dy * dy <= blend_radius_sq {
+                        blended[i] = true;
+                        blended[j] = true;
                     }
                 }
             }
         }
     }
 
-    // Second pass: resolve labels
-    for l in labels.iter_mut() {
-        if *l > 0 {
-            *l = find(&mut parent, *l);
-        }
-    }
-
-    // Collect components: only those near a detected peak
-    // Build map of label → peak positions + conv values (for multi-peak detection)
-    use std::collections::HashMap;
-    let mut peak_map: HashMap<u32, Vec<(usize, usize, f32)>> = HashMap::new();
-    for &(px, py, conv_val) in &peak_positions {
-        let l = labels[py * width + px];
-        if l > 0 {
-            peak_map.entry(l).or_default().push((px, py, conv_val));
-        } else {
-            // Peak might be just off — check neighbors, add to first found label
-            'search: for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    let nx = px as i32 + dx;
-                    let ny = py as i32 + dy;
-                    if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
-                        let l2 = labels[ny as usize * width + nx as usize];
-                        if l2 > 0 {
-                            peak_map.entry(l2).or_default().push((px, py, conv_val));
-                            break 'search;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Gather pixel lists per component
-    let mut components: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
-    for y in 0..height {
-        for x in 0..width {
-            let l = labels[y * width + x];
-            if l > 0 && peak_map.contains_key(&l) {
-                components.entry(l).or_default().push((x, y));
-            }
-        }
-    }
-
-    // Validate components and compute centroids.
-    // Multi-peak components (blended stars) are skipped entirely — blended profiles
-    // produce unreliable FWHM/eccentricity. (PixInsight StarDetector uses the same approach.)
-    // Only count peaks with >30% of the component's strongest convolution response;
-    // weaker peaks are noise artifacts, not genuine blended stars.
+    // Process non-blended peaks via stamp-based metrics.
+    // Stamp radius = 1×FWHM (smaller than blend_radius to avoid neighbor contamination).
+    let stamp_r = (fwhm.ceil() as i32).max(3);
     let mut stars = Vec::new();
-    for (label, pixels) in &components {
-        let peaks = &peak_map[label];
-        let max_conv = peaks.iter().map(|p| p.2).fold(0.0_f32, f32::max);
-        let significant_peaks = peaks.iter().filter(|p| p.2 > 0.3 * max_conv).count();
-        if significant_peaks > 1 {
-            continue;
-        }
-        if let Some(star) = process_component(pixels, data, width, height, background, bg_map, params) {
+    for (i, &(px, py, _conv_val)) in peak_positions.iter().enumerate() {
+        if blended[i] { continue; }
+        if let Some(star) = process_peak_stamp(
+            px, py, stamp_r, data, width, height, background, bg_map, params,
+        ) {
             // ── Pass 2 filters (when field_fwhm is provided) ──
             if let Some(ff) = field_fwhm {
-                // 1. Sharpness: (conv[peak] - mean(conv[8_neighbors])) / conv[peak]
-                let &(px, py, _) = peaks.iter().max_by(|a, b| a.2.total_cmp(&b.2)).unwrap();
+                // 1. Sharpness
                 if px >= 1 && py >= 1 && px < width - 1 && py < height - 1 {
                     let cp = conv[py * width + px];
                     if cp > 0.0 {
@@ -276,7 +241,7 @@ pub fn detect_stars(
                     }
                 }
 
-                // 2. Concentration index: flux(1σ) / flux(3σ) from raw bg-subtracted pixels
+                // 2. Concentration index
                 let field_sigma = ff / 2.3548;
                 let ci_inner_r_sq = field_sigma * field_sigma;
                 let ci_outer_r = 3.0 * field_sigma;
@@ -310,7 +275,7 @@ pub fn detect_stars(
                     }
                 }
 
-                // 3. Edge margin: reject stars whose centroid is within 2*FWHM of any edge
+                // 3. Edge margin
                 let margin = (2.0 * ff).max(8.0);
                 if star.x < margin || star.y < margin
                     || star.x > (width as f32 - margin)
@@ -345,12 +310,11 @@ pub fn detect_stars(
     stars
 }
 
-// ── Per-component processing ────────────────────────────────────────────────
-
-/// Validate a component (pixel list) and compute centroid / shape metrics.
-/// Returns `None` if the component is rejected (area, border, saturation, aspect ratio).
-fn process_component(
-    pixels: &[(usize, usize)],
+/// Compute star metrics from a stamp around a peak position.
+fn process_peak_stamp(
+    peak_x: usize,
+    peak_y: usize,
+    stamp_r: i32,
     data: &[f32],
     width: usize,
     height: usize,
@@ -358,70 +322,67 @@ fn process_component(
     bg_map: Option<&[f32]>,
     params: &DetectionParams,
 ) -> Option<DetectedStar> {
-    let area = pixels.len();
+    let cx_i = peak_x as i32;
+    let cy_i = peak_y as i32;
 
-    // Area filter
-    if area < params.min_star_area || area > params.max_star_area {
+    if cx_i - stamp_r <= 0 || cy_i - stamp_r <= 0
+        || cx_i + stamp_r >= width as i32 - 1
+        || cy_i + stamp_r >= height as i32 - 1
+    {
         return None;
     }
 
-    // Border rejection
-    let touches_border = pixels.iter().any(|&(x, y)| x == 0 || y == 0 || x == width - 1 || y == height - 1);
-    if touches_border {
-        return None;
-    }
+    let bg_at = |x: usize, y: usize| bg_map.map_or(background, |m| m[y * width + x]);
 
-    // Compute peak and check saturation
+    // First pass: find peak value in stamp
     let mut peak = 0.0_f32;
     let mut raw_peak = 0.0_f32;
+    for dy in -stamp_r..=stamp_r {
+        let py = (cy_i + dy) as usize;
+        for dx in -stamp_r..=stamp_r {
+            let px = (cx_i + dx) as usize;
+            let raw = data[py * width + px];
+            let bg = bg_at(px, py);
+            let val = raw - bg;
+            if val > peak { peak = val; }
+            if raw > raw_peak { raw_peak = raw; }
+        }
+    }
+
+    if peak <= 0.0 { return None; }
+
+    // Second pass: compute metrics using 5% of peak threshold.
+    // Only includes pixels that clearly belong to THIS star, not neighbors.
+    let threshold = peak * 0.05;
     let mut sum_w = 0.0_f64;
     let mut sum_wx = 0.0_f64;
     let mut sum_wy = 0.0_f64;
     let mut flux = 0.0_f64;
+    let mut area = 0_usize;
 
-    // Bounding box for aspect ratio check
-    let mut min_x = usize::MAX;
-    let mut max_x = 0usize;
-    let mut min_y = usize::MAX;
-    let mut max_y = 0usize;
+    for dy in -stamp_r..=stamp_r {
+        let py = (cy_i + dy) as usize;
+        for dx in -stamp_r..=stamp_r {
+            let px = (cx_i + dx) as usize;
+            let bg = bg_at(px, py);
+            let val = data[py * width + px] - bg;
+            if val <= threshold { continue; }
 
-    for &(x, y) in pixels {
-        let raw = data[y * width + x];
-        let bg = bg_map.map_or(background, |m| m[y * width + x]);
-        let val = raw - bg;
-        if val > peak {
-            peak = val;
+            area += 1;
+            let w = (val as f64).powi(2);
+            sum_w += w;
+            sum_wx += w * px as f64;
+            sum_wy += w * py as f64;
+            flux += val as f64;
         }
-        if raw > raw_peak {
-            raw_peak = raw;
-        }
-
-        // I² weighting for centroid
-        let w = (val.max(0.0) as f64).powi(2);
-        sum_w += w;
-        sum_wx += w * x as f64;
-        sum_wy += w * y as f64;
-        flux += val.max(0.0) as f64;
-
-        min_x = min_x.min(x);
-        max_x = max_x.max(x);
-        min_y = min_y.min(y);
-        max_y = max_y.max(y);
     }
 
-    // Saturation check — use raw (pre-background-subtracted) peak
+    if area < params.min_star_area || area > params.max_star_area {
+        return None;
+    }
     if raw_peak > params.saturation_limit {
         return None;
     }
-
-    // Aspect ratio check (reject cosmic rays/satellite trails)
-    let bbox_w = (max_x - min_x + 1) as f32;
-    let bbox_h = (max_y - min_y + 1) as f32;
-    let aspect = bbox_w.max(bbox_h) / bbox_w.min(bbox_h);
-    if aspect > 4.0 {
-        return None;
-    }
-
     if sum_w < 1e-10 {
         return None;
     }
@@ -429,52 +390,45 @@ fn process_component(
     let cx = (sum_wx / sum_w) as f32;
     let cy = (sum_wy / sum_w) as f32;
 
-    // Theta from stamp-based I-weighted second moments (not CCL pixels).
-    // CCL blobs have too few pixels → grid-induced theta coherence.
-    // A stamp over the continuous image gives reliable orientation.
-    let stamp_r = ((2.0 * (area as f64 / std::f64::consts::PI).sqrt()) as i32).max(5);
-    let cx_i = cx.round() as i32;
-    let cy_i = cy.round() as i32;
-    let (theta, ecc) = {
-        let mut sf = 0.0_f64;
-        let mut six = 0.0_f64;
-        let mut siy = 0.0_f64;
-        let mut sixx = 0.0_f64;
-        let mut siyy = 0.0_f64;
-        let mut sixy = 0.0_f64;
-        for dy in -stamp_r..=stamp_r {
-            let py = cy_i + dy;
-            if py < 0 || py >= height as i32 { continue; }
-            for dx in -stamp_r..=stamp_r {
-                let px = cx_i + dx;
-                if px < 0 || px >= width as i32 { continue; }
-                let bg = bg_map.map_or(background, |m| m[py as usize * width + px as usize]);
-                let v = (data[py as usize * width + px as usize] - bg).max(0.0) as f64;
-                sf += v;
-                six += v * px as f64;
-                siy += v * py as f64;
-                sixx += v * (px as f64) * (px as f64);
-                siyy += v * (py as f64) * (py as f64);
-                sixy += v * (px as f64) * (py as f64);
-            }
+    // Stamp-based I-weighted second moments for theta and eccentricity
+    let mut sf = 0.0_f64;
+    let mut six = 0.0_f64;
+    let mut siy = 0.0_f64;
+    let mut sixx = 0.0_f64;
+    let mut siyy = 0.0_f64;
+    let mut sixy = 0.0_f64;
+    for dy in -stamp_r..=stamp_r {
+        let py = (cy_i + dy) as usize;
+        for dx in -stamp_r..=stamp_r {
+            let px = (cx_i + dx) as usize;
+            let bg = bg_at(px, py);
+            let v = data[py * width + px] - bg;
+            if v <= threshold { continue; }
+            let v = v as f64;
+            sf += v;
+            six += v * px as f64;
+            siy += v * py as f64;
+            sixx += v * (px as f64) * (px as f64);
+            siyy += v * (py as f64) * (py as f64);
+            sixy += v * (px as f64) * (py as f64);
         }
-        if sf > 1e-10 {
-            let icx = six / sf;
-            let icy = siy / sf;
-            let mxx = sixx / sf - icx * icx;
-            let myy = siyy / sf - icy * icy;
-            let mxy = sixy / sf - icx * icy;
-            let t = (0.5 * (2.0 * mxy).atan2(mxx - myy)) as f32;
-            let trace = mxx + myy;
-            let det = mxx * myy - mxy * mxy;
-            let disc = (trace * trace - 4.0 * det).max(0.0);
-            let l1 = (trace + disc.sqrt()) * 0.5;
-            let l2 = (trace - disc.sqrt()) * 0.5;
-            let e = if l1 > 0.0 { (1.0 - l2 / l1).max(0.0).sqrt() as f32 } else { 0.0 };
-            (t, e)
-        } else {
-            (0.0, 0.0)
-        }
+    }
+    let (theta, ecc) = if sf > 1e-10 {
+        let icx = six / sf;
+        let icy = siy / sf;
+        let mxx = sixx / sf - icx * icx;
+        let myy = siyy / sf - icy * icy;
+        let mxy = sixy / sf - icx * icy;
+        let t = (0.5 * (2.0 * mxy).atan2(mxx - myy)) as f32;
+        let trace = mxx + myy;
+        let det = mxx * myy - mxy * mxy;
+        let disc = (trace * trace - 4.0 * det).max(0.0);
+        let l1 = (trace + disc.sqrt()) * 0.5;
+        let l2 = (trace - disc.sqrt()) * 0.5;
+        let e = if l1 > 0.0 { (1.0 - l2 / l1).max(0.0).sqrt() as f32 } else { 0.0 };
+        (t, e)
+    } else {
+        (0.0, 0.0)
     };
 
     Some(DetectedStar {
@@ -486,24 +440,6 @@ fn process_component(
         theta,
         eccentricity: ecc,
     })
-}
-
-// ── Union-Find ──────────────────────────────────────────────────────────────
-
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
-    while parent[x as usize] != x {
-        parent[x as usize] = parent[parent[x as usize] as usize]; // path halving
-        x = parent[x as usize];
-    }
-    x
-}
-
-fn union(parent: &mut [u32], a: u32, b: u32) {
-    let ra = find(parent, a);
-    let rb = find(parent, b);
-    if ra != rb {
-        parent[ra.max(rb) as usize] = ra.min(rb);
-    }
 }
 
 #[cfg(test)]

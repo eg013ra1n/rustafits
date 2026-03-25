@@ -34,18 +34,17 @@ pub fn estimate_background_mesh(
     let nx = (width + cell_size - 1) / cell_size;
     let ny = (height + cell_size - 1) / cell_size;
 
-    let mut cell_bg = vec![0.0_f32; nx * ny];
-    let mut cell_sigma = vec![0.0_f32; nx * ny];
-    let mut cell_valid = vec![true; nx * ny];
-
-    // Per-cell statistics
-    for cy in 0..ny {
-        let y0 = cy * cell_size;
-        let y1 = (y0 + cell_size).min(height);
-        for cx in 0..nx {
+    // Per-cell statistics (parallelized — each cell is independent)
+    use rayon::prelude::*;
+    let cells: Vec<(f32, f32, bool)> = (0..ny * nx)
+        .into_par_iter()
+        .map(|cell_idx| {
+            let cy = cell_idx / nx;
+            let cx = cell_idx % nx;
+            let y0 = cy * cell_size;
+            let y1 = (y0 + cell_size).min(height);
             let x0 = cx * cell_size;
             let x1 = (x0 + cell_size).min(width);
-            let cell_idx = cy * nx + cx;
 
             let mut samples = Vec::with_capacity((y1 - y0) * (x1 - x0));
             for y in y0..y1 {
@@ -58,21 +57,25 @@ pub fn estimate_background_mesh(
             }
 
             if samples.len() < 10 {
-                cell_valid[cell_idx] = false;
-                continue;
+                return (0.0, 0.0, false);
             }
 
             let original_len = samples.len();
             let (mode, sigma) = sigma_clipped_stats(&mut samples, 3, 3.0);
 
             // Reject star-contaminated cells (>30% clipped)
-            if samples.len() < (original_len * 7 / 10) {
-                cell_valid[cell_idx] = false;
-            }
+            let valid = samples.len() >= (original_len * 7 / 10);
+            (mode, sigma, valid)
+        })
+        .collect();
 
-            cell_bg[cell_idx] = mode;
-            cell_sigma[cell_idx] = sigma;
-        }
+    let mut cell_bg = vec![0.0_f32; nx * ny];
+    let mut cell_sigma = vec![0.0_f32; nx * ny];
+    let mut cell_valid = vec![true; nx * ny];
+    for (i, &(bg, sigma, valid)) in cells.iter().enumerate() {
+        cell_bg[i] = bg;
+        cell_sigma[i] = sigma;
+        cell_valid[i] = valid;
     }
 
     // Fill invalid cells with nearest valid neighbor
@@ -157,7 +160,7 @@ pub fn estimate_background_mesh(
     let mut valid_bgs: Vec<f32> = (0..nx * ny).map(|i| filtered_bg[i]).collect();
     let background = find_median(&mut valid_bgs);
 
-    // Bilinear interpolation of per-cell noise to full resolution
+    // Bicubic interpolation of per-cell noise to full resolution
     let noise_map = interpolate_grid_to_map(&cell_sigma, nx, ny, width, height, cell_size);
 
     BackgroundResult {

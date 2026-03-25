@@ -184,7 +184,7 @@ impl ImageAnalyzer {
                 max_stars: 200,
                 apply_debayer: true,
                 trail_r_squared_threshold: 0.5,
-                noise_layers: 4,
+                noise_layers: 0,
                 measure_cap: 500,
                 fit_max_iter: 25,
                 fit_tolerance: 1e-4,
@@ -238,11 +238,12 @@ impl ImageAnalyzer {
         self
     }
 
-    /// Set MRS wavelet noise layers.
-    /// Uses à trous B3-spline wavelet to isolate noise from nebulosity/gradients.
-    /// Default: 4.
+    /// Set MRS wavelet noise layers for noise estimation.
+    /// Default: 0 (fast MAD noise from mesh-grid cell sigmas).
+    /// Set to 1-6 for MRS wavelet noise (more robust against nebulosity/gradients,
+    /// ~200ms slower per frame). 4 is the recommended MRS setting.
     pub fn with_mrs_layers(mut self, layers: usize) -> Self {
-        self.config.noise_layers = layers.max(1);
+        self.config.noise_layers = layers;
         self
     }
 
@@ -304,9 +305,9 @@ impl ImageAnalyzer {
     ) -> Result<AnalysisResult> {
         match &self.thread_pool {
             Some(pool) => pool.install(|| {
-                self.run_analysis(data, width, height, channels, None)
+                self.run_analysis(data, width, height, channels)
             }),
-            None => self.run_analysis(data, width, height, channels, None),
+            None => self.run_analysis(data, width, height, channels),
         }
     }
 
@@ -340,17 +341,17 @@ impl ImageAnalyzer {
         let height = meta.height;
         let channels = meta.channels;
 
-        let green_mask = if self.config.apply_debayer
+        // OSC green interpolation: replace R/B pixels with weighted average of
+        // neighboring green values (matching Siril's interpolate_nongreen).
+        // PSF fitting uses all pixels — no green mask.
+        if self.config.apply_debayer
             && meta.bayer_pattern != BayerPattern::None
             && channels == 1
         {
             data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
-            Some(build_green_mask(width, height, meta.bayer_pattern))
-        } else {
-            None
-        };
+        }
 
-        self.run_analysis(&data, width, height, channels, green_mask.as_deref())
+        self.run_analysis(&data, width, height, channels)
     }
 
     fn analyze_impl(&self, path: &Path) -> Result<AnalysisResult> {
@@ -368,20 +369,15 @@ impl ImageAnalyzer {
         let height = meta.height;
         let channels = meta.channels;
 
-        // Green-channel interpolation for OSC: native-resolution mono green image
-        // (matches Siril's interpolate_nongreen — no PSF broadening from 2×2 binning)
-        let green_mask = if self.config.apply_debayer
+        // OSC green interpolation (matching Siril's interpolate_nongreen).
+        if self.config.apply_debayer
             && meta.bayer_pattern != BayerPattern::None
             && channels == 1
         {
             data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
-            // width, height, channels unchanged — native resolution mono green
-            Some(build_green_mask(width, height, meta.bayer_pattern))
-        } else {
-            None
-        };
+        }
 
-        self.run_analysis(&data, width, height, channels, green_mask.as_deref())
+        self.run_analysis(&data, width, height, channels)
     }
 
     fn run_analysis(
@@ -390,7 +386,6 @@ impl ImageAnalyzer {
         width: usize,
         height: usize,
         channels: usize,
-        green_mask: Option<&[bool]>,
     ) -> Result<AnalysisResult> {
         // Extract luminance if multi-channel
         let lum = if channels == 3 {
@@ -409,9 +404,13 @@ impl ImageAnalyzer {
         // ── Stage 1: Background & Noise ──────────────────────────────────
         let cell_size = background::auto_cell_size(width, height);
         let mut bg_result = background::estimate_background_mesh(&lum, width, height, cell_size);
-        bg_result.noise = background::estimate_noise_mrs(
-            &lum, width, height, self.config.noise_layers.max(1),
-        ).max(0.001);
+        if self.config.noise_layers > 0 {
+            // MRS wavelet noise: accurate but ~500ms. Layers 1-6.
+            bg_result.noise = background::estimate_noise_mrs(
+                &lum, width, height, self.config.noise_layers.max(1),
+            ).max(0.001);
+        }
+        // noise_layers == 0: keep MAD noise from mesh-grid (already in bg_result.noise)
 
         // ── Stage 2, Pass 1: Discovery ───────────────────────────────────
         let initial_fwhm = 3.0_f32;
@@ -448,7 +447,7 @@ impl ImageAnalyzer {
                 &lum, width, height, &cal_owned,
                 bg_result.background,
                 bg_result.background_map.as_deref(),
-                green_mask,
+                None, // fit all pixels in green-interpolated image (no green mask)
                 None, // free-beta Moffat
                 50, 1e-6, 5, // calibration always uses full precision
                 None,   // no screening for calibration
@@ -485,40 +484,20 @@ impl ImageAnalyzer {
             );
         }
 
-        // Source-mask background re-estimation
-        let mask_fwhm = if field_fwhm > 1.0 { field_fwhm } else { initial_fwhm };
-        if !pass1_stars.is_empty() {
-            let mask_radius = (2.5 * mask_fwhm).ceil() as i32;
-            let mask_r_sq = (mask_radius * mask_radius) as f32;
-            let mut source_mask = vec![false; width * height];
-            for star in &pass1_stars {
-                let cx = star.x.round() as i32;
-                let cy = star.y.round() as i32;
-                for dy in -mask_radius..=mask_radius {
-                    let py = cy + dy;
-                    if py < 0 || py >= height as i32 { continue; }
-                    for dx in -mask_radius..=mask_radius {
-                        let px = cx + dx;
-                        if px < 0 || px >= width as i32 { continue; }
-                        if (dx * dx + dy * dy) as f32 <= mask_r_sq {
-                            source_mask[py as usize * width + px as usize] = true;
-                        }
-                    }
-                }
-            }
-            bg_result = background::estimate_background_mesh_masked(
-                &lum, width, height, cell_size, &source_mask,
-            );
-            bg_result.noise = background::estimate_noise_mrs(
-                &lum, width, height, self.config.noise_layers.max(1),
-            ).max(0.001);
-        }
+        // Source-mask background re-estimation skipped for speed.
+        // The sigma-clipped cell stats already reject >30% star-contaminated
+        // cells and 3-round sigma clipping handles residual star flux within
+        // cells. The source mask adds ~400ms for marginal improvement.
 
         // ── Stage 2, Pass 2: Full detection with refined kernel ──────────
-        let final_fwhm = if field_fwhm > 1.0
-            && ((field_fwhm - initial_fwhm) / initial_fwhm).abs() > 0.30
+        // Clamp minimum FWHM to 2.0px — no real optics produce sub-2px stars,
+        // and tiny kernels have poor noise rejection (OSC green-channel fits
+        // can underestimate FWHM due to Bayer grid undersampling).
+        let clamped_fwhm = field_fwhm.max(2.0);
+        let final_fwhm = if clamped_fwhm > 1.0
+            && ((clamped_fwhm - initial_fwhm) / initial_fwhm).abs() > 0.30
         {
-            field_fwhm.min(initial_fwhm * 2.0)
+            clamped_fwhm.min(initial_fwhm * 2.0)
         } else {
             initial_fwhm
         };
@@ -530,7 +509,7 @@ impl ImageAnalyzer {
                 &lum, width, height,
                 bg_result.background, bg_result.noise,
                 bg_map, noise_map, &det_params, final_fwhm,
-                Some(field_fwhm),
+                Some(clamped_fwhm),
             )
         };
 
@@ -637,7 +616,7 @@ impl ImageAnalyzer {
         let mut measured = metrics::measure_stars(
             &lum, width, height, &to_measure,
             bg_result.background, bg_map_ref,
-            green_mask, field_beta,
+            None, field_beta, // fit all pixels in green-interpolated image
             self.config.fit_max_iter,
             self.config.fit_tolerance,
             self.config.fit_max_rejects,
@@ -651,18 +630,9 @@ impl ImageAnalyzer {
 
         // ── Stage 4: Metrics ─────────────────────────────────────────────
 
-        // Refine trail detection using accurate PSF-fit eccentricities.
-        // Detection-stage moments are noisy; PSF-fit ecc is reliable.
-        let possibly_trailed = possibly_trailed || {
-            let mut fit_eccs: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
-            fit_eccs.sort_unstable_by(|a, b| a.total_cmp(b));
-            let med = if fit_eccs.len() % 2 == 1 {
-                fit_eccs[fit_eccs.len() / 2]
-            } else {
-                (fit_eccs[fit_eccs.len() / 2 - 1] + fit_eccs[fit_eccs.len() / 2]) * 0.5
-            };
-            med > 0.55
-        };
+        // Trail detection uses only the Rayleigh test (Stage 1) on detection-stage
+        // angles.  High PSF eccentricity alone is NOT trailing — it can be optical
+        // aberration (coma, tilt) or wind shake without coherent direction.
 
         // FWHM & HFR: ecc ≤ 0.8 filter — elongated profiles inflate
         // geometric-mean FWHM. On trailed frames bypass it.
@@ -985,15 +955,15 @@ pub fn prepare_luminance(
     let height = meta.height;
     let channels = meta.channels;
 
-    let green_mask = if apply_debayer
+    // OSC green interpolation (matching Siril's interpolate_nongreen).
+    // No green mask — PSF fitting uses all pixels in the interpolated image.
+    if apply_debayer
         && meta.bayer_pattern != BayerPattern::None
         && channels == 1
     {
         data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
-        Some(build_green_mask(width, height, meta.bayer_pattern))
-    } else {
-        None
-    };
+    }
+    let green_mask: Option<Vec<bool>> = None;
 
     let lum = if channels == 3 {
         extract_luminance(&data, width, height)
