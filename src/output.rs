@@ -36,24 +36,25 @@ pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()
         }
         _ => {
             // JPEG via libjpeg-turbo (SIMD-accelerated DCT on NEON/AVX2)
-            let (pixels, format) = if image.channels == 4 {
-                // Strip alpha for JPEG
-                let rgb: Vec<u8> = image
+            // Strip alpha if RGBA; otherwise pass RGB data by reference (zero-copy).
+            let rgb_tmp;
+            let pixels: &[u8] = if image.channels == 4 {
+                rgb_tmp = image
                     .data
                     .chunks_exact(4)
                     .flat_map(|px| [px[0], px[1], px[2]])
-                    .collect();
-                (rgb, turbojpeg::PixelFormat::RGB)
+                    .collect::<Vec<u8>>();
+                &rgb_tmp
             } else {
-                (image.data.clone(), turbojpeg::PixelFormat::RGB)
+                &image.data
             };
 
             let tj_image = turbojpeg::Image {
-                pixels: pixels.as_slice(),
+                pixels,
                 width: image.width,
                 pitch: image.width * 3,
                 height: image.height,
-                format,
+                format: turbojpeg::PixelFormat::RGB,
             };
 
             let jpeg_data = turbojpeg::compress(tj_image, quality as i32, turbojpeg::Subsamp::Sub2x2)

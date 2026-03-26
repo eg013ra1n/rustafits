@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.8.3
+Version:        0.8.4
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,10 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Thu Mar 27 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.4-1
+- Remove unnecessary buffer clone in JPEG output (zero-copy for RGB)
+- Add shared thread pool for annotate path (analysis + conversion)
+
 * Wed Mar 26 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.3-1
 - Replace JPEG encoder with turbojpeg (SIMD-accelerated, 2-3x faster)
 - Add fused u16→u8 stretch path (skip f32 intermediate for mono FITS)

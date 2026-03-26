@@ -155,6 +155,12 @@ fn run() -> Result<()> {
     }
 
     if annotate {
+        // Shared thread pool for analysis + conversion
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new().build()
+                .context("Failed to create thread pool")?
+        );
+
         // Read raw pixels once, share between analyzer and converter
         let (meta, pixels) = ImageConverter::read_raw(input_path)
             .context("Failed to read image")?;
@@ -163,6 +169,7 @@ fn run() -> Result<()> {
         let result = ImageAnalyzer::new()
             .with_max_stars(max_stars)
             .with_measure_cap(measure_cap)
+            .with_thread_pool(pool.clone())
             .analyze_raw(&meta, &pixels)
             .context("Analysis failed")?;
 
@@ -172,6 +179,7 @@ fn run() -> Result<()> {
         }
 
         // Process image (consumes pixels — borrow released above)
+        converter = converter.with_thread_pool(pool);
         let mut image = converter.process_data(meta, pixels)
             .context("Image processing failed")?;
 

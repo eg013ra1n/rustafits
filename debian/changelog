@@ -1,3 +1,10 @@
+rustafits (0.8.4-1) unstable; urgency=medium
+
+  * Remove unnecessary buffer clone in JPEG output (zero-copy for RGB)
+  * Add shared thread pool for annotate path (analysis + conversion)
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Thu, 27 Mar 2026 00:00:00 +0300
+
 rustafits (0.8.3-1) unstable; urgency=medium
 
   * Replace JPEG encoder with turbojpeg (SIMD-accelerated, 2-3x faster)
