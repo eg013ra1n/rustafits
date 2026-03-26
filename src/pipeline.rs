@@ -60,20 +60,21 @@ fn process_u16(
             height = nh;
         }
 
-        // Convert to float
-        let mut fdata = color::u16_to_f32(&data);
-
-        // Preview binning for mono
+        // Preview binning for mono (needs f32 for binning)
         if config.preview_mode && meta.bayer_pattern == BayerPattern::None {
+            let mut fdata = color::u16_to_f32(&data);
             let (binned, nw, nh) = binning::bin_2x2_float(&fdata, width, height);
             fdata = binned;
             width = nw;
             height = nh;
+            float_data = fdata;
+            is_color = false;
+            num_channels = 1;
+            return apply_stretch_and_finalize(float_data, width, height, is_color, num_channels, &meta, config);
         }
 
-        float_data = fdata;
-        is_color = false;
-        num_channels = 1;
+        // Fast path: stretch directly from u16, skip f32 intermediate
+        return apply_stretch_u16_and_finalize(&data, width, height, &meta, config);
     }
 
     apply_stretch_and_finalize(float_data, width, height, is_color, num_channels, &meta, config)
@@ -139,6 +140,64 @@ fn process_f32(
     }
 
     apply_stretch_and_finalize(float_data, width, height, is_color, num_channels, &meta, config)
+}
+
+fn compute_stretch_coefficients_u16(channel_data: &[u16]) -> (f32, f32, f32, f32, f32) {
+    let max_input = 65536.0f32;
+    let params = stretch::compute_stretch_params_u16(channel_data, max_input);
+    let hs_range_factor = if params.highlights == params.shadows {
+        1.0
+    } else {
+        1.0 / (params.highlights - params.shadows)
+    };
+    let native_shadows = params.shadows * max_input;
+    let native_highlights = params.highlights * max_input;
+    let k1 = (params.midtones - 1.0) * hs_range_factor * 255.0 / max_input;
+    let k2 = (2.0 * params.midtones - 1.0) * hs_range_factor / max_input;
+    (native_shadows, native_highlights, k1, k2, params.midtones)
+}
+
+/// Fast u16→u8 stretch for mono images, skipping the f32 intermediate.
+fn apply_stretch_u16_and_finalize(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    meta: &ImageMetadata,
+    config: &ProcessConfig,
+) -> Result<ProcessedImage> {
+    let channel_size = width * height;
+    let bpp: usize = if config.rgba_output { 4 } else { 3 };
+
+    let out_data = if config.auto_stretch {
+        let (ns, nh, k1, k2, m) = compute_stretch_coefficients_u16(&data[..channel_size]);
+
+        let mut temp = vec![0u8; channel_size];
+        stretch::apply_stretch_from_u16(
+            &data[..channel_size], &mut temp, 0, 1, ns, nh, k1, k2, m,
+        );
+        if config.rgba_output {
+            color::replicate_gray_to_rgba(&temp)
+        } else {
+            color::replicate_gray_to_rgb(&temp)
+        }
+    } else {
+        vec![0u8; channel_size * bpp]
+    };
+
+    let mut result = ProcessedImage {
+        data: out_data,
+        width,
+        height,
+        is_color: false,
+        channels: bpp as u8,
+        flip_vertical: meta.flip_vertical,
+    };
+
+    if meta.flip_vertical {
+        color::vertical_flip(&mut result.data, width, height, bpp);
+    }
+
+    Ok(result)
 }
 
 fn compute_stretch_coefficients(channel_data: &[f32]) -> (f32, f32, f32, f32, f32) {

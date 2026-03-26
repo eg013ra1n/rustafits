@@ -1,6 +1,6 @@
 [package]
 name = "rustafits"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 authors = ["Vilen Sharifov <vilen.sharifov@gmail.com>"]
 description = "High-performance FITS to JPEG converter for astronomical images with auto-stretch and Bayer debayering"
@@ -33,7 +33,8 @@ anyhow = "1.0"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
 ruzstd = "0.7"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+turbojpeg = "1.4"
 quick-xml = "0.37"
 base64 = "0.22"
 rayon = "1.10"

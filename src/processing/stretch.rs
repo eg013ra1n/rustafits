@@ -147,6 +147,40 @@ pub fn compute_stretch_params(data: &[f32], max_input: f32) -> StretchParams {
     }
 }
 
+/// Compute stretch params directly from u16 data (avoids u16→f32 conversion).
+pub fn compute_stretch_params_u16(data: &[u16], max_input: f32) -> StretchParams {
+    const MAX_SAMPLES: usize = 500_000;
+
+    let num_samples = data.len().min(MAX_SAMPLES);
+    let mut samples: Vec<f32> = if data.len() <= MAX_SAMPLES {
+        data.iter().map(|&v| v as f32).collect()
+    } else {
+        let step = data.len() / MAX_SAMPLES;
+        (0..num_samples).map(|i| data[i * step] as f32).collect()
+    };
+
+    compute_stretch_params(&mut samples, max_input)
+}
+
+/// Fused u16→stretch→u8: converts u16 to f32 and applies STF stretch in one pass.
+/// Avoids allocating a separate f32 intermediate buffer.
+pub fn apply_stretch_from_u16(
+    channel_data: &[u16],
+    output: &mut [u8],
+    output_offset: usize,
+    stride: usize,
+    native_shadows: f32,
+    native_highlights: f32,
+    k1: f32,
+    k2: f32,
+    midtones: f32,
+) {
+    for (i, &val) in channel_data.iter().enumerate() {
+        output[output_offset + i * stride] =
+            stretch_pixel(val as f32, native_shadows, native_highlights, k1, k2, midtones);
+    }
+}
+
 /// Apply stretch to a channel, writing into `output` at positions `output_offset + i * stride`.
 pub fn apply_stretch(
     channel_data: &[f32],

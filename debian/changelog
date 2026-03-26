@@ -1,3 +1,11 @@
+rustafits (0.8.3-1) unstable; urgency=medium
+
+  * Replace JPEG encoder with turbojpeg (SIMD-accelerated, 2-3x faster)
+  * Add fused u16-to-u8 stretch path (skip f32 intermediate for mono FITS)
+  * Mono FITS to JPEG conversion ~3x faster (330ms to 107ms for 26MP)
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Wed, 26 Mar 2026 22:00:00 +0300
+
 rustafits (0.8.2-1) unstable; urgency=medium
 
   * Replace CCL with proximity-based blend detection (2-5x faster pipeline)

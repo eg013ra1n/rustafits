@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.8.2
+Version:        0.8.3
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,11 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Wed Mar 26 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.3-1
+- Replace JPEG encoder with turbojpeg (SIMD-accelerated, 2-3x faster)
+- Add fused u16→u8 stretch path (skip f32 intermediate for mono FITS)
+- Mono FITS→JPEG conversion ~3x faster (330ms→107ms for 26MP)
+
 * Tue Mar 25 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.2-1
 - Replace CCL with proximity-based blend detection (2-5x faster)
 - Parallelize background mesh cell statistics with rayon
