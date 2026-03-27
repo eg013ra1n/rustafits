@@ -1,3 +1,12 @@
+rustafits (0.8.6-1) unstable; urgency=medium
+
+  * Add with_optics() for arcsecond FWHM/HFR measurements
+  * Add plate_scale, median_fwhm_arcsec, median_hfr_arcsec to AnalysisResult
+  * Add per-star fwhm_arcsec, hfr_arcsec to StarMetrics
+  * Update README with complete API reference
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Thu, 27 Mar 2026 22:00:00 +0300
+
 rustafits (0.8.5-1) unstable; urgency=medium
 
   * Add per-stage timing instrumentation (StageTiming in AnalysisResult)

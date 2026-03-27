@@ -137,12 +137,20 @@ use astroimage::ImageAnalyzer;
 
 let result = ImageAnalyzer::new()
     .with_max_stars(500)
+    .with_optics(620.0, 3.76)  // focal length mm, pixel size µm → arcsec output
     .analyze("light.fits")?;
 
-println!("Stars: {}  FWHM: {:.2} px  Ecc: {:.3}  Beta: {:.2}",
+println!("Stars: {}  FWHM: {:.2} px ({:.1}\")  Ecc: {:.3}  Seeing: {:.1}\"",
     result.stars_detected, result.median_fwhm,
+    result.median_fwhm_arcsec.unwrap_or(0.0),
     result.median_eccentricity,
-    result.median_beta.unwrap_or_default());
+    result.median_fwhm_arcsec.unwrap_or(0.0));
+
+// Per-stage timing breakdown
+let t = &result.stage_timing;
+println!("Timing: bg={:.0}ms det={:.0}ms cal={:.0}ms meas={:.0}ms total={:.0}ms",
+    t.background_ms, t.detection_pass1_ms, t.calibration_ms,
+    t.measurement_ms, t.total_ms);
 ```
 
 Default configuration uses a two-pass calibration pipeline: pass 1 fits free-beta Moffat
@@ -150,7 +158,37 @@ on bright calibration stars to derive the field PSF model (beta, FWHM). Pass 2 a
 fixed-beta Moffat to all detected stars with Gaussian and moments fallbacks. Background
 uses parallelized mesh-grid with auto-tuned cell size and MAD noise estimation (MRS wavelet
 available via `with_mrs_layers(4)`). OSC/Bayer images are green-interpolated before
-detection and PSF fitting. See [Analysis API](docs/usage.md) for all builder methods.
+detection and PSF fitting.
+
+### Batch analysis
+
+Analyze multiple images in parallel with progress reporting:
+
+```rust
+use astroimage::ImageAnalyzer;
+
+let analyzer = ImageAnalyzer::new()
+    .with_optics(620.0, 3.76);
+
+let paths: Vec<&str> = vec!["frame001.fits", "frame002.fits", /* ... */];
+
+let results = analyzer.analyze_batch(&paths, 4, |done, total, path| {
+    println!("[{}/{}] {}", done, total, path.display());
+});
+
+for (path, result) in &results {
+    match result {
+        Ok(r) => println!("{}: FWHM={:.2}\" ecc={:.3}",
+            path.display(),
+            r.median_fwhm_arcsec.unwrap_or(0.0),
+            r.median_eccentricity),
+        Err(e) => eprintln!("{}: {}", path.display(), e),
+    }
+}
+```
+
+The `concurrency` parameter controls how many frames are analyzed simultaneously.
+Results are returned in approximate completion order with their paths.
 
 ### Star annotation overlay
 
@@ -234,10 +272,64 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 | `with_max_star_area(usize)` | Maximum star area in stamp (default 2000 px) |
 | `with_saturation_fraction(f32)` | Reject stars above this fraction of 65535 (default 0.95) |
 | `with_max_stars(usize)` | Keep only the brightest N stars (default 200) |
+| `with_measure_cap(usize)` | Max stars to PSF-fit for statistics (default 500, 0 = all) |
 | `with_mrs_layers(usize)` | Noise layers: 0 = fast MAD (default), 1-6 = MRS wavelet |
-| `with_trail_threshold(f32)` | R² threshold for trail detection (default 0.5) |
+| `with_trail_threshold(f32)` | R² threshold for Rayleigh trail detection (default 0.5) |
+| `with_optics(f64, f64)` | Focal length (mm) + pixel size (µm) → enables arcsec output |
 | `without_debayer()` | Skip green-channel interpolation for OSC images |
 | `with_thread_pool(pool)` | Use a custom rayon thread pool |
+
+### AnalysisResult fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `width`, `height` | usize | pixels | Image dimensions |
+| `background` | f32 | ADU | Global background level |
+| `noise` | f32 | ADU | Background noise sigma |
+| `stars_detected` | usize | — | Total detections (before measure cap) |
+| `stars` | Vec\<StarMetrics\> | — | Per-star metrics (brightest N) |
+| `median_fwhm` | f32 | pixels | Median FWHM across measured stars |
+| `median_fwhm_arcsec` | Option\<f32\> | arcsec | Median FWHM (requires `with_optics`) |
+| `median_eccentricity` | f32 | — | 0 = round, →1 = elongated |
+| `median_hfr` | f32 | pixels | Median half-flux radius |
+| `median_hfr_arcsec` | Option\<f32\> | arcsec | Median HFR (requires `with_optics`) |
+| `median_snr` | f32 | — | Median per-star SNR |
+| `plate_scale` | Option\<f32\> | arcsec/px | Plate scale (requires `with_optics`) |
+| `trail_r_squared` | f32 | — | Rayleigh R̄² for directional coherence |
+| `possibly_trailed` | bool | — | True if coherent trailing detected |
+| `median_beta` | Option\<f32\> | — | Moffat β (None if Gaussian/moments) |
+| `stage_timing` | StageTiming | ms | Per-stage timing breakdown |
+
+### StarMetrics fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `x`, `y` | f32 | pixels | Subpixel centroid position |
+| `fwhm_x`, `fwhm_y` | f32 | pixels | FWHM along major/minor axis |
+| `fwhm` | f32 | pixels | Geometric mean FWHM |
+| `fwhm_arcsec` | Option\<f32\> | arcsec | FWHM (requires `with_optics`) |
+| `eccentricity` | f32 | — | 0 = round, →1 = elongated |
+| `theta` | f32 | radians | Position angle of major axis |
+| `hfr` | f32 | pixels | Half-flux radius |
+| `hfr_arcsec` | Option\<f32\> | arcsec | HFR (requires `with_optics`) |
+| `snr` | f32 | — | Per-star aperture photometry SNR |
+| `peak`, `flux` | f32 | ADU | Peak and total flux |
+| `beta` | Option\<f32\> | — | Moffat β parameter |
+| `fit_method` | FitMethod | — | FreeMoffat, FixedMoffat, Gaussian, or Moments |
+| `fit_residual` | f32 | — | Normalized fit quality (lower = better) |
+
+### StageTiming fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `background_ms` | f64 | Background mesh + noise estimation |
+| `detection_pass1_ms` | f64 | Pass 1 star detection |
+| `calibration_ms` | f64 | Free-beta Moffat calibration |
+| `detection_pass2_ms` | f64 | Pass 2 detection with refined kernel |
+| `measurement_ms` | f64 | PSF measurement on measured stars |
+| `snr_ms` | f64 | Per-star SNR computation |
+| `statistics_ms` | f64 | Statistics aggregation |
+| `total_ms` | f64 | Total pipeline wall time |
 
 ### Multi-image concurrent processing
 

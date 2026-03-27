@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.8.5
+Version:        0.8.6
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,12 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Thu Mar 27 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.6-1
+- Add with_optics() for arcsecond FWHM/HFR measurements
+- Add plate_scale, median_fwhm_arcsec, median_hfr_arcsec to AnalysisResult
+- Add per-star fwhm_arcsec, hfr_arcsec to StarMetrics
+- Update README with complete API reference
+
 * Thu Mar 27 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.5-1
 - Add per-stage timing instrumentation (StageTiming in AnalysisResult)
 - Add analyze_batch() API for parallel multi-image analysis
