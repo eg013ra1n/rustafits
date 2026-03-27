@@ -340,6 +340,52 @@ impl ImageAnalyzer {
         }
     }
 
+    /// Analyze multiple images in parallel.
+    ///
+    /// `concurrency` controls how many frames are analyzed simultaneously.
+    /// `progress` is called after each frame completes with (completed, total, path).
+    /// Returns results in approximate completion order.
+    pub fn analyze_batch<P, F>(
+        &self,
+        paths: &[P],
+        concurrency: usize,
+        progress: F,
+    ) -> Vec<(std::path::PathBuf, Result<AnalysisResult>)>
+    where
+        P: AsRef<std::path::Path> + Sync,
+        F: Fn(usize, usize, &std::path::Path) + Send + Sync,
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use rayon::prelude::*;
+
+        let total = paths.len();
+        let completed = AtomicUsize::new(0);
+        let concurrency = concurrency.max(1);
+
+        let do_batch = || {
+            let mut results = Vec::with_capacity(total);
+            for chunk in paths.chunks(concurrency) {
+                let chunk_results: Vec<_> = chunk
+                    .into_par_iter()
+                    .map(|p| {
+                        let path = p.as_ref();
+                        let result = self.analyze_impl(path);
+                        let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        progress(n, total, path);
+                        (path.to_path_buf(), result)
+                    })
+                    .collect();
+                results.extend(chunk_results);
+            }
+            results
+        };
+
+        match &self.thread_pool {
+            Some(pool) => pool.install(do_batch),
+            None => do_batch(),
+        }
+    }
+
     fn analyze_raw_impl(
         &self,
         meta: &ImageMetadata,
