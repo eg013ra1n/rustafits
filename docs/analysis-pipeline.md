@@ -14,14 +14,11 @@ measured population, while `stars_detected` reports the raw detection count.
 FITS / XISF File
        |
        v
-+------------------+
-|  Read & Decode   |  u16 big-endian (FITS) or f32 little-endian (XISF)
-+------------------+
-       |
-       v
-+------------------+
-| u16 -> f32       |  SIMD-accelerated, [0..65535] range
-+------------------+
++-------------------------------+
+| Read & Decode                 |  u16 big-endian (FITS) or f32 little-endian (XISF)
+|                               |  u16 data converted to f32 (SIMD-accelerated)
+|                               |  f32 data used as-is. Range: [0..65535]
++-------------------------------+
        |
        v
 +-------------------------------+
@@ -57,13 +54,14 @@ FITS / XISF File
 |                               |
 | Pass 1: Separable Gaussian    |  SIMD-accelerated convolution (AVX2/SSE2/NEON)
 |   convolution with FWHM=3.0   |  Zero-sum DAOFIND-style matched filter kernel
-|   + proximity blend detection  |  Stamp-based area and peak deblending
-|                               |  Voronoi deblending for multi-peak groups
-| -> estimate FWHM from top-20  |  Stamp-based half-max radial profile
+|   + proximity blend rejection  |  Peaks within 2*FWHM: both rejected (blend)
+|   + neighbor count filter      |  Require 3+ neighbors above threshold
+| -> calibrate FWHM via Moffat  |  Free-beta Moffat on 100 brightest (see below)
 |                               |
-| Pass 2 (if FWHM differs >30%)|  Re-detect with calibration FWHM kernel
-|   convolution with calibration|  Uses field_fwhm from calibration pass
-|   FWHM + proximity + deblend  |
+| Pass 2 (if FWHM differs >30%)|  Re-detect with calibrated FWHM kernel
+|   + sharpness filter          |  Rejects nebula knots, extended sources
+|   + concentration index       |  Flux(1σ)/Flux(3σ) ratio filter
+|   + edge margin (2*FWHM)     |  Rejects truncated PSFs near borders
 +-------------------------------+
        |
        v
@@ -151,7 +149,8 @@ Stars are filtered during detection (before measurement) by:
 | Max area | max_star_area (default 2000 px) | Extended objects (galaxies, nebulae, comae) |
 | Saturation | saturation_fraction * 65535 (default 0.95) | Saturated stars |
 | Border | Touches image edge | Truncated PSFs |
-| Aspect ratio | Bounding box > 8:1 | Cosmic rays (aspect ~20-100), satellite trails (~50+) |
+| Neighbor count | < 3 neighbors above threshold | Isolated noise peaks (requires extended PSF wings) |
+| Proximity blend | Another peak within 2*FWHM | Overlapping PSFs (both peaks rejected) |
 
 All measured stars (after measure cap) contribute to statistics.
 
