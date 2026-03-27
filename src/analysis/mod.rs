@@ -94,6 +94,18 @@ pub struct StarMetrics {
     pub fit_residual: f32,
 }
 
+/// Per-stage timing in milliseconds for the analysis pipeline.
+pub struct StageTiming {
+    pub background_ms: f64,
+    pub detection_pass1_ms: f64,
+    pub calibration_ms: f64,
+    pub detection_pass2_ms: f64,
+    pub measurement_ms: f64,
+    pub snr_ms: f64,
+    pub statistics_ms: f64,
+    pub total_ms: f64,
+}
+
 /// Full analysis result for an image.
 pub struct AnalysisResult {
     /// Image width (after debayer if applicable).
@@ -144,6 +156,8 @@ pub struct AnalysisResult {
     /// Median Moffat β across all stars (None if Moffat fitting not used).
     /// Typical range: 2.0-5.0 for real optics. Lower = broader wings.
     pub median_beta: Option<f32>,
+    /// Per-stage timing breakdown for the analysis pipeline.
+    pub stage_timing: StageTiming,
 }
 
 /// Builder configuration for analysis (internal).
@@ -386,6 +400,8 @@ impl ImageAnalyzer {
         height: usize,
         channels: usize,
     ) -> Result<AnalysisResult> {
+        let pipeline_start = std::time::Instant::now();
+
         // Extract luminance if multi-channel
         let lum = if channels == 3 {
             extract_luminance(data, width, height)
@@ -401,6 +417,7 @@ impl ImageAnalyzer {
         };
 
         // ── Stage 1: Background & Noise ──────────────────────────────────
+        let t = std::time::Instant::now();
         let cell_size = background::auto_cell_size(width, height);
         let mut bg_result = background::estimate_background_mesh(&lum, width, height, cell_size);
         if self.config.noise_layers > 0 {
@@ -410,8 +427,10 @@ impl ImageAnalyzer {
             ).max(0.001);
         }
         // noise_layers == 0: keep MAD noise from mesh-grid (already in bg_result.noise)
+        let background_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // ── Stage 2, Pass 1: Discovery ───────────────────────────────────
+        let t = std::time::Instant::now();
         let initial_fwhm = 3.0_f32;
         let pass1_stars = {
             let bg_map = bg_result.background_map.as_deref();
@@ -423,8 +442,10 @@ impl ImageAnalyzer {
                 None,
             )
         };
+        let detection_pass1_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // Select calibration stars: brightest, not saturated, not too elongated
+        let t = std::time::Instant::now();
         let calibration_stars: Vec<&detection::DetectedStar> = pass1_stars
             .iter()
             .filter(|s| s.eccentricity < 0.5 && s.area >= 5)
@@ -483,12 +504,15 @@ impl ImageAnalyzer {
             );
         }
 
+        let calibration_ms = t.elapsed().as_secs_f64() * 1000.0;
+
         // Source-mask background re-estimation skipped for speed.
         // The sigma-clipped cell stats already reject >30% star-contaminated
         // cells and 3-round sigma clipping handles residual star flux within
         // cells. The source mask adds ~400ms for marginal improvement.
 
         // ── Stage 2, Pass 2: Full detection with refined kernel ──────────
+        let t = std::time::Instant::now();
         // Clamp minimum FWHM to 2.0px — no real optics produce sub-2px stars,
         // and tiny kernels have poor noise rejection (OSC green-channel fits
         // can underestimate FWHM due to Bayer grid undersampling).
@@ -511,6 +535,7 @@ impl ImageAnalyzer {
                 Some(clamped_fwhm),
             )
         };
+        let detection_pass2_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         let bg_map_ref = bg_result.background_map.as_deref();
         let detection_threshold = self.config.detection_sigma * bg_result.noise;
@@ -557,6 +582,11 @@ impl ImageAnalyzer {
                 trail_r_squared, possibly_trailed,
                 measured_fwhm_kernel: final_fwhm,
                 median_beta: field_beta.map(|b| b as f32),
+                stage_timing: StageTiming {
+                    background_ms: 0.0, detection_pass1_ms: 0.0, calibration_ms: 0.0,
+                    detection_pass2_ms: 0.0, measurement_ms: 0.0, snr_ms: 0.0,
+                    statistics_ms: 0.0, total_ms: pipeline_start.elapsed().as_secs_f64() * 1000.0,
+                },
             })
         };
 
@@ -565,6 +595,7 @@ impl ImageAnalyzer {
         }
 
         // ── Stage 3: PSF Measurement (with measure cap) ─────────────────
+        let t = std::time::Instant::now();
         let stars_detected = detected.len();
 
         // Apply measure cap with spatial grid balancing.
@@ -622,12 +653,14 @@ impl ImageAnalyzer {
             Some(field_fwhm),     // enable moments screening
             possibly_trailed,      // bypass ecc gate on trailed frames
         );
+        let measurement_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         if measured.is_empty() {
             return make_zero_result(stars_detected);
         }
 
         // ── Stage 4: Metrics ─────────────────────────────────────────────
+        let t = std::time::Instant::now();
 
         // Trail detection uses only the Rayleigh test (Stage 1) on detection-stage
         // angles.  High PSF eccentricity alone is NOT trailing — it can be optical
@@ -668,8 +701,13 @@ impl ImageAnalyzer {
             .map(|s| 1.0 / (1.0 + s.fit_residual))
             .collect();
 
-        snr::compute_star_snr(&lum, width, height, &mut measured, median_fwhm);
+        let statistics_ms_before_snr = t.elapsed().as_secs_f64() * 1000.0;
 
+        let t = std::time::Instant::now();
+        snr::compute_star_snr(&lum, width, height, &mut measured, median_fwhm);
+        let snr_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
         let mut snr_vals: Vec<f32> = measured.iter().map(|s| s.snr).collect();
 
         let median_eccentricity = sigma_clipped_weighted_median(&ecc_vals, &ecc_weights);
@@ -698,6 +736,8 @@ impl ImageAnalyzer {
                 fit_residual: m.fit_residual,
             })
             .collect();
+        let statistics_ms = statistics_ms_before_snr + t.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
 
         Ok(AnalysisResult {
             width, height, source_channels: channels,
@@ -708,6 +748,11 @@ impl ImageAnalyzer {
             trail_r_squared, possibly_trailed,
             measured_fwhm_kernel: final_fwhm,
             median_beta,
+            stage_timing: StageTiming {
+                background_ms, detection_pass1_ms, calibration_ms,
+                detection_pass2_ms, measurement_ms, snr_ms,
+                statistics_ms, total_ms,
+            },
         })
     }
 }

@@ -438,7 +438,7 @@ fn star_color(config: &AnnotationConfig, eccentricity: f32, fwhm: f32, median_fw
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::{AnalysisResult, StarMetrics};
+    use crate::analysis::{AnalysisResult, StageTiming, StarMetrics};
 
     fn dummy_result(stars: Vec<StarMetrics>) -> AnalysisResult {
         AnalysisResult {
@@ -460,6 +460,11 @@ mod tests {
             possibly_trailed: false,
             measured_fwhm_kernel: 3.0,
             median_beta: None,
+            stage_timing: StageTiming {
+                background_ms: 0.0, detection_pass1_ms: 0.0, calibration_ms: 0.0,
+                detection_pass2_ms: 0.0, measurement_ms: 0.0, snr_ms: 0.0,
+                statistics_ms: 0.0, total_ms: 0.0,
+            },
             stars,
         }
     }
