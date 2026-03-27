@@ -41,17 +41,18 @@ let result = analyzer.analyze("light_001.fits")?;
 | Method | Default | Description |
 |--------|---------|-------------|
 | `with_detection_sigma(f32)` | 5.0 | Detection threshold in sigma above background. Lower values (2-3) find fainter stars but increase false positives. Clamped to minimum 1.0. |
-| `with_min_star_area(usize)` | 5 | Minimum connected-component area in pixels. Filters hot pixels and noise. Clamped to minimum 1. |
-| `with_max_star_area(usize)` | 2000 | Maximum connected-component area in pixels. Filters extended objects like galaxies and nebulae. |
+| `with_min_star_area(usize)` | 5 | Minimum star area in pixels. Filters hot pixels and noise. Clamped to minimum 1. |
+| `with_max_star_area(usize)` | 2000 | Maximum star area in pixels. Filters extended objects like galaxies and nebulae. |
 | `with_saturation_fraction(f32)` | 0.95 | Reject stars with peak above this fraction of 65535. Clamped to 0.5-1.0. |
 | `with_max_stars(usize)` | 200 | Keep only the brightest N stars. Clamped to minimum 1. |
-| `with_mrs_layers(usize)` | 4 | MRS wavelet noise layers. Uses iterative multiresolution support with B3-spline à trous wavelet to build a significance mask across scales, isolating pure noise from nebulosity and stars. |
-| `without_debayer()` | Debayer enabled | Skip green-channel interpolation for OSC images. By default, OSC images get native-resolution green interpolation + green-pixel-only fitting. This flag disables both, running analysis directly on the raw Bayer mosaic (faster but less accurate). |
+| `with_mrs_layers(usize)` | 0 | MRS wavelet noise layers. 0 = fast MAD noise (default). Set to 4 for MRS wavelet with B3-spline à trous significance masking (more robust on nebula-rich fields, slower). |
+| `without_debayer()` | Debayer enabled | Skip green-channel interpolation for OSC images. By default, OSC images get native-resolution green interpolation. This flag disables it, running analysis directly on the raw Bayer mosaic (faster but less accurate). |
 | `with_trail_threshold(f32)` | 0.5 | R² threshold for trail detection (Path A). Lower = more aggressive. The raw `trail_r_squared` is always reported regardless of this setting. Clamped to 0.0-1.0. |
-| `with_measure_cap(usize)` | 2000 | Max stars to PSF-fit for statistics. Stars are sorted by flux (brightest first) before capping. Set to 0 to measure all (catalog export mode). Dense fields (100K+ stars) benefit most from capping. |
+| `with_measure_cap(usize)` | 500 | Max stars to PSF-fit for statistics. Stars are sorted by flux (brightest first) before capping. Set to 0 to measure all (catalog export mode). Dense fields (100K+ stars) benefit most from capping. |
 | `with_fit_max_iter(usize)` | 25 | LM max iterations for pass-2 measurement fits. Calibration pass always uses 50. |
 | `with_fit_tolerance(f64)` | 1e-4 | LM convergence tolerance for pass-2 measurement fits. Calibration pass always uses 1e-6. |
 | `with_fit_max_rejects(usize)` | 5 | Consecutive LM step rejects before early bailout. Stars that bail out fall through to the next method in the Moffat→Gaussian→Moments chain. |
+| `with_optics(f32, f32)` | None | `with_optics(focal_mm, pixel_um)` enables arcsecond output for FWHM and HFR. |
 | `with_thread_pool(Arc<ThreadPool>)` | Global rayon pool | Route all parallel work through a custom rayon thread pool. |
 
 ### When to Adjust
@@ -61,7 +62,7 @@ let result = analyzer.analyze("light_001.fits")?;
 - **Hot pixel problems** — raise `min_star_area` to 8-10.
 - **Nebula regions** — lower `max_star_area` to avoid detecting bright nebula knots as stars.
 - **Speed over accuracy** — use `without_debayer()`.
-- **MRS wavelet layers** — default 4 layers matches PixInsight. Decrease to 1 for speed if noise accuracy is not critical.
+- **MRS wavelet layers** — default 0 uses fast MAD noise. Set to 4 for MRS wavelet on nebula-rich fields where MAD may overestimate noise.
 - **OSC images** — green-channel interpolation and green-pixel-only fitting are applied automatically. No configuration needed.
 
 ## Analyzing Raw Data
@@ -85,6 +86,46 @@ let result = ImageAnalyzer::new()
 `analyze_data()` skips file reading and debayering — the data must already be
 in planar f32 format with values in the 0-65535 ADU range. Channel count must
 be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
+
+## Batch Analysis
+
+Use `analyze_batch()` to process multiple files with internal worker orchestration:
+
+```rust
+use rustafits::ImageAnalyzer;
+
+let analyzer = ImageAnalyzer::new()
+    .with_thread_pool(pool.clone());
+
+let paths = vec!["light_001.fits", "light_002.fits", "light_003.fits"];
+let results = analyzer.analyze_batch(
+    paths.iter(),
+    2,                           // concurrency
+    |completed, total| {         // progress callback
+        println!("{}/{}", completed, total);
+    },
+);
+
+for result in results {
+    match result {
+        Ok(r) => println!("FWHM: {:.2}", r.median_fwhm),
+        Err(e) => eprintln!("Error: {}", e),
+    }
+}
+```
+
+## Arcsecond Output (with_optics)
+
+When optical parameters are known, FWHM and HFR can be reported in arcseconds:
+
+```rust
+let result = ImageAnalyzer::new()
+    .with_optics(1000.0, 3.76)   // focal_length_mm, pixel_size_um
+    .analyze("light_001.fits")?;
+
+// median_fwhm and median_hfr are now in arcseconds
+println!("FWHM: {:.2}\"", result.median_fwhm);
+```
 
 ## Reading Results
 
@@ -111,6 +152,7 @@ be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
 | `psf_signal` | `f32` | PSF signal strength: `median(star_peaks) / noise`. Higher = better signal. |
 | `trail_r_squared` | `f32` | Rayleigh R² statistic for directional coherence of star position angles. 0.0 = uniform (no trail), 1.0 = all aligned (strong trail). |
 | `possibly_trailed` | `bool` | True if the image is likely trailed (R² above threshold or eccentricity-gated Rayleigh fires). |
+| `stage_timing` | `StageTiming` | Per-stage timing in milliseconds (background, detection, calibration, measurement, SNR, etc.). |
 
 ### `StarMetrics`
 

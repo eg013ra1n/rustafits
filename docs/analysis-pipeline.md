@@ -4,7 +4,7 @@ The analysis module performs automatic star detection, PSF measurement, and imag
 assessment on astronomical images. It outputs per-star metrics and image-wide statistics
 suitable for subframe evaluation and stacking weight computation.
 
-A configurable measure cap (default 2000) limits how many stars undergo PSF fitting.
+A configurable measure cap (default 500) limits how many stars undergo PSF fitting.
 Stars are sorted by flux (brightest first) before capping. Statistics reflect the
 measured population, while `stars_detected` reports the raw detection count.
 
@@ -31,8 +31,8 @@ FITS / XISF File
 |                               |
 | OSC (Bayer): Green Interp     |  Native-resolution green-channel interpolation
 |   green CFA pixels keep       |  R/B pixels get distance-weighted average of
-|   original values              |  green neighbors (3x3). Builds green_mask
-|                               |  so fitter only uses true green pixels
+|   original values              |  green neighbors (3x3). All pixels in the
+|                               |  interpolated image are used for PSF fitting
 |                               |
 | RGB (3-ch): Extract Lum       |  L = 0.2126R + 0.7152G + 0.0722B
 |   (pre-debayered input via    |  Converts 3-channel planar to single-channel
@@ -46,9 +46,9 @@ FITS / XISF File
 | -> noise sigma (ADU)          |  Bicubic interpolation between cell medians
 | -> bg/noise maps              |
 |                               |
-| Noise: MRS wavelet (default)  |  B3-spline à trous wavelet, 4-layer significance masking
-|   (configurable layers via    |  Isolates noise from nebulosity/gradients
-|    with_mrs_layers)            |
+| Noise: MAD (default) or MRS   |  Default: 1.4826 * MAD (fast, robust)
+|   wavelet (configurable via   |  Optional: MRS wavelet via with_mrs_layers(4)
+|    with_mrs_layers)            |  MRS isolates noise from nebulosity/gradients
 +-------------------------------+
        |
        v
@@ -57,13 +57,13 @@ FITS / XISF File
 |                               |
 | Pass 1: Separable Gaussian    |  SIMD-accelerated convolution (AVX2/SSE2/NEON)
 |   convolution with FWHM=3.0   |  Zero-sum DAOFIND-style matched filter kernel
-|   + CCL + peak deblending     |  Connected Component Labeling with Union-Find
-|                               |  Voronoi deblending for multi-peak components
+|   + proximity blend detection  |  Stamp-based area and peak deblending
+|                               |  Voronoi deblending for multi-peak groups
 | -> estimate FWHM from top-20  |  Stamp-based half-max radial profile
 |                               |
 | Pass 2 (if FWHM differs >30%)|  Re-detect with calibration FWHM kernel
 |   convolution with calibration|  Uses field_fwhm from calibration pass
-|   FWHM + CCL + deblending    |
+|   FWHM + proximity + deblend  |
 +-------------------------------+
        |
        v
@@ -76,14 +76,6 @@ FITS / XISF File
        |
        v
 +-------------------------------+
-| Source-Mask Background        |  Mask star pixels (r = 2.5 * field_fwhm)
-| Re-estimation                 |  Re-run mesh-grid background on masked image
-| -> refined background map     |  Removes stellar flux contamination
-| -> refined noise map          |
-+-------------------------------+
-       |
-       v
-+-------------------------------+
 | Trail Detection (Stage 1)     |  Rayleigh test on position angles (2 theta)
 | (image-level, advisory)       |  Dual-path: strong R^2 OR eccentricity-gated
 | -> trail_r_squared            |  Advisory only — never rejects, always continues
@@ -92,7 +84,7 @@ FITS / XISF File
        |
        v
 +-------------------------------+
-| Measure Cap                   |  Slice detected stars to measure_cap (default 2000)
+| Measure Cap                   |  Slice detected stars to measure_cap (default 500)
 | stars_detected = raw count    |  Stars already sorted by flux (brightest first)
 | 0 = measure all               |  Brightest stars have highest-SNR fits
 +-------------------------------+
@@ -105,17 +97,9 @@ FITS / XISF File
 | -> HFR, theta                 |  FitMethod tracked per star (Moffat/Gaussian/Moments)
 | -> Moffat beta                |  Moments-based theta (always computed)
 | -> fit_residual               |  Normalized LM cost: sqrt(cost/n_px) / amplitude
-|                               |  OSC: only green CFA pixels fed to fitter
+|                               |  OSC: all pixels in green-interpolated image
 |                               |  Stars that fail all fitting are excluded
 |                               |  LM: configurable max_iter/conv_tol/max_rejects
-+-------------------------------+
-       |
-       v
-+-------------------------------+
-| Trail Detection (Stage 2)     |  Refines trail flag using PSF-fit eccentricities
-|                               |  (more accurate than detection-stage moments)
-| -> possibly_trailed           |  rayleigh_trailed OR (fit_median_ecc > 0.55)
-|                               |  Catches non-coherent guiding issues (wind shake)
 +-------------------------------+
        |
        v
@@ -151,6 +135,7 @@ FITS / XISF File
        v
 +-------------------------------+
 | AnalysisResult                |  Summary medians + capped per-star vector
+|                               |  Includes StageTiming (per-stage ms)
 +-------------------------------+
 ```
 
@@ -176,22 +161,22 @@ All measured stars (after measure cap) contribute to statistics.
 |------------------|-------------------|----------------------------------------------|
 | Background       | `background.rs`   | Mesh-grid background, MRS wavelet noise        |
 | Convolution      | `convolution.rs`  | Separable Gaussian convolution (SIMD), B3-spline smoothing |
-| Detection        | `detection.rs`    | DAOFIND matched filter + CCL + deblending     |
+| Detection        | `detection.rs`    | DAOFIND matched filter + proximity blend detection |
 | Fitting          | `fitting.rs`      | Two-pass calibration, Moffat->Gaussian->Moments fallback |
 | Metrics          | `metrics.rs`      | Per-star FWHM, eccentricity, HFR measurement |
 | SNR              | `snr.rs`          | Per-star and image-wide SNR computations      |
 | Orchestration    | `mod.rs`          | Builder API, trail detection, pipeline wiring |
 
-## Trail Detection (Two-Stage)
+## Trail Detection (Rayleigh Test)
 
-Detects satellite trails, tracking errors, wind shake, and vibration using circular
-statistics on star position angles and PSF-fit eccentricity. Reports an advisory
-flag and raw R² statistic — the caller decides whether to reject.
+Detects satellite trails and tracking errors using circular statistics on star
+position angles. Reports an advisory flag and raw R² statistic — the caller
+decides whether to reject.
 
 The pipeline **always continues** to PSF measurement regardless — the trail flag
 is advisory only.
 
-### Stage 1: Rayleigh Test (before PSF measurement)
+### Rayleigh Test (before PSF measurement)
 
 Uses the Rayleigh test on doubled position angles (2θ) from detection-stage moments.
 Requires ≥20 detected stars. Two paths cover different regimes:
@@ -202,17 +187,6 @@ Requires ≥20 detected stars. Two paths cover different regimes:
 | B — Eccentricity-gated | R̄² > 0.05 AND median_ecc > 0.6 AND p < 0.05 | Undersampled trails |
 
 The Path A threshold defaults to 0.5 and is configurable via `with_trail_threshold()`.
-
-### Stage 2: Post-Measurement Eccentricity (after PSF fitting)
-
-After PSF fitting, the median of accurate PSF-fit eccentricities is checked:
-- If `fit_median_ecc > 0.55`, the frame is flagged regardless of Rayleigh result.
-- Catches non-coherent guiding issues (wind shake, vibration) where angles are random
-  but all stars are clearly elongated.
-
-```
-possibly_trailed = rayleigh_trailed OR (fit_median_ecc > 0.55)
-```
 
 ### Effect on Statistics
 
@@ -248,13 +222,14 @@ are now fixed defaults.
 | Max star area | 2000 px | `with_max_star_area(u32)` | Reject extended objects larger than N pixels |
 | Saturation fraction | 0.95 | `with_saturation_fraction(f32)` | Fraction of 65535 above which stars are rejected |
 | Max stars | 5000 | `with_max_stars(usize)` | Late cap on returned per-star vector (statistics use all) |
-| Measure cap | 2000 | `with_measure_cap(usize)` | Max stars to PSF-fit (0 = all). Dense fields benefit most. |
+| Measure cap | 500 | `with_measure_cap(usize)` | Max stars to PSF-fit (0 = all). Dense fields benefit most. |
 | Fit max iter | 25 | `with_fit_max_iter(usize)` | LM max iterations for measurement pass (calibration always 50) |
 | Fit tolerance | 1e-4 | `with_fit_tolerance(f64)` | LM convergence tolerance for measurement pass (calibration always 1e-6) |
 | Fit max rejects | 5 | `with_fit_max_rejects(usize)` | LM consecutive reject bailout |
-| MRS noise layers | 4 | `with_mrs_layers(usize)` | Wavelet layers for significance masking |
+| MRS noise layers | 0 (MAD) | `with_mrs_layers(usize)` | 0 = fast MAD noise. Set to 4 for MRS wavelet (more robust on nebula fields). |
 | Trail threshold | 0.5 | `with_trail_threshold(f32)` | R^2 threshold for trail advisory flag |
 | Debayer | auto | `with_debayer(bool)` | Force debayer on/off for OSC data |
+| Optics | None | `with_optics(focal_mm, pixel_um)` | Enable arcsecond FWHM/HFR output |
 | Thread pool | None | `with_thread_pool(Arc<ThreadPool>)` | Optional shared Rayon thread pool |
 
 See individual algorithm documents for full details:

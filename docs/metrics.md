@@ -29,29 +29,12 @@ Input: detected star (centroid, area), luminance image, background
   stamp[], stamp_width, stamp_height, relative centroid (cx, cy)
 ```
 
-## Green-Pixel-Only Fitting (OSC)
+## OSC (Bayer) Handling
 
 For OSC (Bayer) images, the analysis pipeline uses green-channel interpolation to
-produce a native-resolution mono image. However, R/B pixel positions contain
-interpolated values — feeding these into the PSF fitter broadens the measured
-FWHM by ~6% because interpolation smooths the profile.
-
-To avoid this, a `green_mask` marks which pixels are real green CFA positions.
-During PSF measurement, only green pixels are used:
-
-**What's filtered (green-only):**
-- Gaussian fit pixel samples (`PixelSample` collection)
-- Windowed moments centroid refinement and second-moment summation
-- HFR intensity-weighted distance computation
-
-**What's NOT filtered (all pixels used):**
-- `estimate_sigma_halfmax` — uses bilinear interpolation along 8 radial rays
-  for initial sigma. Interpolated values are fine for this coarse estimate.
-
-**Pixel density:** A Bayer pattern has 50% green pixels. For a typical star with
-FWHM ~2.7 px, the fitting radius (~4σ ≈ 4.6 px) captures ~67 pixels total,
-of which ~33 are green. This is more than sufficient for the 7-parameter
-Gaussian fit (minimum 10 samples required).
+produce a native-resolution mono image. All pixels in the interpolated image are
+used for PSF fitting, moments computation, and HFR calculation. No green mask
+filtering is applied.
 
 ## Half-Flux Radius (HFR)
 
@@ -67,8 +50,8 @@ where:
   d_i = sqrt((x_i - cx)^2 + (y_i - cy)^2)   distance from centroid
 ```
 
-**OSC filtering:** When a `green_mask` is present, only green CFA pixels contribute
-to the HFR sum (see [Green-Pixel-Only Fitting](#green-pixel-only-fitting-osc)).
+**OSC handling:** For OSC images, all pixels in the green-interpolated image
+contribute to the HFR sum (see [OSC Handling](#osc-bayer-handling)).
 
 **Interpretation:** For a Gaussian PSF with FWHM=F, HFR ~ 0.67 * FWHM/2 ~ 0.34*F.
 HFR is more robust than FWHM for non-Gaussian profiles (e.g. coma, defocused stars).
@@ -109,8 +92,8 @@ Star Stamp
     v
 +-----------------------------+
 | Collect PixelSamples        |  (x, y, intensity) for stamp pixels > 0
-| with background subtraction |  OSC: only green CFA pixels (via green_mask)
-|                             |  skips interpolated R/B positions
+| with background subtraction |  All pixels used (including OSC green-interpolated)
+|                             |
 +-----------------------------+
     |
     v
@@ -165,7 +148,7 @@ Star Stamp
 | Centroid Refinement (2 iter)|  Two-pass I-weighted centroid:
 |                             |    cx = sum(val * x) / sum(val)
 |                             |    cy = sum(val * y) / sum(val)
-|                             |  OSC: only green CFA pixels (via green_mask)
+|                             |  All pixels used (including OSC green-interpolated)
 +-----------------------------+
     |
     v

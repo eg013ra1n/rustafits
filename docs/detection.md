@@ -1,7 +1,7 @@
 # Star Detection
 
-Two-stage pipeline: DAOFIND-style matched-filter convolution followed by connected
-component labeling (CCL) with union-find. Each detected star carries stamp-based
+Two-stage pipeline: DAOFIND-style matched-filter convolution followed by
+proximity-based blend detection. Each detected star carries stamp-based
 position angle (theta) and eccentricity for downstream trail rejection.
 
 ## Stage 1: Matched Filter & Peak Detection
@@ -73,66 +73,55 @@ comparisons.
 
 ### Peak-Based Deblending
 
-In crowded fields the low CCL threshold (1.5 * noise) can merge nearby stars into a
-single connected component. When a component contains multiple detected peaks the
-pipeline splits it by nearest-peak assignment: each pixel is assigned to the peak
-closest to it (Voronoi partitioning), and each resulting sub-component is processed
-independently for centroid, flux, and area.
+In crowded fields, nearby stars can overlap. When multiple detected peaks fall
+within proximity of each other, the pipeline splits the group by nearest-peak
+assignment: each pixel in the stamp-based area is assigned to the closest peak
+(Voronoi partitioning), and each resulting sub-group is processed independently
+for centroid, flux, and area.
 
-Single-peak components — the vast majority — pass through unchanged, so the
+Isolated peaks — the vast majority — pass through unchanged, so the
 deblending step adds negligible overhead in uncrowded images.
 
-An area guard prevents deblending of extended objects: if the component's
-total area exceeds `max_star_area`, deblending is skipped and the component
-is processed as a whole (and rejected by the area filter). This avoids
+An area guard prevents deblending of extended objects: if the stamp-based
+area exceeds `max_star_area`, deblending is skipped and the group is
+processed as a whole (and rejected by the area filter). This avoids
 Voronoi splitting of large blobs like comet comae, which would otherwise
 produce high-flux false detections that displace real stars from the top-N
 list.
 
 ---
 
-## Stage 2: Connected Component Labeling
+## Stage 2: Proximity-Based Blend Detection
 
 ```
 Input: luminance image, peak positions, background, noise
        |
        v
 +-------------------------------+
-| Binary Threshold              |  threshold_low = background + 1.5 * noise
-|                               |  Foreground: pixel > threshold_low
-|                               |  (lower than detection threshold to capture star wings)
+| Stamp-Based Area              |  For each peak, compute area from a stamp region
+|                               |  centered on the peak position
+|                               |  Area = count of pixels above background + 1.5 * noise
 +-------------------------------+
        |
        v
 +-------------------------------+
-| Two-Pass CCL (Union-Find)     |
-|                               |  Pass 1: scan L->R, T->B
-|   +---+---+---+               |    - If left or top neighbor labeled: inherit or union
-|   | . | T | . |               |    - Else: new label
-|   +---+---+---+               |
-|   | L | * |   |               |  Pass 2: resolve all labels to roots
-|   +---+---+---+               |
+| Proximity Blend Detection     |  Identify peaks within proximity of each other
+|                               |  Group nearby peaks for deblending
+|                               |  Isolated peaks pass through unchanged
 +-------------------------------+
        |
        v
 +-------------------------------+
-| Link Peaks to Components      |  Each peak matched to its component via 3x3 neighborhood
-|                               |  Builds peak_map: label -> list of peak positions
-|                               |  Only components containing a detected peak are kept
-+-------------------------------+
-       |
-       v
-+-------------------------------+
-| Peak-Based Deblending         |  If multi-peak AND area ≤ max_star_area:
+| Peak-Based Deblending         |  If multi-peak group AND area ≤ max_star_area:
 |                               |    assign each pixel to nearest peak (Voronoi)
-|                               |    process each sub-component independently
-|                               |  Otherwise: process component as whole
+|                               |    process each sub-group independently
+|                               |  Otherwise: process as whole
 +-------------------------------+
        |
        v
 +-------------------------------+
-| Per-Component Metrics         |
-|                               |  area = pixel count
+| Per-Star Metrics              |
+|                               |  area = stamp-based pixel count
 |   Intensity-squared centroid: |
 |     w_i = max(0, pixel - bg)^2
 |     cx = sum(w_i * x_i) / sum(w_i)
@@ -178,15 +167,13 @@ After computing the centroid, a stamp region around each star is used to compute
 intensity-weighted second-order moments. These give the position angle (theta) and
 eccentricity of the blob shape.
 
-### Why Stamps Instead of CCL Pixels?
-
-CCL blobs have too few pixels for reliable moments — especially for undersampled stars
-(FWHM < 3 px), where the blob might be only 5-15 pixels. This causes strong
-grid-induced theta coherence: the pixel geometry dominates the moment tensor.
+### Why Stamps?
 
 Using a continuous stamp region (e.g. 11x11 or larger) over the background-subtracted
-image includes many more pixels, and the intensity weighting naturally focuses on the
-star's true shape rather than the CCL boundary geometry.
+image includes many pixels, and the intensity weighting naturally focuses on the
+star's true shape rather than threshold boundary geometry. This is especially
+important for undersampled stars (FWHM < 3 px), where thresholded regions might
+be only 5-15 pixels, causing grid-induced theta coherence.
 
 ### Adaptive Stamp Radius
 
@@ -197,7 +184,7 @@ moment windows:
 stamp_r = max(5, floor(2 * sqrt(area / pi)))
 ```
 
-| CCL area | Effective FWHM | stamp_r | Stamp size |
+| Area     | Effective FWHM | stamp_r | Stamp size |
 |----------|----------------|---------|------------|
 | 10 px    | ~2 px          | 5       | 11 x 11   |
 | 50 px    | ~5 px          | 8       | 17 x 17   |
@@ -284,7 +271,7 @@ measurement:
 | `y`           | f32     | Intensity-weighted centroid Y (subpixel)       |
 | `peak`        | f32     | Background-subtracted peak value               |
 | `flux`        | f32     | Total background-subtracted flux               |
-| `area`        | usize   | Number of connected pixels above threshold     |
+| `area`        | usize   | Stamp-based area (pixels above threshold)      |
 | `theta`       | f32     | Position angle from stamp moments (radians)    |
 | `eccentricity`| f32     | Eccentricity from stamp moments (0=round)      |
 
@@ -296,7 +283,7 @@ measurement:
 |-------------------|--------------|-------------------------------------------|
 | Initial FWHM      | 3.0 px       | Typical well-sampled star size            |
 | Detection sigma   | 5.0 (default)| Configurable; 5-sigma = very few false positives |
-| Low CCL threshold | 1.5 * noise  | Captures star wings for area measurement  |
+| Low threshold     | 1.5 * noise  | Captures star wings for area measurement  |
 | Min star area     | 5 px         | Rejects hot pixels and cosmic ray hits    |
 | Max star area     | 2000 px      | Rejects extended objects                  |
 | Max aspect ratio  | 3.0          | Rejects elongated artifacts               |

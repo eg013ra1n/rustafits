@@ -16,8 +16,12 @@ The current architecture — N worker threads calling `pool.install(|| analyze_i
 
 ## Recommendation 1: Parallelize MRS Noise Estimation
 
-**Priority**: High
-**Estimated Impact**: ~500ms → ~100-150ms per frame on 8 cores
+> **Resolved (v0.8.2):** The default noise estimator is now MAD (fast, single-pass).
+> MRS wavelet is optional via `with_mrs_layers(4)`. For most workflows, this
+> recommendation is no longer relevant as MAD noise is near-instant.
+
+**Priority**: High (if using MRS)
+**Estimated Impact**: ~500ms → ~100-150ms per frame on 8 cores (MRS only)
 
 ### Problem
 
@@ -57,7 +61,10 @@ Athenaeum's batch analysis processes 200-2000 frames per target. With `batch_con
 
 ## Recommendation 2: `analyze_data()` API for Pre-Loaded Pixel Data
 
-**Priority**: High
+> **Resolved:** `analyze_data()` already exists in the current API. See usage.md
+> for the public signature: `analyze_data(&data, width, height, channels)`.
+
+**Priority**: High (already implemented)
 **Estimated Impact**: Enables I/O overlap, ~50-100ms hidden per frame on HDD/NAS
 
 ### Problem
@@ -161,6 +168,8 @@ With half-resolution analysis, on-demand analysis would complete in ~0.5-0.7 sec
 
 ### 4. Expose Per-Stage Timing
 
+> **Resolved:** `StageTiming` is now included in `AnalysisResult`.
+
 Adding optional timing instrumentation (behind a feature flag or config option) would help downstream applications profile their specific workloads:
 
 ```rust
@@ -183,6 +192,8 @@ pub struct StageTiming {
 ```
 
 ### 5. Batch-Analyze API
+
+> **Resolved:** `analyze_batch()` is now available. See usage.md for the public API.
 
 For batch processing, a method that accepts an iterator of paths and handles worker orchestration internally would simplify callers and enable internal optimizations (e.g., shared background models across frames taken close together):
 
@@ -210,11 +221,11 @@ Measured on Athenaeum with QHY268M frames (6252x4176, mono, 16-bit):
 | File I/O | 50-100ms | No |
 | u16 → f32 | 10-20ms | No |
 | Background mesh | 100-150ms | Yes (cells) |
-| MRS noise | 400-500ms | **No** |
+| MAD noise (default) | ~5ms | No |
 | Pass 1 detection | 200-300ms | Partial (conv yes, CC no) |
 | Calibration PSF | 50-100ms | Yes (100 stars) |
 | Pass 2 detection | 200-300ms | Partial |
-| PSF measurement | 500-1500ms | Yes (up to 500 stars) |
+| PSF measurement | 500-1500ms | Yes (up to measure_cap stars) |
 | SNR computation | 50-100ms | Yes (per-star) |
 | Statistics | 5-10ms | No |
 | **Total** | **~1.5-3.0s** | |

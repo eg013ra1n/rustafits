@@ -1,21 +1,14 @@
-# Trail Detection (Two-Stage Rayleigh + Eccentricity)
+# Trail Detection (Rayleigh Angle Coherence)
 
-Image-level detection of satellite trails, tracking errors, wind shake, and vibration
-using circular statistics on star position angles and PSF-fit eccentricity. Reports an
-advisory flag and raw R² statistic — the caller decides whether to reject.
-
-> **Changed in v0.7.2:** Trail detection is now **two-stage**. Stage 1 uses the Rayleigh
-> test on detection-stage moments (angle coherence). Stage 2 refines the result after
-> PSF measurement using the accurate fitted eccentricity — catching non-coherent
-> guiding issues (wind shake, vibration) that the angle-based test cannot detect.
-> The minimum star count was raised from 5 to 20 for statistical reliability.
+Image-level detection of satellite trails and tracking errors using circular
+statistics on star position angles. Reports an advisory flag and raw R² statistic
+— the caller decides whether to reject.
 
 ## The Problem
 
 Trailed images (from tracking drift, wind, or cable snag) produce elongated star
 profiles. **Coherent** trailing (RA drift) stretches all stars in the same direction.
-**Non-coherent** issues (wind shake, vibration, periodic error) elongate stars in
-random or semi-random directions. A single detection method cannot catch both.
+The Rayleigh test detects this directional coherence.
 
 ## Stage 1: Rayleigh Test on Detection-Stage Moments
 
@@ -115,33 +108,6 @@ differ only in their activation criteria and p-value threshold.
 
 ---
 
-## Stage 2: Post-Measurement Eccentricity Refinement
-
-After PSF fitting, the pipeline computes the median of PSF-fit eccentricities
-(which are much more accurate than detection-stage moments). If the fitted median
-eccentricity exceeds **0.55**, the frame is flagged as trailed regardless of the
-Rayleigh test result.
-
-```
-fit_eccs = [measured_star.eccentricity for all PSF-fit stars]
-fit_median_ecc = median(fit_eccs)
-
-possibly_trailed = rayleigh_trailed OR (fit_median_ecc > 0.55)
-```
-
-This catches **non-coherent guiding issues** (wind shake, vibration, periodic error)
-where star elongation angles are random but all stars are clearly elongated. The
-Rayleigh test fundamentally cannot detect these because there is no preferred direction.
-
-### Why 0.55?
-
-Good frames typically have PSF-fit median eccentricity of 0.30–0.50. Frames with
-guiding issues show 0.55+. The threshold sits above the normal range while catching
-genuinely problematic frames. This was calibrated against both dense M42 frames
-(77 files, FWHM R²=0.995 vs PixInsight) and sparse EDPH data (117 files).
-
----
-
 ## Full Decision Logic
 
 ```
@@ -189,7 +155,7 @@ The Rayleigh test result is exposed via two fields on `AnalysisResult`:
 | Field | Type | Description |
 |-------|------|-------------|
 | `trail_r_squared` | `f32` | Raw R̄² statistic. 0.0 = uniform, 1.0 = perfectly aligned. |
-| `possibly_trailed` | `bool` | True if any detection stage fired (Rayleigh OR fit ecc > 0.55). |
+| `possibly_trailed` | `bool` | True if the Rayleigh test fired (angle coherence detected). |
 
 The R̄² threshold for Path A is configurable:
 
@@ -229,7 +195,6 @@ p: ~0 (statistically significant but weak)
 
 Path A: R̄² = 0.15 < 0.5 --> does not fire
 Path B: R̄² = 0.15 > 0.05 but median_ecc = 0.48 < 0.6 --> does not fire
-Stage 2: PSF-fit median ecc = 0.36 < 0.55 --> does not fire
 
 Result: possibly_trailed = false, trail_r_squared = 0.15
         Statistics use ecc ≤ 0.8 filter as normal.
@@ -244,13 +209,12 @@ R̄²: ~0.70 (strong coherence — all stars elongated same direction)
 p: ~0 (exp(-70))
 
 Path A: R̄² = 0.70 > 0.5 AND p < 0.01 --> FIRES
-Stage 2: not needed (already flagged)
 
 Result: possibly_trailed = true, trail_r_squared = 0.70
         Statistics bypass ecc filter — reports true eccentricity.
 ```
 
-### Trailed image, non-coherent (wind shake)
+### Non-coherent elongation (wind shake, coma)
 
 ```
 Detected: 500 stars
@@ -260,10 +224,11 @@ p: ~0 (due to large n, but R̄² is tiny)
 
 Path A: R̄² = 0.02 < 0.5 --> does not fire
 Path B: R̄² = 0.02 < 0.05 --> does not fire
-Stage 2: PSF-fit median ecc = 0.58 > 0.55 --> FIRES
 
-Result: possibly_trailed = true, trail_r_squared = 0.02
-        Statistics bypass ecc filter — reports true eccentricity.
+Result: possibly_trailed = false, trail_r_squared = 0.02
+        High eccentricity without directional coherence indicates
+        optical aberration or wind shake, not tracking drift.
+        Statistics use ecc ≤ 0.8 filter as normal.
 ```
 
 ### Borderline image (mild guiding wobble)
@@ -276,7 +241,6 @@ p: ~0
 
 Path A: R̄² = 0.08 < 0.5 --> does not fire
 Path B: R̄² = 0.08 > 0.05 but median_ecc = 0.52 < 0.6 --> does not fire
-Stage 2: PSF-fit median ecc = 0.47 < 0.55 --> does not fire
 
 Result: possibly_trailed = false, trail_r_squared = 0.08
         Slightly elevated R̄² hints at some wobble, but not enough to flag.
@@ -326,4 +290,3 @@ knots, while the Gaussian fitter only fits theta for obviously elliptical stars.
 | Path B R̄² floor | 0.05 | Prevents false triggers at high n with spurious coherence |
 | Path B ecc threshold | 0.6 | Above undersampled baseline (~0.3-0.4) |
 | Path B p threshold | 0.05 | Standard significance level |
-| Stage 2 fit ecc threshold | 0.55 | Above normal PSF-fit range (0.30-0.50), catches wind shake |

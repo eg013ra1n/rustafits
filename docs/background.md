@@ -1,9 +1,8 @@
 # Background Estimation
 
 Background estimation uses a mesh-grid approach with auto-tuned cell size. Noise is
-estimated via iterative MRS wavelet (B3-spline à trous, default 4 layers with significance
-masking). After pass 1 calibration, a source-masked re-estimation is always performed for
-cleaner statistics.
+estimated via MAD by default (fast and robust). MRS wavelet noise estimation (B3-spline
+à trous, significance masking) is available as an option via `with_mrs_layers(4)`.
 
 ## Global Background Estimation
 
@@ -159,20 +158,6 @@ w(+2) =  0.5*t^3 - 0.5*t^2
 where t is the fractional position between cell centers. The 2D interpolation is
 separable: compute 4 horizontal interpolations, then 1 vertical.
 
-### Source-Masked Re-estimation
-
-The pipeline always performs one source-masked re-estimation after pass 1 calibration.
-After the initial background estimate and star detection, star pixels are masked and
-the mesh-grid background is re-estimated for cleaner statistics:
-
-1. Pass 1: estimate background normally (sources contaminate statistics).
-2. Detect stars using the initial background.
-3. Build a source mask: circle of r = 2.5 * FWHM around each detected star.
-4. Re-estimate background excluding masked pixels (cleaner statistics).
-
-This is particularly valuable for crowded fields where bright stars bias the per-cell
-background estimate.
-
 ### Constants
 
 | Parameter            | Value | Rationale                              |
@@ -186,16 +171,17 @@ background estimate.
 
 ## MRS Wavelet Noise Estimation
 
-Always-on (default `noise_layers=4`). The MRS (Multiresolution Support) wavelet
-method isolates the finest-scale fluctuations using the à trous (with holes) wavelet
-transform with iterative significance masking. This avoids the problem where
-sigma-clipped MAD overestimates noise by 30-40% on nebula-rich fields (M42, NGC 7000,
-etc.) by conflating nebulosity with background fluctuations.
+Optional (default off, enable via `with_mrs_layers(4)`). The default noise estimator
+is MAD (1.4826 * MAD), which is fast and robust for most fields. The MRS
+(Multiresolution Support) wavelet method isolates the finest-scale fluctuations using
+the à trous (with holes) wavelet transform with iterative significance masking. MRS
+avoids the problem where MAD overestimates noise by 30-40% on nebula-rich fields
+(M42, NGC 7000, etc.) by conflating nebulosity with background fluctuations.
 
 ### Algorithm
 
 ```
-Input: luminance image, noise_layers (default 4)
+Input: luminance image, noise_layers (0 = MAD default, 4 = recommended MRS)
        |
        v
 +-------------------------------+
@@ -242,8 +228,8 @@ The first wavelet layer (`w1 = data - smoothed`) captures structure at the 1-2 p
 scale — exactly where Poisson/read noise lives. Nebulosity, gradients, and extended
 objects have much larger spatial scales and are almost entirely removed by the subtraction.
 
-MRS wavelet noise is always-on (default 4 layers). The layer count is configurable via
-`with_mrs_layers(n)`. Higher layers (2+) build a significance mask using dilated
+MRS wavelet noise is optional (default off; enable via `with_mrs_layers(n)` where n >= 1).
+Higher layers (2+) build a significance mask using dilated
 convolution to identify and exclude structure at progressively larger scales, producing
 a purer noise estimate from the layer-1 coefficients.
 
@@ -268,9 +254,9 @@ a purer noise estimate from the layer-1 coefficients.
 | Mode estimator | 2.5m - 1.5mu | Pluggable (SExtractor, biweight, MMM) | 2.5m - 1.5mu |
 | Asymmetry fallback | Yes (0.3sigma) | Depends on estimator | Yes (0.3sigma) |
 | Background method | Mesh-grid | Mesh-grid | Mesh-grid (always, auto cell size) |
-| Noise estimator | Clipped sigma | MAD or biweight scale | MRS wavelet (always-on, 4 layers) |
-| Wavelet noise | — | — | B3-spline à trous (default 4 layers, significance masking) |
+| Noise estimator | Clipped sigma | MAD or biweight scale | MAD (default) or MRS wavelet (optional) |
+| Wavelet noise | — | — | B3-spline à trous (optional via with_mrs_layers, significance masking) |
 | Grid filtering | 3x3 median | Configurable median | 3x3 median |
 | Interpolation | Bicubic spline | Bicubic spline (scipy zoom) | Catmull-Rom bicubic |
-| Source masking | No (single pass) | Manual mask input | Always-on (1 re-estimation, auto-mask) |
+| Source masking | No (single pass) | Manual mask input | No (single pass) |
 | Parallelization | No | No (Python) | Yes (rayon per-row) |
