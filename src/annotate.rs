@@ -460,6 +460,9 @@ mod tests {
             possibly_trailed: false,
             measured_fwhm_kernel: 3.0,
             median_beta: None,
+            plate_scale: None,
+            median_fwhm_arcsec: None,
+            median_hfr_arcsec: None,
             stage_timing: StageTiming {
                 background_ms: 0.0, detection_pass1_ms: 0.0, calibration_ms: 0.0,
                 detection_pass2_ms: 0.0, measurement_ms: 0.0, snr_ms: 0.0,
@@ -484,6 +487,8 @@ mod tests {
             beta: None,
             fit_method: crate::analysis::FitMethod::Gaussian,
             fit_residual: 0.0,
+            fwhm_arcsec: None,
+            hfr_arcsec: None,
         }
     }
 
@@ -575,6 +580,8 @@ mod tests {
             beta: None,
             fit_method: crate::analysis::FitMethod::Gaussian,
             fit_residual: 0.0,
+            fwhm_arcsec: None,
+            hfr_arcsec: None,
         };
         let result = dummy_result(vec![star]);
         let config = AnnotationConfig::default();

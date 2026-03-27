@@ -92,6 +92,10 @@ pub struct StarMetrics {
     /// Normalized fit residual (quality weight: w = 1/(1+r)).
     /// Lower = better fit. 1.0 for moments fallback.
     pub fit_residual: f32,
+    /// FWHM in arcseconds (None if optics not provided via with_optics).
+    pub fwhm_arcsec: Option<f32>,
+    /// HFR in arcseconds (None if optics not provided via with_optics).
+    pub hfr_arcsec: Option<f32>,
 }
 
 /// Per-stage timing in milliseconds for the analysis pipeline.
@@ -156,6 +160,12 @@ pub struct AnalysisResult {
     /// Median Moffat β across all stars (None if Moffat fitting not used).
     /// Typical range: 2.0-5.0 for real optics. Lower = broader wings.
     pub median_beta: Option<f32>,
+    /// Plate scale in arcsec/pixel (None if optics not provided).
+    pub plate_scale: Option<f32>,
+    /// Median FWHM in arcseconds (None if optics not provided).
+    pub median_fwhm_arcsec: Option<f32>,
+    /// Median HFR in arcseconds (None if optics not provided).
+    pub median_hfr_arcsec: Option<f32>,
     /// Per-stage timing breakdown for the analysis pipeline.
     pub stage_timing: StageTiming,
 }
@@ -179,6 +189,10 @@ pub struct AnalysisConfig {
     fit_tolerance: f64,
     /// Consecutive LM step rejects before early bailout.
     fit_max_rejects: usize,
+    /// Telescope focal length in millimeters (for arcsecond measurements).
+    focal_length_mm: Option<f64>,
+    /// Camera pixel size in micrometers (for arcsecond measurements).
+    pixel_size_um: Option<f64>,
 }
 
 /// Image analyzer with builder pattern.
@@ -203,6 +217,8 @@ impl ImageAnalyzer {
                 fit_max_iter: 25,
                 fit_tolerance: 1e-4,
                 fit_max_rejects: 5,
+                focal_length_mm: None,
+                pixel_size_um: None,
             },
             thread_pool: None,
         }
@@ -249,6 +265,16 @@ impl ImageAnalyzer {
     /// Default: 0.5. Lower values are more aggressive (more false positives).
     pub fn with_trail_threshold(mut self, threshold: f32) -> Self {
         self.config.trail_r_squared_threshold = threshold.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set optics parameters for arcsecond-based measurements.
+    /// `focal_length_mm`: telescope focal length in millimeters.
+    /// `pixel_size_um`: camera pixel size in micrometers.
+    /// When both are set, FWHM and HFR are reported in arcseconds alongside pixels.
+    pub fn with_optics(mut self, focal_length_mm: f64, pixel_size_um: f64) -> Self {
+        self.config.focal_length_mm = Some(focal_length_mm);
+        self.config.pixel_size_um = Some(pixel_size_um);
         self
     }
 
@@ -628,6 +654,7 @@ impl ImageAnalyzer {
                 trail_r_squared, possibly_trailed,
                 measured_fwhm_kernel: final_fwhm,
                 median_beta: field_beta.map(|b| b as f32),
+                plate_scale: None, median_fwhm_arcsec: None, median_hfr_arcsec: None,
                 stage_timing: StageTiming {
                     background_ms: 0.0, detection_pass1_ms: 0.0, calibration_ms: 0.0,
                     detection_pass2_ms: 0.0, measurement_ms: 0.0, snr_ms: 0.0,
@@ -769,6 +796,16 @@ impl ImageAnalyzer {
             if beta_vals.is_empty() { None } else { Some(find_median(&mut beta_vals)) }
         };
 
+        let plate_scale = match (self.config.focal_length_mm, self.config.pixel_size_um) {
+            (Some(fl), Some(ps)) if fl > 0.0 && ps > 0.0 => {
+                Some((ps / fl * 206.265) as f32)
+            }
+            _ => None,
+        };
+
+        let median_fwhm_arcsec = plate_scale.map(|s| median_fwhm * s);
+        let median_hfr_arcsec = plate_scale.map(|s| median_hfr * s);
+
         // Late cap: truncate to max_stars AFTER all statistics are computed
         measured.truncate(self.config.max_stars);
 
@@ -780,6 +817,8 @@ impl ImageAnalyzer {
                 eccentricity: m.eccentricity, snr: m.snr, hfr: m.hfr,
                 theta: m.theta, beta: m.beta, fit_method: m.fit_method,
                 fit_residual: m.fit_residual,
+                fwhm_arcsec: plate_scale.map(|s| m.fwhm * s),
+                hfr_arcsec: plate_scale.map(|s| m.hfr * s),
             })
             .collect();
         let statistics_ms = statistics_ms_before_snr + t.elapsed().as_secs_f64() * 1000.0;
@@ -794,6 +833,7 @@ impl ImageAnalyzer {
             trail_r_squared, possibly_trailed,
             measured_fwhm_kernel: final_fwhm,
             median_beta,
+            plate_scale, median_fwhm_arcsec, median_hfr_arcsec,
             stage_timing: StageTiming {
                 background_ms, detection_pass1_ms, calibration_ms,
                 detection_pass2_ms, measurement_ms, snr_ms,
