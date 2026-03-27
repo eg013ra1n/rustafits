@@ -430,3 +430,55 @@ fn analyze_with_mrs_layers() {
         result.stars_detected, result.background, result.noise, result.median_fwhm,
     );
 }
+
+#[test]
+fn analyze_stage_timing() {
+    if !has_test_file("mono.fits") {
+        eprintln!("Skipping: tests/mono.fits not found");
+        return;
+    }
+
+    let result = ImageAnalyzer::new()
+        .analyze("tests/mono.fits")
+        .unwrap();
+
+    let t = &result.stage_timing;
+    eprintln!("Stage timing:");
+    eprintln!("  background:      {:.1}ms", t.background_ms);
+    eprintln!("  detection_pass1: {:.1}ms", t.detection_pass1_ms);
+    eprintln!("  calibration:     {:.1}ms", t.calibration_ms);
+    eprintln!("  detection_pass2: {:.1}ms", t.detection_pass2_ms);
+    eprintln!("  measurement:     {:.1}ms", t.measurement_ms);
+    eprintln!("  snr:             {:.1}ms", t.snr_ms);
+    eprintln!("  statistics:      {:.1}ms", t.statistics_ms);
+    eprintln!("  total:           {:.1}ms", t.total_ms);
+
+    assert!(t.total_ms > 0.0, "total_ms should be > 0");
+    assert!(t.background_ms > 0.0, "background_ms should be > 0");
+    assert!(t.detection_pass1_ms > 0.0, "detection_pass1_ms should be > 0");
+    assert!(t.measurement_ms > 0.0, "measurement_ms should be > 0");
+}
+
+#[test]
+fn analyze_batch_two_files() {
+    if !has_test_file("cocoon.fits") || !has_test_file("mono.fits") {
+        eprintln!("Skipping: test files not found");
+        return;
+    }
+
+    let analyzer = ImageAnalyzer::new();
+    let paths = ["tests/cocoon.fits", "tests/mono.fits"];
+    let results = analyzer.analyze_batch(&paths, 2, |done, total, path| {
+        eprintln!("[{}/{}] {}", done, total, path.display());
+    });
+
+    assert_eq!(results.len(), 2, "Should have 2 results");
+    for (path, result) in &results {
+        let r = result.as_ref().unwrap_or_else(|e| panic!("Failed {}: {}", path.display(), e));
+        eprintln!("{}: stars={}, FWHM={:.2}, total={:.1}ms",
+            path.file_name().unwrap().to_str().unwrap(),
+            r.stars_detected, r.median_fwhm, r.stage_timing.total_ms);
+        assert!(r.stars_detected > 0);
+        assert!(r.stage_timing.total_ms > 0.0);
+    }
+}

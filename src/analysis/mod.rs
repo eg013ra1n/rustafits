@@ -984,20 +984,6 @@ pub fn estimate_fwhm_from_stars(
 /// Build a boolean mask marking green CFA pixel positions.
 ///
 /// Returns a `Vec<bool>` of length `width * height` where `true` marks pixels
-/// that are at green positions in the Bayer pattern. For GBRG/GRBG green is
-/// at (row + col) even; for RGGB/BGGR green is at (row + col) odd.
-fn build_green_mask(width: usize, height: usize, pattern: BayerPattern) -> Vec<bool> {
-    let green_at_even = matches!(pattern, BayerPattern::Gbrg | BayerPattern::Grbg);
-    (0..height)
-        .flat_map(|y| {
-            (0..width).map(move |x| {
-                let parity = (x + y) & 1;
-                if green_at_even { parity == 0 } else { parity == 1 }
-            })
-        })
-        .collect()
-}
-
 /// Extract luminance from planar RGB data: L = 0.2126R + 0.7152G + 0.0722B
 pub fn extract_luminance(data: &[f32], width: usize, height: usize) -> Vec<f32> {
     use rayon::prelude::*;

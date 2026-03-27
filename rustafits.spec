@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.8.4
+Version:        0.8.5
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,11 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Thu Mar 27 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.5-1
+- Add per-stage timing instrumentation (StageTiming in AnalysisResult)
+- Add analyze_batch() API for parallel multi-image analysis
+- Remove dead code (build_green_mask, estimate_background_mesh_masked)
+
 * Thu Mar 27 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.8.4-1
 - Remove unnecessary buffer clone in JPEG output (zero-copy for RGB)
 - Add shared thread pool for annotate path (analysis + conversion)

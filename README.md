@@ -1,6 +1,6 @@
 # rustafits
 
-High-performance FITS/XISF to JPEG/PNG converter for astronomical images with auto-stretch, Bayer debayering, and SIMD acceleration. Pure Rust — no system dependencies.
+High-performance FITS/XISF to JPEG/PNG converter for astronomical images with auto-stretch, Bayer debayering, and SIMD acceleration.
 
 ## Features
 
@@ -11,7 +11,8 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
-- **Image Analysis**: Two-pass Moffat-primary PSF calibration pipeline with star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MRS wavelet noise estimation
+- **Image Analysis**: Two-pass Moffat-primary PSF calibration pipeline with star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MAD noise estimation (optional MRS wavelet)
+- **JPEG via libjpeg-turbo**: SIMD-accelerated JPEG encoding (NEON on aarch64, AVX2 on x86_64) via turbojpeg
 - **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
 
 ## Supported Formats
@@ -25,10 +26,21 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 
 ### Cargo (Recommended)
 
-No system dependencies needed — everything is pure Rust:
-
 ```bash
 cargo install rustafits
+```
+
+**Build requirements:** cmake (and nasm on x86_64) for the turbojpeg SIMD JPEG encoder.
+
+```bash
+# macOS
+brew install cmake nasm
+
+# Debian/Ubuntu
+sudo apt install cmake nasm
+
+# Arch Linux
+sudo pacman -S cmake nasm
 ```
 
 ### From Source
@@ -84,7 +96,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustafits = "0.7"
+rustafits = "0.8"
 ```
 
 ### File output
@@ -134,11 +146,11 @@ println!("Stars: {}  FWHM: {:.2} px  Ecc: {:.3}  Beta: {:.2}",
 ```
 
 Default configuration uses a two-pass calibration pipeline: pass 1 fits free-beta Moffat
-on bright calibration stars to derive the field PSF model (beta, FWHM), then re-estimates
-background with source masking. Pass 2 applies fixed-beta Moffat to all detected stars
-with Gaussian and moments fallbacks. Background is always mesh-grid with auto-tuned cell
-size and MRS wavelet noise (default 1 layer). See [Analysis API](docs/usage.md) for all
-builder methods.
+on bright calibration stars to derive the field PSF model (beta, FWHM). Pass 2 applies
+fixed-beta Moffat to all detected stars with Gaussian and moments fallbacks. Background
+uses parallelized mesh-grid with auto-tuned cell size and MAD noise estimation (MRS wavelet
+available via `with_mrs_layers(4)`). OSC/Bayer images are green-interpolated before
+detection and PSF fitting. See [Analysis API](docs/usage.md) for all builder methods.
 
 ### Star annotation overlay
 
@@ -218,11 +230,11 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 | Method | Description |
 |--------|-------------|
 | `with_detection_sigma(f32)` | Detection threshold in sigma above background (default 5.0) |
-| `with_min_star_area(usize)` | Minimum connected-component area (default 5 px) |
-| `with_max_star_area(usize)` | Maximum connected-component area (default 2000 px) |
+| `with_min_star_area(usize)` | Minimum star area in stamp (default 5 px) |
+| `with_max_star_area(usize)` | Maximum star area in stamp (default 2000 px) |
 | `with_saturation_fraction(f32)` | Reject stars above this fraction of 65535 (default 0.95) |
 | `with_max_stars(usize)` | Keep only the brightest N stars (default 200) |
-| `with_mrs_layers(usize)` | MRS wavelet noise layers (default 1) |
+| `with_mrs_layers(usize)` | Noise layers: 0 = fast MAD (default), 1-6 = MRS wavelet |
 | `with_trail_threshold(f32)` | R² threshold for trail detection (default 0.5) |
 | `without_debayer()` | Skip green-channel interpolation for OSC images |
 | `with_thread_pool(pool)` | Use a custom rayon thread pool |
@@ -277,9 +289,11 @@ Benchmarks on Apple M4 (6252x4176 16-bit images):
 
 | Mode | Time |
 |------|------|
-| FITS | ~460ms |
-| FITS (preview) | ~130ms |
-| XISF (LZ4 compressed) | ~290ms |
+| Mono FITS → JPEG | ~107ms |
+| OSC FITS → JPEG | ~67ms |
+| XISF → JPEG | ~106ms |
+| Mono FITS + annotate | ~970ms |
+| Analysis only | ~250-750ms |
 
 ### SIMD Acceleration
 
@@ -292,6 +306,7 @@ SIMD is used across the processing pipeline with automatic runtime dispatch:
 | u16 to f32 | yes | yes | yes |
 | Gray to RGB | SSSE3 pshufb | AVX2 pshufb | yes |
 | Debayer (f32) | yes | — | yes |
+| JPEG encode | — | AVX2 DCT | NEON DCT |
 
 ## Architecture
 
@@ -313,7 +328,7 @@ rustafits/
 │   │   ├── mod.rs            # Analyzer builder + pipeline orchestration
 │   │   ├── background.rs     # Background estimation (global, mesh-grid, MRS wavelet)
 │   │   ├── convolution.rs    # Separable convolution + B3-spline smoothing
-│   │   ├── detection.rs      # Star detection (DAOFIND + CCL)
+│   │   ├── detection.rs      # Star detection (DAOFIND + proximity blend rejection)
 │   │   ├── fitting.rs        # LM Gaussian & Moffat PSF fitting (free/fixed beta)
 │   │   ├── metrics.rs        # FWHM, eccentricity, HFR measurement
 │   │   └── snr.rs            # Per-star and image-wide SNR
@@ -326,7 +341,7 @@ rustafits/
 │       └── color.rs         # Color conversions (SIMD)
 ```
 
-**Dependencies** (all pure Rust): anyhow, flate2 (rust_backend), lz4_flex, ruzstd, image, quick-xml, base64
+**Dependencies**: anyhow, flate2 (rust_backend), lz4_flex, ruzstd, image (PNG only), turbojpeg (libjpeg-turbo), quick-xml, base64, rayon
 
 ## Troubleshooting
 
