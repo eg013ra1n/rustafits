@@ -10,11 +10,11 @@ Input: detected star (centroid, area), luminance image, background
        v
 +------------------------------+
 | Estimate Star Scale          |
-|   sigma_est = sqrt(area/pi)  |  area -> equivalent circular sigma
-|              * 0.5           |
+|   sigma_est = field_fwhm/2.3548  (if available)
+|   fallback: sqrt(area/pi)*0.5    (from detection)
 |                              |
 |   stamp_radius = ceil(4*sigma_est)
-|   clamp: 8 <= radius <= 50  |
+|   clamp: 8 <= radius <= 50  |  Supports FWHM up to ~25px
 +------------------------------+
        |
        v

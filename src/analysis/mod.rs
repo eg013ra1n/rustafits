@@ -604,7 +604,7 @@ impl ImageAnalyzer {
         let final_fwhm = if clamped_fwhm > 1.0
             && ((clamped_fwhm - initial_fwhm) / initial_fwhm).abs() > 0.30
         {
-            clamped_fwhm.min(initial_fwhm * 2.0)
+            clamped_fwhm.min(initial_fwhm * 6.0)
         } else {
             initial_fwhm
         };
@@ -1008,7 +1008,7 @@ pub fn estimate_fwhm_from_stars(
 
     let mut fwhm_vals = Vec::with_capacity(round_stars.len());
     for star in &round_stars {
-        let stamp_radius = 12_usize; // enough for FWHM up to ~10px
+        let stamp_radius = 30_usize; // enough for FWHM up to ~25px (defocused)
         let cx = star.x.round() as i32;
         let cy = star.y.round() as i32;
         let sr = stamp_radius as i32;

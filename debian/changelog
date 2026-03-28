@@ -1,3 +1,12 @@
+rustafits (0.9.1-1) unstable; urgency=medium
+
+  * Fix defocused/large-PSF handling: adaptive stamp sizing up to FWHM ~25px
+  * Increase FWHM estimation stamp from 12 to 30 pixels
+  * Raise FWHM cap from 2x to 6x initial (allows large defocused PSFs)
+  * Detection stamp proportional to FWHM (1.5x instead of 1x)
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Thu, 27 Mar 2026 23:30:00 +0300
+
 rustafits (0.9.0-1) unstable; urgency=medium
 
   * Adaptive moments screening with field-relative thresholds

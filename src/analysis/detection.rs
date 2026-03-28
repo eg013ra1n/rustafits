@@ -211,7 +211,7 @@ pub fn detect_stars(
 
     // Process non-blended peaks via stamp-based metrics.
     // Stamp radius = 1×FWHM (smaller than blend_radius to avoid neighbor contamination).
-    let stamp_r = (fwhm.ceil() as i32).max(3);
+    let stamp_r = ((1.5 * fwhm).ceil() as i32).max(3);
     let mut stars = Vec::new();
     for (i, &(px, py, _conv_val)) in peak_positions.iter().enumerate() {
         if blended[i] { continue; }

@@ -158,6 +158,14 @@ fn compute_star_moments(
 }
 
 /// Compute adaptive screening thresholds from field moment statistics.
+/// Compute adaptive screening thresholds from field-level moment statistics.
+///
+/// NOTE: The sharp_lo floor of 0.15 is critical for defocused frames where
+/// large-stamp handling (mod.rs FWHM cap + metrics stamp_radius) produces
+/// correct FWHM but peak sharpness is very low (donut PSFs have no sharp peak).
+/// If the adaptive sharpness threshold is tightened, defocused frames will
+/// regress to zero-star results.  The stamp_radius hard cap (.min(50) at
+/// line 69) also interacts — it limits maximum stamp to 101×101 pixels.
 fn compute_adaptive_thresholds(
     moments: &[MomentStats],
     field_fwhm: f32,
