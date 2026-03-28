@@ -160,6 +160,16 @@ pub struct AnalysisResult {
     /// Median Moffat β across all stars (None if Moffat fitting not used).
     /// Typical range: 2.0-5.0 for real optics. Lower = broader wings.
     pub median_beta: Option<f32>,
+    /// Pass 1 detection count (before calibration/re-detection).
+    pub pass1_detections: usize,
+    /// Calibrated field FWHM from Moffat pass (pixels, before capping).
+    pub calibrated_fwhm: f32,
+    /// Number of stars that survived PSF fitting (before late truncation).
+    pub stars_measured: usize,
+    /// Number of Moffat fits (FreeMoffat + FixedMoffat) among measured stars.
+    pub moffat_count: usize,
+    /// Number of Gaussian fits among measured stars.
+    pub gaussian_count: usize,
     /// Plate scale in arcsec/pixel (None if optics not provided).
     pub plate_scale: Option<f32>,
     /// Median FWHM in arcseconds (None if optics not provided).
@@ -644,6 +654,8 @@ impl ImageAnalyzer {
         let snr_weight = snr::compute_snr_weight(&lum, bg_result.background, bg_result.noise);
         let frame_snr = if bg_result.noise > 0.0 { bg_result.background / bg_result.noise } else { 0.0 };
 
+        let pass1_detections = pass1_stars.len();
+
         let make_zero_result = |stars_detected: usize| {
             Ok(AnalysisResult {
                 width, height, source_channels: channels,
@@ -656,6 +668,8 @@ impl ImageAnalyzer {
                 trail_r_squared, possibly_trailed,
                 measured_fwhm_kernel: final_fwhm,
                 median_beta: field_beta.map(|b| b as f32),
+                pass1_detections: 0, calibrated_fwhm: 0.0,
+                stars_measured: 0, moffat_count: 0, gaussian_count: 0,
                 plate_scale: None, median_fwhm_arcsec: None, median_hfr_arcsec: None,
                 stage_timing: StageTiming {
                     background_ms: 0.0, detection_pass1_ms: 0.0, calibration_ms: 0.0,
@@ -728,6 +742,13 @@ impl ImageAnalyzer {
             if field_fwhm > 1.0 { Some(field_fwhm) } else { None },  // adaptive screening when FWHM is reliable
         );
         let measurement_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let stars_measured = measured.len();
+        let moffat_count = measured.iter()
+            .filter(|s| matches!(s.fit_method, FitMethod::FreeMoffat | FitMethod::FixedMoffat))
+            .count();
+        let gaussian_count = measured.iter()
+            .filter(|s| matches!(s.fit_method, FitMethod::Gaussian))
+            .count();
 
         if measured.is_empty() {
             return make_zero_result(stars_detected);
@@ -834,6 +855,8 @@ impl ImageAnalyzer {
             trail_r_squared, possibly_trailed,
             measured_fwhm_kernel: final_fwhm,
             median_beta,
+            pass1_detections, calibrated_fwhm: field_fwhm,
+            stars_measured, moffat_count, gaussian_count,
             plate_scale, median_fwhm_arcsec, median_hfr_arcsec,
             stage_timing: StageTiming {
                 background_ms, detection_pass1_ms, calibration_ms,
