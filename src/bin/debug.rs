@@ -15,8 +15,8 @@ use astroimage::analysis::fitting::{self, PixelSample,
 use astroimage::analysis::metrics;
 use astroimage::analysis::render;
 use astroimage::analysis::snr;
-use astroimage::analysis::{estimate_fwhm_from_stars, prepare_luminance, sigma_clipped_median,
-    sigma_clipped_weighted_median};
+use astroimage::analysis::{estimate_fwhm_from_stars, prepare_luminance, sigma_clipped_median};
+use astroimage::ImageAnalyzer;
 use astroimage::formats;
 
 fn main() {
@@ -408,7 +408,7 @@ fn cmd_measure(
         None, // no green mask — fit all pixels in interpolated image
         None, // free-beta for debug measure
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-        None, false,
+        None,
     );
     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -721,7 +721,7 @@ fn cmd_query(
         None, // no green mask — fit all pixels
         None, // free-beta for debug query
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-        None, false,
+        None,
     );
 
     if measured.is_empty() {
@@ -957,242 +957,75 @@ fn cmd_pipeline(
     w: usize,
     h: usize,
     channels: usize,
-    green_mask: Option<&[bool]>,
+    _green_mask: Option<&[bool]>,  // unused now but keep for API compat
     opts: &Opts,
 ) -> Result<()> {
-    let total = Instant::now();
+    let mut analyzer = ImageAnalyzer::new()
+        .with_detection_sigma(opts.sigma)
+        .with_measure_cap(opts.measure_cap)
+        .with_mrs_layers(opts.mrs_layers)
+        .with_max_stars(opts.top)
+        .with_fit_max_iter(opts.fit_max_iter)
+        .with_fit_tolerance(opts.fit_tolerance)
+        .with_fit_max_rejects(opts.fit_max_rejects);
 
-    // Stage 1: Background
+    if opts.no_debayer {
+        analyzer = analyzer.without_debayer();
+    }
+
+    let result = analyzer.analyze_data(lum, w, h, channels)?;
+    let t = &result.stage_timing;
+
     eprintln!("\n=== Stage 1: Background Estimation ===");
-    let t = Instant::now();
-    let cell_size = background::auto_cell_size(w, h);
-    let mut bg = background::estimate_background_mesh(lum, w, h, cell_size);
-    let mad_noise = bg.noise;
-    if opts.mrs_layers > 0 {
-        bg.noise = background::estimate_noise_mrs(lum, w, h, opts.mrs_layers.max(1)).max(0.001);
-    }
-    eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
-    eprintln!("  Cell size: {} (auto)", cell_size);
-    if opts.mrs_layers > 0 {
-        eprintln!("  Background: {:.2}  MRS noise: {:.2}", bg.background, bg.noise);
-        eprintln!("  MAD noise:  {:.2} (ratio {:.2}x)", mad_noise, mad_noise / bg.noise.max(0.001));
-    } else {
-        eprintln!("  Background: {:.2}  MAD noise: {:.2} (MRS skipped)", bg.background, bg.noise);
-    }
+    eprintln!("  Time: {:.1}ms", t.background_ms);
+    eprintln!("  Background: {:.2}  Noise: {:.2}", result.background, result.noise);
 
-    if let Some(ref dir) = opts.save_dir {
-        if let Some(ref bg_map) = bg.background_map {
-            render::save_grayscale(bg_map, w, h, &dir.join("background_map.png"))?;
-        }
-        if let Some(ref noise_map) = bg.noise_map {
-            render::save_grayscale(noise_map, w, h, &dir.join("noise_map.png"))?;
-        }
-    }
-
-    // Stage 2: Detection
     eprintln!("\n=== Stage 2: Star Detection ===");
-    let t = Instant::now();
-
-    let det_params = DetectionParams {
-        detection_sigma: opts.sigma,
-        min_star_area: 5,
-        max_star_area: 2000,
-        saturation_limit: 0.95 * 65535.0,
-    };
-
-    let bg_map_ref = bg.background_map.as_deref();
-    let noise_map_ref = bg.noise_map.as_deref();
-    let initial_fwhm = opts.fwhm_override.unwrap_or(3.0);
-
-    let pass1 = detection::detect_stars(
-        lum, w, h,
-        bg.background, bg.noise,
-        bg_map_ref, noise_map_ref, &det_params, initial_fwhm, None,
-    );
-    let pass1_count = pass1.len();
-
-    let measured_fwhm = estimate_fwhm_from_stars(
-        lum, w, h, &pass1, bg.background, bg_map_ref,
-    );
-    let capped = measured_fwhm.min(initial_fwhm * 2.0);
-
-    let (detected, final_fwhm) = if capped > 0.0
-        && ((capped - initial_fwhm) / initial_fwhm).abs() > 0.30
-    {
-        let d = detection::detect_stars(
-            lum, w, h,
-            bg.background, bg.noise,
-            bg_map_ref, noise_map_ref, &det_params, capped, None,
-        );
-        (d, capped)
+    eprintln!("  Time: {:.1}ms", t.detection_pass1_ms + t.calibration_ms + t.detection_pass2_ms);
+    eprintln!("  Pass 1: {} detections", result.pass1_detections);
+    eprintln!("  Calibration FWHM: {:.3}px", result.calibrated_fwhm);
+    eprintln!("  Final: {} detections (FWHM={:.2})", result.stars_detected, result.measured_fwhm_kernel);
+    if result.possibly_trailed {
+        eprintln!("  Trail R²: {:.4}  Rayleigh trailed: true", result.trail_r_squared);
     } else {
-        (pass1, initial_fwhm)
-    };
-
-    // Trail detection (Rayleigh test on detection-stage moments)
-    const TRAIL_R_SQ_THRESHOLD: f64 = 0.5;
-    let (trail_r_squared, possibly_trailed) = if detected.len() >= 20 {
-        let n = detected.len();
-        let (sum_cos, sum_sin) =
-            detected.iter().fold((0.0f64, 0.0f64), |(sc, ss), s| {
-                let a = 2.0 * s.theta as f64;
-                (sc + a.cos(), ss + a.sin())
-            });
-        let r_sq = (sum_cos * sum_cos + sum_sin * sum_sin) / (n as f64 * n as f64);
-        let p = (-(n as f64) * r_sq).exp();
-        let mut eccs: Vec<f32> = detected.iter().map(|s| s.eccentricity).collect();
-        eccs.sort_unstable_by(|a, b| a.total_cmp(b));
-        let median_ecc = if eccs.len() % 2 == 1 {
-            eccs[eccs.len() / 2]
-        } else {
-            (eccs[eccs.len() / 2 - 1] + eccs[eccs.len() / 2]) * 0.5
-        };
-        let trailed = (r_sq > TRAIL_R_SQ_THRESHOLD && p < 0.01)
-            || (r_sq > 0.05 && median_ecc > 0.6 && p < 0.05);
-        (r_sq, trailed)
-    } else {
-        (0.0, false)
-    };
-
-    eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
-    eprintln!("  Pass 1: {} detections (FWHM=3.0)", pass1_count);
-    eprintln!("  Measured FWHM: {:.3}px  Capped: {:.3}px", measured_fwhm, capped);
-    eprintln!("  Final: {} detections (FWHM={:.2})", detected.len(), final_fwhm);
-    eprintln!("  Trail R²: {:.4}  Rayleigh trailed: {}", trail_r_squared, possibly_trailed);
-
-    if let Some(ref dir) = opts.save_dir {
-        let sigma = final_fwhm / 2.3548;
-        let (kernel_1d, _) = convolution::generate_1d_kernel(sigma);
-        let mut conv = vec![0.0_f32; w * h];
-        convolution::separable_convolve(lum, w, h, &kernel_1d, &mut conv);
-        render::save_grayscale(&conv, w, h, &dir.join("convolution.png"))?;
-
-        let markers: Vec<(f32, f32, [u8; 3])> = detected
-            .iter()
-            .map(|s| (s.x, s.y, [0, 255, 0]))
-            .collect();
-        render::save_with_markers(lum, w, h, &markers, &dir.join("detections.png"))?;
+        eprintln!("  Trail R²: {:.4}  Rayleigh trailed: false", result.trail_r_squared);
     }
 
-    // Stage 3: PSF Measurement
     eprintln!("\n=== Stage 3: PSF Measurement ===");
-    let t = Instant::now();
+    eprintln!("  Time: {:.1}ms", t.measurement_ms);
+    eprintln!("  Measured: {} / {} detected ({} Moffat / {} Gauss)",
+        result.stars_measured, result.stars_detected,
+        result.moffat_count, result.gaussian_count);
 
-    let effective_cap = if opts.measure_cap == 0 { detected.len() } else { opts.measure_cap };
-    let to_measure = &detected[..detected.len().min(effective_cap)];
-    if to_measure.len() < detected.len() {
-        eprintln!("  Measure cap: {} / {} detected", to_measure.len(), detected.len());
-    }
-
-    let mut measured = metrics::measure_stars(
-        lum, w, h, to_measure,
-        bg.background, bg_map_ref,
-        None, // no green mask — fit all pixels
-        None, // free-beta for pipeline debug
-        opts.fit_max_iter, opts.fit_tolerance, opts.fit_max_rejects,
-        None, false,
-    );
-    eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
-    eprintln!("  Measured: {} / {} detected", measured.len(), detected.len());
-
-    if measured.is_empty() {
-        eprintln!("  No stars measured — pipeline complete.");
-        return Ok(());
-    }
-
-    // Stage 4: Statistics
     eprintln!("\n=== Stage 4: Statistics ===");
-    let t = Instant::now();
-
-    // Trail detection uses only the Rayleigh test on detection-stage angles.
-    // High PSF ecc alone is not trailing (could be optical aberration or wind shake).
-
-    // FWHM/HFR: ecc ≤ 0.8 filter, bypass on trailed frames
-    const FWHM_ECC_MAX: f32 = 0.8;
-    let fwhm_filtered: Vec<&metrics::MeasuredStar> = if possibly_trailed {
-        measured.iter().collect()
-    } else {
-        let round: Vec<&metrics::MeasuredStar> = measured.iter()
-            .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
-            .collect();
-        if round.len() >= 3 { round } else { measured.iter().collect() }
-    };
-    let fwhm_vals: Vec<f32> = fwhm_filtered.iter().map(|s| s.fwhm).collect();
-    let hfr_vals: Vec<f32> = fwhm_filtered.iter().map(|s| s.hfr).collect();
-    let shape_weights: Vec<f32> = fwhm_filtered.iter()
-        .map(|s| 1.0 / (1.0 + s.fit_residual)).collect();
-    let median_fwhm = sigma_clipped_weighted_median(&fwhm_vals, &shape_weights);
-    let median_hfr = sigma_clipped_weighted_median(&hfr_vals, &shape_weights);
-
-    snr::compute_star_snr(lum, w, h, &mut measured, median_fwhm);
-
-    // Ecc: trail-aware cutoff
-    let ecc_filtered: Vec<&metrics::MeasuredStar> = if possibly_trailed {
-        measured.iter().collect()
-    } else {
-        let filtered: Vec<&metrics::MeasuredStar> = measured.iter()
-            .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
-            .collect();
-        if filtered.len() >= 3 { filtered } else { measured.iter().collect() }
-    };
-    let ecc_vals: Vec<f32> = ecc_filtered.iter().map(|s| s.eccentricity).collect();
-    let ecc_weights: Vec<f32> = ecc_filtered.iter()
-        .map(|s| 1.0 / (1.0 + s.fit_residual)).collect();
-    let median_ecc = sigma_clipped_weighted_median(&ecc_vals, &ecc_weights);
-
-    let snr_weight = snr::compute_snr_weight(lum, bg.background, bg.noise);
-    let psf_signal = snr::compute_psf_signal(&measured, bg.noise);
-
-    let beta_vals: Vec<f32> = measured.iter().filter_map(|s| s.beta).collect();
-    let median_beta = if beta_vals.is_empty() { None } else {
-        Some(sigma_clipped_median(&beta_vals))
-    };
-
-    eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
-    eprintln!("  Median FWHM:     {:.3}px", median_fwhm);
-    eprintln!("  Median ecc:      {:.3}", median_ecc);
-    eprintln!("  Median HFR:      {:.3}px", median_hfr);
-    eprintln!("  SNR weight:      {:.2}", snr_weight);
-    eprintln!("  PSF signal:      {:.2}", psf_signal);
-    eprintln!("  Frame SNR:       {:.1}", bg.background / bg.noise.max(1e-6));
-    if let Some(beta) = median_beta {
-        let moffat_count = measured.iter().filter(|s| s.beta.is_some()).count();
+    eprintln!("  Time: {:.1}ms", t.statistics_ms + t.snr_ms);
+    if result.possibly_trailed {
+        eprintln!("  Trailed: true (Rayleigh angle coherence)");
+    }
+    eprintln!("  Median FWHM:     {:.3}px", result.median_fwhm);
+    eprintln!("  Median ecc:      {:.3}", result.median_eccentricity);
+    eprintln!("  Median HFR:      {:.3}px", result.median_hfr);
+    eprintln!("  SNR weight:      {:.2}", result.snr_weight);
+    eprintln!("  PSF signal:      {:.2}", result.psf_signal);
+    eprintln!("  Frame SNR:       {:.1}", result.frame_snr);
+    if let Some(beta) = result.median_beta {
         eprintln!("  Median beta:     {:.2} ({} Moffat / {} Gauss)",
-            beta, moffat_count, measured.len() - moffat_count);
+            beta, result.moffat_count, result.gaussian_count);
     }
-    eprintln!(
-        "  Image: {}x{}, {} ch",
-        w, h, channels
-    );
+    eprintln!("  Image: {}x{}, {} ch", result.width, result.height, result.source_channels);
 
-    eprintln!("\n=== Total pipeline: {:.1}ms ===", total.elapsed().as_secs_f64() * 1000.0);
+    eprintln!("\n=== Total pipeline: {:.1}ms ===\n", t.total_ms);
 
-    // Top N table
-    let n = measured.len().min(opts.top);
-    eprintln!();
-    eprintln!(
-        "{:>5} {:>8} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>7} {:>6}",
-        "#", "X", "Y", "FWHMx", "FWHMy", "FWHM", "Ecc", "HFR", "SNR", "Theta", "Beta"
-    );
-    eprintln!("{}", "-".repeat(88));
-    for (i, s) in measured.iter().take(n).enumerate() {
-        eprintln!(
-            "{:>5} {:>8.2} {:>8.2} {:>7.3} {:>7.3} {:>7.3} {:>6.3} {:>6.3} {:>6.1} {:>7.3} {:>6}",
-            i + 1, s.x, s.y, s.fwhm_x, s.fwhm_y, s.fwhm, s.eccentricity, s.hfr, s.snr, s.theta,
-            s.beta.map_or("-".to_string(), |b| format!("{:.2}", b)),
-        );
-    }
-
-    if let Some(ref dir) = opts.save_dir {
-        let ellipses: Vec<(f32, f32, f32, f32, f32, [u8; 3])> = measured
-            .iter()
-            .map(|s| {
-                let color = if s.beta.is_some() { [0, 255, 0] } else { [255, 255, 0] };
-                (s.x, s.y, s.fwhm_x / 2.0, s.fwhm_y / 2.0, s.theta, color)
-            })
-            .collect();
-        render::save_with_ellipses(lum, w, h, &ellipses, &dir.join("measured.png"))?;
-        eprintln!("\n  Saved all debug images to {:?}", dir);
+    // Per-star table header
+    if !result.stars.is_empty() {
+        eprintln!("    #        X        Y   FWHMx   FWHMy    FWHM    Ecc    HFR    SNR   Theta   Beta");
+        eprintln!("----------------------------------------------------------------------------------------");
+        for (i, s) in result.stars.iter().enumerate() {
+            let beta_str = s.beta.map_or("     -".to_string(), |b| format!("{:6.2}", b));
+            eprintln!("{:5} {:8.2} {:8.2} {:7.3} {:7.3} {:7.3} {:6.3} {:6.3} {:6.1} {:8.4} {}",
+                i + 1, s.x, s.y, s.fwhm_x, s.fwhm_y, s.fwhm,
+                s.eccentricity, s.hfr, s.snr, s.theta, beta_str);
+        }
     }
 
     Ok(())
@@ -1215,7 +1048,7 @@ fn cmd_dump(
         None, // no green mask — fit all pixels
         None, // free-beta for debug dump
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-        None, false,
+        None,
     );
 
     if measured.is_empty() {
@@ -1416,179 +1249,38 @@ fn analyze_one_file(
     path: &std::path::Path,
     opts: &Opts,
 ) -> Result<OurResult> {
-    let (meta, pixels) = formats::read_image(path)
-        .with_context(|| format!("Failed to read: {:?}", path))?;
+    let mut analyzer = ImageAnalyzer::new()
+        .with_detection_sigma(opts.sigma)
+        .with_measure_cap(opts.measure_cap)
+        .with_mrs_layers(opts.mrs_layers)
+        .with_fit_max_iter(opts.fit_max_iter)
+        .with_fit_tolerance(opts.fit_tolerance)
+        .with_fit_max_rejects(opts.fit_max_rejects);
 
-    let (lum, w, h, _channels, green_mask) =
-        prepare_luminance(&meta, &pixels, !opts.no_debayer);
-
-    // Background
-    let cell_size = background::auto_cell_size(w, h);
-    let mut bg = background::estimate_background_mesh(&lum, w, h, cell_size);
-    if opts.mrs_layers > 0 {
-        bg.noise = background::estimate_noise_mrs(&lum, w, h, opts.mrs_layers.max(1)).max(0.001);
+    if opts.no_debayer {
+        analyzer = analyzer.without_debayer();
     }
 
-    // Detection
-    let det_params = DetectionParams {
-        detection_sigma: opts.sigma,
-        min_star_area: 5,
-        max_star_area: 2000,
-        saturation_limit: 0.95 * 65535.0,
+    let result = analyzer.analyze(path)?;
+
+    // Compute mean values from per-star data for compare output
+    let mean_fwhm = if result.stars.is_empty() { 0.0 } else {
+        result.stars.iter().map(|s| s.fwhm as f64).sum::<f64>() / result.stars.len() as f64
     };
-    let bg_map_ref = bg.background_map.as_deref();
-    let noise_map_ref = bg.noise_map.as_deref();
-    let initial_fwhm = opts.fwhm_override.unwrap_or(3.0);
-
-    let pass1 = detection::detect_stars(
-        &lum, w, h,
-        bg.background, bg.noise,
-        bg_map_ref, noise_map_ref, &det_params, initial_fwhm, None,
-    );
-    let measured_fwhm = estimate_fwhm_from_stars(
-        &lum, w, h, &pass1, bg.background, bg_map_ref,
-    );
-    let capped = measured_fwhm.min(initial_fwhm * 2.0);
-
-    let (detected, _final_fwhm) = if capped > 0.0
-        && ((capped - initial_fwhm) / initial_fwhm).abs() > 0.30
-    {
-        let d = detection::detect_stars(
-            &lum, w, h,
-            bg.background, bg.noise,
-            bg_map_ref, noise_map_ref, &det_params, capped, None,
-        );
-        (d, capped)
-    } else {
-        (pass1, initial_fwhm)
+    let mean_ecc = if result.stars.is_empty() { 0.0 } else {
+        result.stars.iter().map(|s| s.eccentricity as f64).sum::<f64>() / result.stars.len() as f64
     };
-
-    // Trail detection (Rayleigh test on detection-stage moments)
-    const TRAIL_R_SQ_THRESHOLD: f64 = 0.5;
-    let possibly_trailed = if detected.len() >= 20 {
-        let n = detected.len();
-        let (sum_cos, sum_sin) =
-            detected.iter().fold((0.0f64, 0.0f64), |(sc, ss), s| {
-                let a = 2.0 * s.theta as f64;
-                (sc + a.cos(), ss + a.sin())
-            });
-        let r_sq = (sum_cos * sum_cos + sum_sin * sum_sin) / (n as f64 * n as f64);
-        let p = (-(n as f64) * r_sq).exp();
-        let mut eccs: Vec<f32> = detected.iter().map(|s| s.eccentricity).collect();
-        eccs.sort_unstable_by(|a, b| a.total_cmp(b));
-        let median_ecc = if eccs.len() % 2 == 1 {
-            eccs[eccs.len() / 2]
-        } else {
-            (eccs[eccs.len() / 2 - 1] + eccs[eccs.len() / 2]) * 0.5
-        };
-        (r_sq > TRAIL_R_SQ_THRESHOLD && p < 0.01)
-            || (r_sq > 0.05 && median_ecc > 0.6 && p < 0.05)
-    } else {
-        false
-    };
-
-    // Two-pass calibration: free-beta on bright calibration stars, fixed-beta on all
-    let calibration_stars: Vec<DetectedStar> = detected
-        .iter()
-        .filter(|s| s.eccentricity < 0.5 && s.area >= 5)
-        .take(100)
-        .map(|s| DetectedStar {
-            x: s.x, y: s.y, peak: s.peak, flux: s.flux,
-            area: s.area, theta: s.theta, eccentricity: s.eccentricity,
-        })
-        .collect();
-
-    let field_beta: Option<f64> = if calibration_stars.len() >= 3 {
-        let cal_measured = metrics::measure_stars(
-            &lum, w, h, &calibration_stars,
-            bg.background, bg_map_ref,
-            None, // no green mask — fit all pixels
-            None, // free-beta
-            CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-            None, false,
-        );
-        let beta_vals: Vec<f32> = cal_measured.iter().filter_map(|s| s.beta).collect();
-        if beta_vals.len() >= 3 {
-            Some(sigma_clipped_median(&beta_vals) as f64)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // Pass 2: fixed-beta on brightest N stars (measure cap)
-    let effective_cap = if opts.measure_cap == 0 { detected.len() } else { opts.measure_cap };
-    let to_measure = &detected[..detected.len().min(effective_cap)];
-    let mut measured = metrics::measure_stars(
-        &lum, w, h, to_measure,
-        bg.background, bg_map_ref,
-        None, // no green mask — fit all pixels
-        field_beta,
-        CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-        None, false,
-    );
-
-    let snr_weight = snr::compute_snr_weight(&lum, bg.background, bg.noise) as f64;
-    let frame_snr = if bg.noise > 0.0 { bg.background as f64 / bg.noise as f64 } else { 0.0 };
-
-    if measured.is_empty() {
-        return Ok(OurResult {
-            median_fwhm: 0.0, mean_fwhm: 0.0,
-            median_ecc: 0.0, mean_ecc: 0.0,
-            noise: bg.noise as f64, stars: 0,
-            frame_snr, snr_weight, median_snr: 0.0,
-        });
-    }
-
-    // Fit-residual-weighted statistics (matching pipeline):
-    // FWHM: ecc ≤ 0.8 filter — on trailed frames bypass it (almost all stars are elongated)
-    const FWHM_ECC_MAX: f32 = 0.8;
-    let fwhm_filtered: Vec<&metrics::MeasuredStar> = if possibly_trailed {
-        measured.iter().collect()
-    } else {
-        let round: Vec<&metrics::MeasuredStar> = measured.iter()
-            .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
-            .collect();
-        if round.len() >= 3 { round } else { measured.iter().collect() }
-    };
-    let (fwhm_vals, shape_weights) = (
-        fwhm_filtered.iter().map(|s| s.fwhm).collect::<Vec<f32>>(),
-        fwhm_filtered.iter().map(|s| 1.0 / (1.0 + s.fit_residual)).collect::<Vec<f32>>(),
-    );
-    let median_fwhm = sigma_clipped_weighted_median(&fwhm_vals, &shape_weights);
-    snr::compute_star_snr(&lum, w, h, &mut measured, median_fwhm);
-
-    // Eccentricity: on normal frames, ecc ≤ 0.8 cutoff removes noise from
-    // faint detections. On trailed frames, elongation IS the signal — bypass
-    // the cutoff so the reported ecc reflects actual frame quality.
-    let ecc_use_all = possibly_trailed;
-    let ecc_filtered: Vec<&metrics::MeasuredStar> = if ecc_use_all {
-        measured.iter().collect()
-    } else {
-        let filtered: Vec<&metrics::MeasuredStar> = measured.iter()
-            .filter(|s| s.eccentricity <= FWHM_ECC_MAX)
-            .collect();
-        if filtered.len() >= 3 { filtered } else { measured.iter().collect() }
-    };
-    let (ecc_vals, ecc_weights) = (
-        ecc_filtered.iter().map(|s| s.eccentricity).collect::<Vec<f32>>(),
-        ecc_filtered.iter().map(|s| 1.0 / (1.0 + s.fit_residual)).collect::<Vec<f32>>(),
-    );
-    let median_ecc = sigma_clipped_weighted_median(&ecc_vals, &ecc_weights);
-    let mean_fwhm: f64 = fwhm_vals.iter().map(|&v| v as f64).sum::<f64>() / fwhm_vals.len() as f64;
-    let mean_ecc: f64 = ecc_vals.iter().map(|&v| v as f64).sum::<f64>() / ecc_vals.len() as f64;
-    let snr_vals: Vec<f32> = measured.iter().map(|s| s.snr).collect();
-    let median_snr = sigma_clipped_median(&snr_vals) as f64;
 
     Ok(OurResult {
-        median_fwhm: median_fwhm as f64,
+        median_fwhm: result.median_fwhm as f64,
         mean_fwhm,
-        median_ecc: median_ecc as f64,
+        median_ecc: result.median_eccentricity as f64,
         mean_ecc,
-        noise: bg.noise as f64,
-        stars: measured.len(),
-        frame_snr, snr_weight, median_snr,
+        noise: result.noise as f64,
+        stars: result.stars_measured,
+        frame_snr: result.frame_snr as f64,
+        snr_weight: result.snr_weight as f64,
+        median_snr: result.median_snr as f64,
     })
 }
 
