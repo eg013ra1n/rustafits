@@ -1,3 +1,12 @@
+rustafits (0.9.0-1) unstable; urgency=medium
+
+  * Adaptive moments screening with field-relative thresholds
+  * Unify debug pipeline with library analysis (consistent results)
+  * Diagnostic fields in AnalysisResult (pass1_detections, stars_measured, etc.)
+  * Fix zero-star results on trailed/poor-quality frames (m82.fits)
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Thu, 27 Mar 2026 23:00:00 +0300
+
 rustafits (0.8.6-1) unstable; urgency=medium
 
   * Add with_optics() for arcsecond FWHM/HFR measurements

@@ -11,7 +11,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
-- **Image Analysis**: Two-pass Moffat-primary PSF calibration pipeline with star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MAD noise estimation (optional MRS wavelet)
+- **Image Analysis**: Two-pass Moffat-primary PSF calibration with adaptive moments screening, star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MAD noise estimation (optional MRS wavelet)
 - **JPEG via libjpeg-turbo**: SIMD-accelerated JPEG encoding (NEON on aarch64, AVX2 on x86_64) via turbojpeg
 - **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
 
@@ -298,6 +298,11 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 | `trail_r_squared` | f32 | — | Rayleigh R̄² for directional coherence |
 | `possibly_trailed` | bool | — | True if coherent trailing detected |
 | `median_beta` | Option\<f32\> | — | Moffat β (None if Gaussian/moments) |
+| `pass1_detections` | usize | — | Pass 1 detection count (before calibration) |
+| `calibrated_fwhm` | f32 | pixels | Calibrated field FWHM from Moffat pass |
+| `stars_measured` | usize | — | Stars that survived PSF fitting |
+| `moffat_count` | usize | — | Moffat fits among measured stars |
+| `gaussian_count` | usize | — | Gaussian fits among measured stars |
 | `stage_timing` | StageTiming | ms | Per-stage timing breakdown |
 
 ### StarMetrics fields
