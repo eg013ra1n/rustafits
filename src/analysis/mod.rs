@@ -524,7 +524,9 @@ impl ImageAnalyzer {
             .take(100)
             .collect();
 
-        // Free-beta Moffat on calibration stars to discover field PSF model
+        // Free-beta Moffat on calibration stars to discover field PSF model.
+        // calibration_ok tracks whether we got reliable results — if not,
+        // moments screening is disabled for the measurement pass.
         let field_beta: Option<f64>;
         let field_fwhm: f32;
         if calibration_stars.len() >= 3 {
@@ -543,7 +545,6 @@ impl ImageAnalyzer {
                 None, // free-beta Moffat
                 50, 1e-6, 5, // calibration always uses full precision
                 None,   // no screening for calibration
-                false,  // not trailed
             );
 
             let mut beta_vals: Vec<f32> = cal_measured.iter().filter_map(|s| s.beta).collect();
@@ -568,7 +569,8 @@ impl ImageAnalyzer {
                 );
             }
         } else {
-            // Too few calibration stars — fall back to halfmax estimate
+            // Too few calibration stars (e.g., trailed image where most stars
+            // have ecc > 0.5).  Fall back to halfmax estimate.
             field_beta = None;
             field_fwhm = estimate_fwhm_from_stars(
                 &lum, width, height, &pass1_stars,
@@ -723,8 +725,7 @@ impl ImageAnalyzer {
             self.config.fit_max_iter,
             self.config.fit_tolerance,
             self.config.fit_max_rejects,
-            Some(field_fwhm),     // enable moments screening
-            possibly_trailed,      // bypass ecc gate on trailed frames
+            if field_fwhm > 1.0 { Some(field_fwhm) } else { None },  // adaptive screening when FWHM is reliable
         );
         let measurement_ms = t.elapsed().as_secs_f64() * 1000.0;
 

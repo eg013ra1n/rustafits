@@ -29,12 +29,177 @@ pub struct MeasuredStar {
 
 const FWHM_FACTOR: f32 = 2.3548;
 
+/// Per-star moment statistics for adaptive screening.
+struct MomentStats {
+    #[allow(dead_code)]
+    fwhm: f32,
+    ecc: f32,
+    sharpness: f32,
+}
+
+/// Adaptive screening thresholds computed from field statistics.
+pub(crate) struct ScreeningThresholds {
+    pub fwhm_lo: f32,
+    pub fwhm_hi: f32,
+    pub ecc_max: f32,
+    pub sharp_lo: f32,
+    pub sharp_hi: f32,
+}
+
+/// Compute moments for a single star without rejecting — returns raw statistics.
+fn compute_star_moments(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    star: &DetectedStar,
+    background: f32,
+    bg_map: Option<&[f32]>,
+    field_fwhm: Option<f32>,
+) -> Option<MomentStats> {
+    // Estimate sigma: prefer field_fwhm if available, fall back to area-based estimate
+    let estimated_sigma = if let Some(ff) = field_fwhm {
+        ff / 2.3548
+    } else {
+        (star.area as f32 / std::f32::consts::PI).sqrt() * 0.5
+    };
+    let estimated_sigma = estimated_sigma.max(1.0).min(20.0);
+
+    // Stamp radius: capture >99.9% of Gaussian flux
+    let stamp_radius = (4.0 * estimated_sigma).ceil() as usize;
+    let stamp_radius = stamp_radius.max(8).min(50);
+
+    let cx = star.x.round() as i32;
+    let cy = star.y.round() as i32;
+
+    // Check bounds
+    if cx - stamp_radius as i32 <= 0
+        || cy - stamp_radius as i32 <= 0
+        || cx + stamp_radius as i32 >= width as i32 - 1
+        || cy + stamp_radius as i32 >= height as i32 - 1
+    {
+        return None;
+    }
+
+    let x0 = (cx - stamp_radius as i32) as usize;
+    let y0 = (cy - stamp_radius as i32) as usize;
+    let x1 = (cx + stamp_radius as i32) as usize;
+    let y1 = (cy + stamp_radius as i32) as usize;
+
+    // Extract background-subtracted stamp
+    let stamp_w = x1 - x0 + 1;
+    let stamp_h = y1 - y0 + 1;
+    let mut stamp = Vec::with_capacity(stamp_w * stamp_h);
+    for sy in y0..=y1 {
+        for sx in x0..=x1 {
+            let bg = bg_map.map_or(background, |m| m[sy * width + sx]);
+            stamp.push(data[sy * width + sx] - bg);
+        }
+    }
+
+    // Centroid relative to stamp origin
+    let rel_cx = star.x - x0 as f32;
+    let rel_cy = star.y - y0 as f32;
+
+    // Compute moments
+    let mut mcx = rel_cx as f64;
+    let mut mcy = rel_cy as f64;
+    let fit_r = 5.0_f64.max(4.0 * estimated_sigma as f64);
+    let fit_r_sq = fit_r * fit_r;
+
+    let mut mxx = 0.0_f64;
+    let mut myy = 0.0_f64;
+    let mut mxy = 0.0_f64;
+
+    for _ in 0..2 {
+        mxx = 0.0; myy = 0.0; mxy = 0.0;
+        let mut sw = 0.0_f64;
+        let mut swx = 0.0_f64;
+        let mut swy = 0.0_f64;
+
+        for sy in 0..stamp_h {
+            for sx in 0..stamp_w {
+                let dx = sx as f64 - mcx;
+                let dy = sy as f64 - mcy;
+                if dx * dx + dy * dy > fit_r_sq { continue; }
+                let val = stamp[sy * stamp_w + sx].max(0.0) as f64;
+                if val <= 0.0 { continue; }
+                sw += val;
+                swx += val * sx as f64;
+                swy += val * sy as f64;
+                mxx += val * dx * dx;
+                myy += val * dy * dy;
+                mxy += val * dx * dy;
+            }
+        }
+
+        if sw < 1e-10 { return None; }
+        mcx = swx / sw;
+        mcy = swy / sw;
+        mxx /= sw;
+        myy /= sw;
+        mxy /= sw;
+    }
+
+    let trace = mxx + myy;
+    let det = mxx * myy - mxy * mxy;
+    let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
+    let l1 = (trace + disc) * 0.5;
+    let l2 = (trace - disc) * 0.5;
+
+    if l1 > 0.0 && l2 > 0.0 {
+        let moment_fwhm = (2.3548 * (l1.sqrt() * l2.sqrt())) as f32;
+        let moment_ecc = (1.0 - l2 / l1).max(0.0).sqrt() as f32;
+        let mean_flux = star.flux / star.area as f32;
+        let sharpness = if mean_flux > 0.0 { star.peak / mean_flux } else { 1.0 };
+        Some(MomentStats { fwhm: moment_fwhm, ecc: moment_ecc, sharpness })
+    } else {
+        None
+    }
+}
+
+/// Compute adaptive screening thresholds from field moment statistics.
+fn compute_adaptive_thresholds(
+    moments: &[MomentStats],
+    field_fwhm: f32,
+) -> ScreeningThresholds {
+    use crate::processing::stretch::find_median;
+
+    let mut eccs: Vec<f32> = moments.iter().map(|m| m.ecc).collect();
+    let mut sharps: Vec<f32> = moments.iter().map(|m| m.sharpness).collect();
+
+    let median_ecc = find_median(&mut eccs);
+    let mad_ecc = {
+        let mut devs: Vec<f32> = eccs.iter().map(|&e| (e - median_ecc).abs()).collect();
+        (1.4826 * find_median(&mut devs)).max(0.03) // floor at 0.03
+    };
+
+    let median_sharp = find_median(&mut sharps);
+    let mad_sharp = {
+        let mut devs: Vec<f32> = sharps.iter().map(|&s| (s - median_sharp).abs()).collect();
+        (1.4826 * find_median(&mut devs)).max(0.1) // floor at 0.1
+    };
+
+    ScreeningThresholds {
+        fwhm_lo: 0.7 * field_fwhm,
+        fwhm_hi: 2.5 * field_fwhm,
+        ecc_max: (median_ecc + 3.0 * mad_ecc).max(0.85),
+        sharp_lo: (median_sharp - 3.0 * mad_sharp).max(0.15),
+        sharp_hi: (median_sharp + 3.0 * mad_sharp).min(8.0),
+    }
+}
+
 /// Measure PSF metrics for all detected stars.
 ///
 /// Uses a unified fallback chain: Moffat → Gaussian → Moments.
 /// `field_beta`: if Some, use fixed-beta Moffat (from pass 1 calibration).
 ///              if None, use free-beta Moffat (for calibration stars).
 /// `max_iter`, `conv_tol`, `max_rejects` control LM solver convergence.
+///
+/// Two-pass architecture:
+///   Pass 0: compute moments for all candidates to derive adaptive thresholds.
+///   Pass 1: measure with adaptive screening.
+///   Fallback: if < 10 stars survive, re-measure without screening and keep
+///             the 10 closest to field median FWHM.
 pub fn measure_stars(
     data: &[f32],
     width: usize,
@@ -48,38 +213,66 @@ pub fn measure_stars(
     conv_tol: f64,
     max_rejects: usize,
     field_fwhm: Option<f32>,
-    possibly_trailed: bool,
 ) -> Vec<MeasuredStar> {
     use rayon::prelude::*;
 
-    let result: Vec<MeasuredStar> = stars
+    // Pass 0: compute moments for all candidates (cheap, parallelizable)
+    let screening = if let Some(ff) = field_fwhm {
+        let moments: Vec<Option<MomentStats>> = stars
+            .par_iter()
+            .map(|star| compute_star_moments(data, width, height, star, background, bg_map, field_fwhm))
+            .collect();
+
+        let valid: Vec<MomentStats> = moments.into_iter().flatten().collect();
+        if valid.len() >= 3 {
+            Some(compute_adaptive_thresholds(&valid, ff))
+        } else {
+            None // not enough data for adaptive thresholds
+        }
+    } else {
+        None
+    };
+
+    // Pass 1: measure with adaptive screening
+    let mut result: Vec<MeasuredStar> = stars
         .par_iter()
         .filter_map(|star| {
             measure_single_star(
                 data, width, height, star, background, bg_map, green_mask,
                 field_beta, max_iter, conv_tol, max_rejects,
-                field_fwhm, possibly_trailed,
+                field_fwhm, screening.as_ref(),
             )
         })
         .collect();
 
-    // Safety fallback: if moments screening rejected >50% of candidates,
-    // the eccentricity gate may be too aggressive (extreme wind shake).
-    // Re-run with screening disabled (field_fwhm = None).
-    if field_fwhm.is_some() && !possibly_trailed
-        && result.len() < stars.len() / 2
-        && stars.len() >= 3
-    {
-        return stars
-            .par_iter()
-            .filter_map(|star| {
-                measure_single_star(
-                    data, width, height, star, background, bg_map, green_mask,
-                    field_beta, max_iter, conv_tol, max_rejects,
-                    None, false,  // disable screening
-                )
-            })
-            .collect();
+    // Minimum star guarantee: if screening rejected too many, re-measure
+    // without screening and keep the best candidates by FWHM proximity.
+    let min_survivors = 10.min(stars.len());
+    if let Some(ff) = field_fwhm {
+        if result.len() < min_survivors && stars.len() >= 3 {
+            result = stars
+                .par_iter()
+                .filter_map(|star| {
+                    measure_single_star(
+                        data, width, height, star, background, bg_map, green_mask,
+                        field_beta, max_iter, conv_tol, max_rejects,
+                        field_fwhm, None, // no screening
+                    )
+                })
+                .collect();
+
+            // If we got more than the minimum, keep those closest to field median FWHM
+            if result.len() > min_survivors {
+                result.sort_by(|a, b| {
+                    let da = (a.fwhm - ff).abs();
+                    let db = (b.fwhm - ff).abs();
+                    da.total_cmp(&db)
+                });
+                result.truncate(min_survivors);
+                // Re-sort by flux descending (restore expected order)
+                result.sort_by(|a, b| b.flux.total_cmp(&a.flux));
+            }
+        }
     }
 
     result
@@ -98,7 +291,7 @@ fn measure_single_star(
     conv_tol: f64,
     max_rejects: usize,
     field_fwhm: Option<f32>,
-    possibly_trailed: bool,
+    screening: Option<&ScreeningThresholds>,
 ) -> Option<MeasuredStar> {
     // Estimate sigma: prefer field_fwhm if available, fall back to area-based estimate
     let estimated_sigma = if let Some(ff) = field_fwhm {
@@ -144,8 +337,8 @@ fn measure_single_star(
     let rel_cx = star.x - x0 as f32;
     let rel_cy = star.y - y0 as f32;
 
-    // ── Moments pre-screening gate ──────────────────────────────────
-    if let Some(ff) = field_fwhm {
+    // ── Adaptive moments pre-screening gate ──────────────────────────
+    if let Some(thresh) = screening {
         let mut mcx = rel_cx as f64;
         let mut mcy = rel_cy as f64;
         let fit_r = 5.0_f64.max(4.0 * estimated_sigma as f64);
@@ -195,18 +388,18 @@ fn measure_single_star(
             let moment_fwhm = (2.3548 * (l1.sqrt() * l2.sqrt())) as f32;
             let moment_ecc = (1.0 - l2 / l1).max(0.0).sqrt() as f32;
 
-            if moment_fwhm < 0.7 * ff || moment_fwhm > 2.5 * ff {
+            if moment_fwhm < thresh.fwhm_lo || moment_fwhm > thresh.fwhm_hi {
                 return None;
             }
 
-            if !possibly_trailed && moment_ecc > 0.8 {
+            if moment_ecc > thresh.ecc_max {
                 return None;
             }
 
             let mean_flux = star.flux / star.area as f32;
             if mean_flux > 0.0 {
                 let peak_sharpness = star.peak / mean_flux;
-                if peak_sharpness < 0.3 || peak_sharpness > 5.0 {
+                if peak_sharpness < thresh.sharp_lo || peak_sharpness > thresh.sharp_hi {
                     return None;
                 }
             }
@@ -1154,10 +1347,18 @@ mod tests {
             x: 100.0, y: 100.0, peak: 5000.0, flux: 50000.0,
             area: 200, theta: 0.0, eccentricity: 0.0,
         };
+        // Use adaptive thresholds centered on typical stars (ecc~0.1, sharpness~2.0)
+        let thresh = ScreeningThresholds {
+            fwhm_lo: 0.7 * field_fwhm,
+            fwhm_hi: 2.5 * field_fwhm,
+            ecc_max: 0.85,
+            sharp_lo: 0.15,
+            sharp_hi: 8.0,
+        };
         let result = measure_single_star(
             &data, width, height, &star, background, None, None,
             Some(1.0), 25, 1e-4, 5,
-            Some(field_fwhm), false,
+            Some(field_fwhm), Some(&thresh),
         );
         assert!(result.is_none(), "Extended source should be rejected by moments screening");
     }
@@ -1171,15 +1372,23 @@ mod tests {
         let data = make_star_image(width, height, 100.0, 100.0, 5000.0, 2.0, background);
         // Use realistic flux/area for a Gaussian with sigma=2, amp=5000:
         // total flux ~ 2*pi*sigma^2*amp ~ 125664, area ~ pi*(2*sigma)^2 ~ 50
-        // peak_sharpness = 5000 / (125664/50) = 1.99 — within [0.3, 5.0]
+        // peak_sharpness = 5000 / (125664/50) = 1.99 — within adaptive bounds
         let star = DetectedStar {
             x: 100.0, y: 100.0, peak: 5000.0, flux: 125664.0,
             area: 50, theta: 0.0, eccentricity: 0.1,
         };
+        // Use adaptive thresholds centered on typical stars (ecc~0.1, sharpness~2.0)
+        let thresh = ScreeningThresholds {
+            fwhm_lo: 0.7 * field_fwhm,
+            fwhm_hi: 2.5 * field_fwhm,
+            ecc_max: 0.85,
+            sharp_lo: 0.15,
+            sharp_hi: 8.0,
+        };
         let result = measure_single_star(
             &data, width, height, &star, background, None, None,
             Some(1.0), 25, 1e-4, 5,
-            Some(field_fwhm), false,
+            Some(field_fwhm), Some(&thresh),
         );
         assert!(result.is_some(), "Real star should pass moments screening");
     }

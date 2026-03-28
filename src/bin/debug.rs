@@ -408,7 +408,7 @@ fn cmd_measure(
         None, // no green mask — fit all pixels in interpolated image
         None, // free-beta for debug measure
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-        None, false,
+        None,
     );
     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -721,7 +721,7 @@ fn cmd_query(
         None, // no green mask — fit all pixels
         None, // free-beta for debug query
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-        None, false,
+        None,
     );
 
     if measured.is_empty() {
@@ -1090,7 +1090,7 @@ fn cmd_pipeline(
         None, // no green mask — fit all pixels
         None, // free-beta for pipeline debug
         opts.fit_max_iter, opts.fit_tolerance, opts.fit_max_rejects,
-        None, false,
+        None,
     );
     eprintln!("  Time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
     eprintln!("  Measured: {} / {} detected", measured.len(), detected.len());
@@ -1215,7 +1215,7 @@ fn cmd_dump(
         None, // no green mask — fit all pixels
         None, // free-beta for debug dump
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-        None, false,
+        None,
     );
 
     if measured.is_empty() {
@@ -1505,7 +1505,7 @@ fn analyze_one_file(
             None, // no green mask — fit all pixels
             None, // free-beta
             CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-            None, false,
+            None,
         );
         let beta_vals: Vec<f32> = cal_measured.iter().filter_map(|s| s.beta).collect();
         if beta_vals.len() >= 3 {
@@ -1526,7 +1526,7 @@ fn analyze_one_file(
         None, // no green mask — fit all pixels
         field_beta,
         CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
-        None, false,
+        None,
     );
 
     let snr_weight = snr::compute_snr_weight(&lum, bg.background, bg.noise) as f64;
