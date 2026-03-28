@@ -374,7 +374,7 @@ before measuring all stars.
 4. Derive field-wide PSF parameters via **sigma-clipped median** of the
    calibration results:
    - `field_beta` -- the characteristic Moffat beta for the image
-   - `field_fwhm` -- used to size source masks and refine the detection kernel
+   - `field_fwhm` -- used for adaptive screening thresholds and detection kernel refinement
 
 If fewer than 3 calibration stars yield valid beta values, `field_beta` falls
 back to a simple median (or `None` if no betas are available), and the pipeline

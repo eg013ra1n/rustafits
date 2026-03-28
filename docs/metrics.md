@@ -36,6 +36,94 @@ produce a native-resolution mono image. All pixels in the interpolated image are
 used for PSF fitting, moments computation, and HFR calculation. No green mask
 filtering is applied.
 
+## Adaptive Moments Screening
+
+Before running the expensive Moffat/Gaussian LM fitter (~50µs per star), each
+candidate is screened using cheap image moments (~1µs) to reject non-stellar objects.
+The thresholds are **adaptive** — computed from the field's own statistics rather than
+fixed constants.
+
+### Two-Pass Architecture
+
+```
+Pass 0: Compute moments for ALL candidates (cheap, parallelized)
+  For each star:
+    - Extract stamp, compute 2-iteration intensity-weighted centroid
+    - Compute second-order moments (Mxx, Myy, Mxy) → eigenvalues → FWHM, ecc
+    - Compute sharpness = peak / mean_flux
+  Collect: moment_fwhm[], moment_ecc[], moment_sharpness[]
+
+  Derive adaptive thresholds from field statistics:
+    median_ecc    = median(moment_ecc[])
+    MAD_ecc       = 1.4826 × median(|ecc_i - median_ecc|), floored at 0.03
+    median_sharp  = median(moment_sharpness[])
+    MAD_sharp     = 1.4826 × median(|sharp_i - median_sharp|), floored at 0.1
+
+  ScreeningThresholds:
+    fwhm_lo   = 0.7 × field_fwhm
+    fwhm_hi   = 2.5 × field_fwhm
+    ecc_max   = max(0.85, median_ecc + 3 × MAD_ecc)
+    sharp_lo  = max(0.15, median_sharp - 3 × MAD_sharp)
+    sharp_hi  = min(8.0, median_sharp + 3 × MAD_sharp)
+
+Pass 1: Measure with adaptive gates + Moffat/Gaussian fitting
+  For each star:
+    - Compute stamp moments (same as Pass 0)
+    - Reject if moment_fwhm outside [fwhm_lo, fwhm_hi]
+    - Reject if moment_ecc > ecc_max
+    - Reject if sharpness outside [sharp_lo, sharp_hi]
+    - Survivors → Moffat → Gaussian → Moments fallback chain
+```
+
+### Why Adaptive?
+
+Fixed thresholds (e.g., ecc > 0.8, sharpness 0.3–5.0) fail on:
+
+- **Trailed images** — median ecc ~0.77, so a fixed 0.8 threshold rejects most real stars.
+  The adaptive ecc_max expands to ~0.77 + 3×0.03 = 0.86 (or higher if MAD is larger).
+- **Large-FWHM frames** (>6px) — peak/mean_flux ratio is naturally lower for broad stars,
+  falling below the fixed 0.3 sharpness floor. Adaptive sharp_lo follows the field median.
+- **Uniform fields** — MAD can be very small (~0.01). The MAD floor prevents thresholds
+  from collapsing: MAD_ecc floored at 0.03 (minimum ecc range ±0.09), MAD_sharp floored
+  at 0.1 (minimum sharpness range ±0.3).
+
+### Minimum Star Guarantee
+
+After adaptive filtering, if fewer than 10 candidates survive PSF fitting (or fewer
+than the total candidate count if < 10 candidates exist), the pipeline re-runs
+measurement **without any screening**, then keeps the 10 stars closest to the field
+median FWHM. This ensures PSF fitting always produces output — no zero-star results.
+
+### Example: Normal Frame (cocoon.fits)
+
+```
+Candidates: 500
+Moment statistics: median_ecc=0.35, MAD_ecc=0.12, median_sharp=1.8, MAD_sharp=0.4
+
+Adaptive thresholds:
+  ecc_max   = max(0.85, 0.35 + 0.36) = 0.85
+  sharp_lo  = max(0.15, 1.8 - 1.2) = 0.60
+  sharp_hi  = min(8.0, 1.8 + 1.2) = 3.00
+
+Result: ~490/500 pass screening → measure with Moffat/Gaussian
+```
+
+### Example: Trailed Frame (m82.fits)
+
+```
+Candidates: 314
+Moment statistics: median_ecc=0.78, MAD_ecc=0.06, median_sharp=0.9, MAD_sharp=0.3
+
+Adaptive thresholds:
+  ecc_max   = max(0.85, 0.78 + 0.18) = 0.96  ← expanded for trailing
+  sharp_lo  = max(0.15, 0.9 - 0.9) = 0.15
+  sharp_hi  = min(8.0, 0.9 + 0.9) = 1.80
+
+Result: ~310/314 pass screening → measure with Moffat/Gaussian
+```
+
+---
+
 ## Half-Flux Radius (HFR)
 
 A non-parametric measure of star size: the intensity-weighted mean distance from centroid.

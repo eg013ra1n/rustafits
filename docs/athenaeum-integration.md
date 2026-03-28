@@ -159,8 +159,8 @@ let result = ImageAnalyzer::new()
 
 | Metric | Accuracy | Notes |
 |--------|----------|-------|
-| **FWHM** | R²=0.989, -1.9% median bias | Near-perfect correlation |
-| **Eccentricity** | R²=0.981, -0.07 median offset | Excellent correlation |
+| **FWHM** | R²=0.978, slope 0.985 | Near-perfect proportional match |
+| **Eccentricity** | R²=0.969, slope 1.121 | Excellent correlation |
 | **Noise** | Consistent | MAD noise (default); MRS wavelet optional |
 | **Star count** | Conservative | Favors quality over quantity |
 
@@ -175,8 +175,8 @@ green mask. This produces accurate FWHM values for Bayer-pattern data.
 
 Eccentricity is computed from the **Moffat/Gaussian fit** axis ratio:
 `e = sqrt(1 - (b/a)^2)`. Frame-level eccentricity uses a sigma-clipped
-weighted median with fit-residual weighting. The R²=0.981 correlation with
-Professional tools indicates excellent relative ranking agreement.
+weighted median with fit-residual weighting. R²=0.969 indicates excellent
+relative ranking agreement.
 
 #### Fit-residual weighting
 
@@ -584,8 +584,8 @@ let result = ImageAnalyzer::new()
     .with_thread_pool(pool.clone())
     .analyze("light_001.fits")?;
 
-// FWHM: R²=0.995, -0.3% median bias (fit-residual-weighted)
-// Eccentricity: R²=0.943, ~0.069 lower (methodology difference)
+// FWHM: R²=0.978, slope 0.985 (fit-residual-weighted)
+// Eccentricity: R²=0.969, slope 1.121
 // Trail detection: Rayleigh angle coherence test
 ```
 
