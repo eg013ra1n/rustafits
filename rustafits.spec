@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.9.1
+Version:        0.9.2
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -43,6 +43,9 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Sat Mar 29 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.2-1
+- Fix FWHM screening bounds: moment-space thresholds (median ± 3×MAD)
+
 * Thu Mar 27 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.1-1
 - Fix defocused/large-PSF handling: adaptive stamp sizing up to FWHM ~25px
 - Increase FWHM estimation stamp from 12 to 30 pixels

@@ -1,3 +1,11 @@
+rustafits (0.9.2-1) unstable; urgency=medium
+
+  * Fix FWHM screening bounds: compute in moment-space (median ± 3×MAD)
+    instead of PSF-fit-space (0.7–2.5× field_fwhm), fixing mass rejection
+    on galaxy-dominated and defocused fields
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Sat, 29 Mar 2026 12:00:00 +0300
+
 rustafits (0.9.1-1) unstable; urgency=medium
 
   * Fix defocused/large-PSF handling: adaptive stamp sizing up to FWHM ~25px

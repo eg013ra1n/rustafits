@@ -54,14 +54,16 @@ Pass 0: Compute moments for ALL candidates (cheap, parallelized)
   Collect: moment_fwhm[], moment_ecc[], moment_sharpness[]
 
   Derive adaptive thresholds from field statistics:
+    median_fwhm   = median(moment_fwhm[])
+    MAD_fwhm      = 1.4826 × median(|fwhm_i - median_fwhm|), floored at 0.5
     median_ecc    = median(moment_ecc[])
     MAD_ecc       = 1.4826 × median(|ecc_i - median_ecc|), floored at 0.03
     median_sharp  = median(moment_sharpness[])
     MAD_sharp     = 1.4826 × median(|sharp_i - median_sharp|), floored at 0.1
 
   ScreeningThresholds:
-    fwhm_lo   = 0.7 × field_fwhm
-    fwhm_hi   = 2.5 × field_fwhm
+    fwhm_lo   = max(1.0, median_fwhm - 3 × MAD_fwhm)
+    fwhm_hi   = min(200.0, median_fwhm + 3 × MAD_fwhm)
     ecc_max   = max(0.85, median_ecc + 3 × MAD_ecc)
     sharp_lo  = max(0.15, median_sharp - 3 × MAD_sharp)
     sharp_hi  = min(8.0, median_sharp + 3 × MAD_sharp)

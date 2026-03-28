@@ -168,12 +168,23 @@ fn compute_star_moments(
 /// line 69) also interacts — it limits maximum stamp to 101×101 pixels.
 fn compute_adaptive_thresholds(
     moments: &[MomentStats],
-    field_fwhm: f32,
+    _field_fwhm: f32,
 ) -> ScreeningThresholds {
     use crate::processing::stretch::find_median;
 
+    let mut fwhms: Vec<f32> = moments.iter().map(|m| m.fwhm).collect();
     let mut eccs: Vec<f32> = moments.iter().map(|m| m.ecc).collect();
     let mut sharps: Vec<f32> = moments.iter().map(|m| m.sharpness).collect();
+
+    // All bounds are computed in moment-space (median ± 3×MAD).
+    // This avoids the units mismatch between moment FWHM and PSF-fit FWHM
+    // that caused mass rejection on galaxy-dominated fields.
+
+    let median_fwhm = find_median(&mut fwhms);
+    let mad_fwhm = {
+        let mut devs: Vec<f32> = fwhms.iter().map(|&f| (f - median_fwhm).abs()).collect();
+        (1.4826 * find_median(&mut devs)).max(0.5) // floor at 0.5px
+    };
 
     let median_ecc = find_median(&mut eccs);
     let mad_ecc = {
@@ -188,8 +199,8 @@ fn compute_adaptive_thresholds(
     };
 
     ScreeningThresholds {
-        fwhm_lo: 0.7 * field_fwhm,
-        fwhm_hi: 2.5 * field_fwhm,
+        fwhm_lo: (median_fwhm - 3.0 * mad_fwhm).max(1.0),
+        fwhm_hi: (median_fwhm + 3.0 * mad_fwhm).min(200.0),
         ecc_max: (median_ecc + 3.0 * mad_ecc).max(0.85),
         sharp_lo: (median_sharp - 3.0 * mad_sharp).max(0.15),
         sharp_hi: (median_sharp + 3.0 * mad_sharp).min(8.0),
@@ -235,7 +246,7 @@ pub fn measure_stars(
         if valid.len() >= 3 {
             Some(compute_adaptive_thresholds(&valid, ff))
         } else {
-            None // not enough data for adaptive thresholds
+            None
         }
     } else {
         None
