@@ -119,7 +119,7 @@ FITS / XISF File
        v
 +-------------------------------+
 | Image-Wide Metrics            |
-| -> SNR Weight                 |  (MeanDev / noise)^2  -- subframe ranking
+| -> SNR Weight                 |  median(star_flux)^2 / (noise^2 * bg)  -- subframe ranking
 | -> PSF Signal                 |  median(star_peaks) / noise
 +-------------------------------+
        |
@@ -202,7 +202,7 @@ See [Trail Detection](trail-rejection.md) for the full algorithm and rationale.
 | FWHM                | `median_fwhm`       | ~2.16 px  | ~2.66 px  |
 | Eccentricity        | `median_eccentricity` | ~0.49   | ~0.44     |
 | Stars detected      | `stars_detected`    | ~4,485    | ~712      |
-| SNR Weight          | `snr_weight`        | ~1.1      | —         |
+| SNR Weight          | `snr_weight`        | ~165      | ~55       |
 | PSF Signal          | `psf_signal`        | ~14       | —         |
 | Frame SNR           | `frame_snr`         | —         | —         |
 

@@ -1496,7 +1496,7 @@ fn cmd_compare(opts: &Opts) -> Result<()> {
 
     eprintln!();
     eprintln!("=== SNR WEIGHT vs PI PSF SIGNAL WEIGHT ===");
-    eprintln!("  Our: (MeanDev/noise)²;  PI: PSF Signal Weight");
+    eprintln!("  Our: median(flux)²/(noise²×bg);  PI: PSF Signal Weight");
     eprintln!();
     eprintln!("  Weight ratio (ours/PI):  mean={:.3}x  median={:.3}x  std={:.3}x",
         mean(&snrw_rats), median_f64(&snrw_rats), std_dev(&snrw_rats));

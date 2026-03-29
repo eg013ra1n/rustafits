@@ -1,6 +1,6 @@
 # Maintainer: Vilen Sharifov <vilen.sharifov@gmail.com>
 pkgname=rustafits
-pkgver=0.9.3
+pkgver=0.9.4
 pkgrel=1
 pkgdesc="High-performance FITS/XISF to JPEG/PNG converter with auto-stretch and Bayer debayering"
 arch=('x86_64' 'aarch64')

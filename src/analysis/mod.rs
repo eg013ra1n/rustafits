@@ -136,7 +136,8 @@ pub struct AnalysisResult {
     pub median_snr: f32,
     /// Median half-flux radius (pixels).
     pub median_hfr: f32,
-    /// SNR weight for frame ranking: (MeanDev / noise)².
+    /// SNR weight for frame ranking: median(star_flux)² / (noise² × background).
+    /// Star-based metric immune to background gradients. Higher = better frame.
     pub snr_weight: f32,
     /// PSF signal: median(star_peaks) / noise.
     pub psf_signal: f32,
@@ -651,7 +652,6 @@ impl ImageAnalyzer {
             (0.0, false)
         };
 
-        let snr_weight = snr::compute_snr_weight(&lum, bg_result.background, bg_result.noise);
         let frame_snr = if bg_result.noise > 0.0 { bg_result.background / bg_result.noise } else { 0.0 };
 
         let pass1_detections = pass1_stars.len();
@@ -664,7 +664,7 @@ impl ImageAnalyzer {
                 stars: Vec::new(),
                 median_fwhm: 0.0, median_eccentricity: 0.0,
                 median_snr: 0.0, median_hfr: 0.0,
-                snr_weight, psf_signal: 0.0, frame_snr,
+                snr_weight: 0.0, psf_signal: 0.0, frame_snr,
                 trail_r_squared, possibly_trailed,
                 measured_fwhm_kernel: final_fwhm,
                 median_beta: field_beta.map(|b| b as f32),
@@ -809,6 +809,7 @@ impl ImageAnalyzer {
         let median_snr = find_median(&mut snr_vals);
         let median_hfr = sigma_clipped_weighted_median(&hfr_vals, &shape_weights);
         let psf_signal = snr::compute_psf_signal(&measured, bg_result.noise);
+        let snr_weight = snr::compute_snr_weight(&measured, bg_result.background, bg_result.noise);
 
         // Median beta: use field_beta from calibration, or compute from all stars
         let median_beta = if let Some(fb) = field_beta {

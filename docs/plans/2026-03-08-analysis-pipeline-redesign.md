@@ -161,7 +161,7 @@ Free-beta Moffat (8 params)
 - Median FWHM (sigma-clipped)
 - Median eccentricity (sigma-clipped)
 - Background SNR — mean_signal / noise
-- SNR Weight — (mean_deviation / noise)^2
+- SNR Weight — median(star_flux)^2 / (noise^2 * background)
 - PSF Signal — median(star_peaks) / noise
 - Trail detection — Rayleigh R^2 test (advisory flag)
 

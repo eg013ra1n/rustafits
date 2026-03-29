@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.9.3
+Version:        0.9.4
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -44,6 +44,10 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Sun Mar 30 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.4-1
+- Replace SNR Weight with star-based formula: median(star_flux)²/(noise²×background)
+- Immune to background gradients inflating the metric
+
 * Sat Mar 29 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.3-1
 - Fix trail detection false positives: raise Path B thresholds (R² 0.05→0.15, ecc 0.6→0.7)
 - Add cmake build dependency for turbojpeg-sys

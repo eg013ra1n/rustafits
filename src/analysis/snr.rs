@@ -143,33 +143,19 @@ fn compute_single_snr(
     (star_flux / noise_sq.sqrt()) as f32
 }
 
-/// Compute image-wide SNR Weight for frame ranking.
-/// SNRWeight = (MeanDeviation / noise)²
-pub fn compute_snr_weight(data: &[f32], background: f32, noise: f32) -> f32 {
-    if noise <= 0.0 || data.is_empty() {
+/// Compute star-based SNR Weight for frame ranking.
+/// SNRWeight = median(star_flux)² / (noise² × background).
+/// Immune to background gradients (signal measured from stars only).
+/// Higher = better frame. Returns 0 when no stars detected.
+pub fn compute_snr_weight(stars: &[MeasuredStar], background: f32, noise: f32) -> f32 {
+    if stars.is_empty() || noise <= 0.0 || background <= 0.0 {
         return 0.0;
     }
-
-    // Subsample for performance
-    let stride = (data.len() / 500_000).max(1);
-    let mut sum_dev = 0.0_f64;
-    let mut count = 0u64;
-
-    for (i, &val) in data.iter().enumerate() {
-        if i % stride != 0 {
-            continue;
-        }
-        sum_dev += (val - background).abs() as f64;
-        count += 1;
-    }
-
-    if count == 0 {
-        return 0.0;
-    }
-
-    let mean_dev = (sum_dev / count as f64) as f32;
-    let ratio = mean_dev / noise;
-    ratio * ratio
+    let mut fluxes: Vec<f32> = stars.iter().map(|s| s.flux).collect();
+    let median_flux = find_median(&mut fluxes) as f64;
+    let n = noise as f64;
+    let bg = background as f64;
+    (median_flux * median_flux / (n * n * bg)) as f32
 }
 
 /// Compute PSF Signal = median(star_peaks) / noise.
@@ -220,10 +206,34 @@ mod tests {
 
     #[test]
     fn test_snr_weight() {
-        let data = vec![1000.0_f32; 10000];
-        let w = compute_snr_weight(&data, 1000.0, 50.0);
-        // All pixels at background → MeanDev ≈ 0 → SNRWeight ≈ 0
-        assert!(w < 0.01, "SNRWeight {} should be ~0 for flat image", w);
+        let stars = vec![
+            MeasuredStar {
+                x: 0.0, y: 0.0, peak: 5000.0, flux: 40000.0,
+                fwhm_x: 7.0, fwhm_y: 7.0, fwhm: 7.0, eccentricity: 0.0, hfr: 3.5, snr: 0.0, theta: 0.0, beta: None,
+                fit_method: crate::analysis::FitMethod::Gaussian,
+                fit_residual: 0.0,
+            },
+            MeasuredStar {
+                x: 0.0, y: 0.0, peak: 3000.0, flux: 20000.0,
+                fwhm_x: 7.0, fwhm_y: 7.0, fwhm: 7.0, eccentricity: 0.0, hfr: 3.5, snr: 0.0, theta: 0.0, beta: None,
+                fit_method: crate::analysis::FitMethod::Gaussian,
+                fit_residual: 0.0,
+            },
+            MeasuredStar {
+                x: 0.0, y: 0.0, peak: 7000.0, flux: 60000.0,
+                fwhm_x: 7.0, fwhm_y: 7.0, fwhm: 7.0, eccentricity: 0.0, hfr: 3.5, snr: 0.0, theta: 0.0, beta: None,
+                fit_method: crate::analysis::FitMethod::Gaussian,
+                fit_residual: 0.0,
+            },
+        ];
+        // median flux = 40000, noise = 50, background = 1000
+        // weight = 40000² / (50² × 1000) = 1.6e9 / 2.5e6 = 640
+        let w = compute_snr_weight(&stars, 1000.0, 50.0);
+        assert!((w - 640.0).abs() < 1.0, "SNRWeight {} expected ~640", w);
+
+        // No stars → 0
+        let w0 = compute_snr_weight(&[], 1000.0, 50.0);
+        assert!(w0 == 0.0, "SNRWeight should be 0 for no stars");
     }
 
     #[test]

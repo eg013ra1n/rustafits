@@ -1,3 +1,12 @@
+rustafits (0.9.4-1) unstable; urgency=medium
+
+  * Replace SNR Weight with star-based formula:
+    median(star_flux)² / (noise² × background)
+  * Immune to background gradients inflating the metric
+  * Returns 0 when no stars detected (correct for unusable frames)
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Sun, 30 Mar 2026 12:00:00 +0300
+
 rustafits (0.9.3-1) unstable; urgency=medium
 
   * Fix trail detection false positives: raise Path B Rayleigh thresholds

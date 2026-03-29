@@ -145,7 +145,7 @@ println!("FWHM: {:.2}\"", result.median_fwhm);
 | `median_eccentricity` | `f32` | Median eccentricity. 0 = perfectly round. Values > 0.5 suggest tracking issues. |
 | `median_snr` | `f32` | Median per-star SNR. |
 | `median_hfr` | `f32` | Median half-flux radius (pixels). Similar to FWHM but more robust to non-Gaussian profiles. |
-| `snr_weight` | `f32` | SNR weight for stacking: `(MeanDev / noise)^2`. |
+| `snr_weight` | `f32` | SNR weight for stacking: `median(star_flux)² / (noise² × background)`. Star-based, gradient-immune. |
 | `frame_snr` | `f32` | Per-frame SNR: `background / noise`. Use for stacking prediction: `stacked_snr = sqrt(sum(frame_snr_i²))`. |
 | `median_beta` | `Option<f32>` | Median Moffat beta. Always present with default pipeline. Typical: 2-5. |
 | `measured_fwhm_kernel` | `f32` | FWHM used for final matched filter kernel in pixels. |

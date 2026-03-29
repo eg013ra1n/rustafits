@@ -116,33 +116,39 @@ Returns SNR = 0 if:
 
 ## SNR Weight
 
-A frame-ranking metric for subframe evaluation and stacking weight computation:
+A star-based frame-ranking metric for subframe evaluation and stacking weight
+computation. Immune to background gradients (signal measured from stars only).
 
 ```
-SNR_weight = (MeanDeviation / noise)^2
+SNR_weight = median(star_flux)^2 / (noise^2 * background)
 ```
 
 ### Algorithm
 
 ```
-Input: luminance image, background, noise
+Input: measured stars (with flux), background, noise
        |
        v
 +--------------------------------+
-| Subsample Image                |  stride to ~500k pixels
-|   MeanDev = mean(|pixel - background|)
+| Collect Star Fluxes            |  background-subtracted integrated flux per star
+| Compute Median                 |  robust to outlier stars (saturated, blended)
 +--------------------------------+
        |
        v
 +--------------------------------+
 | Compute Weight                 |
-|   ratio = MeanDev / noise      |
-|   SNR_weight = ratio^2         |
+|   SNR_weight = median_flux^2   |
+|              / (noise^2 * bg)  |
 +--------------------------------+
 ```
 
-For a pure Gaussian background (no signal), MeanDev ~ 0.8 * sigma, so
-SNR_weight ~ 0.64. Higher values indicate more signal content.
+Higher values indicate better frame quality. Returns 0 when no stars are
+detected (correct behavior for unusable frames like clouded-out exposures).
+
+The numerator uses stellar flux (not pixel deviation), so background gradients
+from light pollution or vignetting cannot inflate the metric. The denominator
+penalizes both noisy frames (noise^2) and elevated backgrounds from moonlight
+or poor transparency (background).
 
 ---
 

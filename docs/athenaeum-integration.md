@@ -77,7 +77,7 @@ let result = ImageAnalyzer::new()
 | `median_snr` | `f32` | Median per-star SNR. |
 | `median_hfr` | `f32` | Median half-flux radius (pixels). |
 | `measured_fwhm_kernel` | `f32` | FWHM used for final matched filter kernel. |
-| `snr_weight` | `f32` | SNR weight for stacking: (MeanDev / noise)^2. |
+| `snr_weight` | `f32` | SNR weight for stacking: median(star_flux)² / (noise² × background). Star-based, gradient-immune. |
 | `psf_signal` | `f32` | PSF signal strength: median(star_peaks) / noise. |
 | `frame_snr` | `f32` | Per-frame SNR: background / noise. For stacking: `stacked_snr = sqrt(sum(frame_snr_i²))`. |
 | `trail_r_squared` | `f32` | Rayleigh R² for directional coherence. 0 = no trail, 1 = strong trail. |
@@ -615,7 +615,7 @@ Additional quality indicators:
 | Trail R² | `trail_r_squared` | `{:.3}` | 0 = no trail, >0.5 = suspicious, >0.7 = strong |
 | Trailed | `possibly_trailed` | icon/badge | Warning, not auto-reject |
 | PSF Signal | `psf_signal` | `{:.0}` | median(star_peaks) / noise |
-| SNR Weight | `snr_weight` | `{:.1}` | SNR weight for stacking: (MeanDev / noise)^2 |
+| SNR Weight | `snr_weight` | `{:.1}` | SNR weight for stacking: median(star_flux)² / (noise² × bg). Star-based, gradient-immune |
 | Frame SNR | `frame_snr` | `{:.1}` | background / noise, for stacking prediction |
 
 ### Annotation toggle in image viewer
