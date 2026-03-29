@@ -1,13 +1,13 @@
 # Maintainer: Vilen Sharifov <vilen.sharifov@gmail.com>
 pkgname=rustafits
-pkgver=0.9.2
+pkgver=0.9.3
 pkgrel=1
 pkgdesc="High-performance FITS/XISF to JPEG/PNG converter with auto-stretch and Bayer debayering"
 arch=('x86_64' 'aarch64')
 url="https://github.com/eg013ra1n/rustafits"
 license=('Apache-2.0')
 depends=()
-makedepends=('rust' 'cargo')
+makedepends=('rust' 'cargo' 'cmake')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/eg013ra1n/$pkgname/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')  # Update with actual checksum after first release
 

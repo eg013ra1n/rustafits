@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.9.2
+Version:        0.9.3
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -9,6 +9,7 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildRequires:  rust-packaging >= 21
 BuildRequires:  cargo
+BuildRequires:  cmake
 BuildRequires:  rust
 
 %description
@@ -43,6 +44,10 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Sat Mar 29 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.3-1
+- Fix trail detection false positives: raise Path B thresholds (R² 0.05→0.15, ecc 0.6→0.7)
+- Add cmake build dependency for turbojpeg-sys
+
 * Sat Mar 29 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.2-1
 - Fix FWHM screening bounds: moment-space thresholds (median ± 3×MAD)
 

@@ -645,7 +645,7 @@ impl ImageAnalyzer {
             };
             let threshold = self.config.trail_r_squared_threshold as f64;
             let trailed = (r_sq > threshold && p < 0.01)       // strong angle coherence
-                || (r_sq > 0.05 && median_ecc > 0.6 && p < 0.05); // moderate coherence + high ecc
+                || (r_sq > 0.15 && median_ecc > 0.7 && p < 0.05); // moderate coherence + high ecc
             (r_sq as f32, trailed)
         } else {
             (0.0, false)

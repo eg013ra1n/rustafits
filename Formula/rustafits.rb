@@ -1,10 +1,11 @@
 class Rustafits < Formula
   desc "High-performance FITS/XISF to JPEG/PNG converter with auto-stretch"
   homepage "https://github.com/eg013ra1n/rustafits"
-  url "https://github.com/eg013ra1n/rustafits/archive/v0.9.2.tar.gz"
+  url "https://github.com/eg013ra1n/rustafits/archive/v0.9.3.tar.gz"
   sha256 "CHECKSUM_HERE"
   license "Apache-2.0"
 
+  depends_on "cmake" => :build
   depends_on "rust" => :build
 
   def install
