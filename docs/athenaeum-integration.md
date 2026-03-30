@@ -337,13 +337,14 @@ Trail detection is **advisory** — the pipeline always computes full metrics an
 reports trail status via `trail_r_squared` and `possibly_trailed`.
 
 Trail detection uses the Rayleigh test on detection-stage moments (angle coherence).
-Requires at least 20 detected stars.
+Requires at least 20 detected stars and FWHM ≥ 2.0 px (below this, pixel grid
+quantization biases moment-based angles).
 
 ### `trail_r_squared`
 
 | Value | Meaning |
 |-------|---------|
-| 0.0 | Uniform angles (no trail) or < 20 stars |
+| 0.0 | Uniform angles (no trail), < 20 stars, or FWHM < 2.0 px |
 | 0.01-0.15 | Typical undersampled round stars (grid-induced) |
 | 0.15-0.40 | Oversampled with field-angle effects (coma, curvature) |
 | 0.50-0.70 | Suspicious — possible mild trailing |

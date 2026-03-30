@@ -178,12 +178,13 @@ is advisory only.
 ### Rayleigh Test (before PSF measurement)
 
 Uses the Rayleigh test on doubled position angles (2θ) from detection-stage moments.
-Requires ≥20 detected stars. Two paths cover different regimes:
+Requires ≥20 detected stars and FWHM ≥ 2.0 px (below this, pixel grid quantization
+biases moment-based angles). Two paths cover different regimes:
 
 | Path | Condition | Catches |
 |------|-----------|---------|
 | A — Strong coherence | R̄² > threshold AND p < 0.01 | Coherent trails (RA drift) |
-| B — Eccentricity-gated | R̄² > 0.05 AND median_ecc > 0.6 AND p < 0.05 | Undersampled trails |
+| B — Eccentricity-gated | R̄² > 0.15 AND median_ecc > 0.7 AND p < 0.05 | Moderate coherence + high elongation |
 
 The Path A threshold defaults to 0.5 and is configurable via `with_trail_threshold()`.
 

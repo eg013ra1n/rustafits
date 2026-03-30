@@ -1,3 +1,12 @@
+rustafits (0.9.5-1) unstable; urgency=medium
+
+  * Skip Rayleigh trail test when FWHM < 2.0 px — pixel grid quantization
+    biases moment-based angles on undersampled PSFs, creating false trail
+    detections
+  * Raise Path B thresholds (R² 0.05→0.15, median_ecc 0.6→0.7)
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Sun, 30 Mar 2026 18:00:00 +0300
+
 rustafits (0.9.4-1) unstable; urgency=medium
 
   * Replace SNR Weight with star-based formula:

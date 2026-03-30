@@ -150,9 +150,10 @@ pub struct AnalysisResult {
     /// A threshold of 0.5 corresponds to R̄ ≈ 0.71 (strong coherence).
     pub trail_r_squared: f32,
     /// True if the image is likely trailed, based on the Rayleigh test.
-    /// Fires when R̄² > threshold with significant p-value, or when R̄² > 0.05
+    /// Fires when R̄² > threshold with significant p-value, or when R̄² > 0.15
     /// with high median eccentricity (catches non-coherent guiding issues).
-    /// Requires ≥20 detected stars for statistical reliability.
+    /// Requires ≥20 detected stars and FWHM ≥ 2.0 px (below this, pixel grid
+    /// quantization biases moment-based angles).
     pub possibly_trailed: bool,
     /// Measured FWHM from adaptive two-pass detection (pixels).
     /// This is the FWHM used for the final matched filter kernel.
@@ -628,7 +629,9 @@ impl ImageAnalyzer {
         // ── Trail detection (Rayleigh test on detection-stage moments) ────
         // Uses 2θ doubling for axial orientation data. R̄² = squared mean
         // resultant length; p ≈ exp(-n·R̄²) is the asymptotic Rayleigh p-value.
-        let (trail_r_squared, possibly_trailed) = if detected.len() >= 20 {
+        // Requires FWHM >= 2.0 px — below this, pixel grid quantization biases
+        // moment-based angles, creating artificial angular coherence.
+        let (trail_r_squared, possibly_trailed) = if detected.len() >= 20 && field_fwhm >= 2.0 {
             let n = detected.len();
             let (sum_cos, sum_sin) =
                 detected.iter().fold((0.0f64, 0.0f64), |(sc, ss), s| {

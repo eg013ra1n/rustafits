@@ -39,11 +39,14 @@ The p-value gives the probability of observing R̄² this large or larger under 
 null hypothesis of uniform random angles. The asymptotic formula `exp(-n·R̄²)` is
 reliable for n ≥ 20.
 
-### Minimum Star Count
+### Prerequisites
 
-The test requires at least **20** detected stars. Below this, the asymptotic p-value
-is unreliable and the test has insufficient statistical power. When skipped:
-`trail_r_squared = 0.0`, `possibly_trailed = false`.
+The test requires:
+- At least **20** detected stars (below this, the asymptotic p-value is unreliable)
+- **FWHM ≥ 2.0 px** (below this, pixel grid quantization biases moment-based
+  angles toward grid-aligned directions, creating artificial angular coherence)
+
+When either condition is not met: `trail_r_squared = 0.0`, `possibly_trailed = false`.
 
 ### Median Eccentricity
 
@@ -112,10 +115,10 @@ differ only in their activation criteria and p-value threshold.
 
 ```
 Stage 1 (detection-stage, before PSF measurement):
-    if n_detected >= 20:
+    if n_detected >= 20 AND field_fwhm >= 2.0:
         compute R̄², p, detection-stage median_ecc
         rayleigh_trailed = (R̄² > 0.5 && p < 0.01)
-                        || (R̄² > 0.05 && median_ecc > 0.6 && p < 0.05)
+                        || (R̄² > 0.15 && median_ecc > 0.7 && p < 0.05)
     else:
         rayleigh_trailed = false
 
@@ -285,8 +288,9 @@ knots, while the Gaussian fitter only fits theta for obviously elliptical stars.
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
 | Minimum stars | 20 | Below this, asymptotic p-value unreliable |
+| Minimum FWHM | 2.0 px | Below this, pixel grid quantization biases angles |
 | Path A R̄² threshold | 0.5 (default, configurable) | Above non-trail coherence (~0.40), below real trails (>0.7) |
 | Path A p threshold | 0.01 | Strict — high confidence required |
-| Path B R̄² floor | 0.05 | Prevents false triggers at high n with spurious coherence |
-| Path B ecc threshold | 0.6 | Above undersampled baseline (~0.3-0.4) |
+| Path B R̄² floor | 0.15 | Prevents false triggers at high n with spurious coherence |
+| Path B ecc threshold | 0.7 | Requires clearly elongated stars (detection-stage moments are noisy) |
 | Path B p threshold | 0.05 | Standard significance level |
