@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.9.6
+Version:        0.9.7
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -44,6 +44,10 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Tue Apr 01 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.7-1
+- Move trail detection to PSF-fit stars (more accurate theta/eccentricity)
+- Add optical aberration suppression: radial angle test (coma) + ecc-distance correlation (tilt)
+
 * Tue Apr 01 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.6-1
 - Parallelize star detection: peak detection, NMS sort, post-NMS filters (20-36% faster)
 

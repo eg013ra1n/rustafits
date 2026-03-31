@@ -10,7 +10,7 @@ Trailed images (from tracking drift, wind, or cable snag) produce elongated star
 profiles. **Coherent** trailing (RA drift) stretches all stars in the same direction.
 The Rayleigh test detects this directional coherence.
 
-## Stage 1: Rayleigh Test on Detection-Stage Moments
+## Rayleigh Test on PSF-Fit Stars
 
 The [Rayleigh test](https://en.wikipedia.org/wiki/Rayleigh_test) detects non-uniformity
 in a circular distribution. We use it on the doubled position angles (2θ)
@@ -50,8 +50,9 @@ When either condition is not met: `trail_r_squared = 0.0`, `possibly_trailed = f
 
 ### Median Eccentricity
 
-The detection-stage median eccentricity is computed from all detected stars using a
-proper median (average of the two middle values for even-length arrays).
+The median eccentricity is computed from PSF-fit measured stars (after Moffat/Gaussian
+fitting), using a proper median (average of the two middle values for even-length arrays).
+PSF-fit eccentricity is more accurate than detection-stage moments.
 
 ---
 
@@ -87,15 +88,14 @@ coherence on non-trailed stars varies by regime:
 
 The default 0.5 threshold sits above both regimes while still catching real trails.
 
-### Path B — Eccentricity-Gated Rayleigh (median ecc > 0.6)
+### Path B — Eccentricity-Gated Rayleigh (median ecc > 0.7)
 
 ```
-Flag if:  R̄² > 0.05  AND  median_eccentricity > 0.6  AND  p < 0.05
+Flag if:  R̄² > 0.15  AND  median_eccentricity > 0.7  AND  p < 0.05
 ```
 
-For undersampled stars, stamp-based moments are noisy and theta has grid bias.
-This path only runs when blobs are **genuinely elongated** (median eccentricity > 0.6)
-AND there is at least modest directional coherence (R̄² > 0.05). The R̄² floor
+This path only runs when stars are **genuinely elongated** (median eccentricity > 0.7)
+AND there is at least modest directional coherence (R̄² > 0.15). The R̄² floor
 prevents false triggers at very high star counts where even tiny spurious coherence
 yields p < 0.05.
 
@@ -103,7 +103,7 @@ yields p < 0.05.
 
 ```
 rayleigh_trailed = (R̄² > threshold AND p < 0.01)     -- Path A
-                OR (R̄² > 0.05 AND median_ecc > 0.6 AND p < 0.05)  -- Path B
+                OR (R̄² > 0.15 AND median_ecc > 0.7 AND p < 0.05)  -- Path B
 ```
 
 Both paths compute the same Rayleigh statistic from the same star list; they
@@ -114,20 +114,33 @@ differ only in their activation criteria and p-value threshold.
 ## Full Decision Logic
 
 ```
-Stage 1 (detection-stage, before PSF measurement):
-    if n_detected >= 20 AND field_fwhm >= 2.0:
-        compute R̄², p, detection-stage median_ecc
+After PSF measurement (uses PSF-fit theta and eccentricity):
+    if n_measured >= 20 AND field_fwhm >= 2.0:
+        compute R̄², p, PSF-fit median_ecc
         rayleigh_trailed = (R̄² > 0.5 && p < 0.01)
                         || (R̄² > 0.15 && median_ecc > 0.7 && p < 0.05)
+
+        if rayleigh_trailed:
+            // Optical aberration suppression:
+            // 1. Radial angle coherence — if elongation angles point radially
+            //    from image center, it's coma/field curvature, not trailing.
+            //    Rayleigh test on 2×(theta - phi) where phi = radial direction.
+            //    Suppress if radial_r_sq > 0.15 && p < 0.05.
+            //
+            // 2. Ecc-distance correlation — if eccentricity increases with
+            //    distance from image center, it's tilt/defocus, not trailing.
+            //    Pearson r(distance, eccentricity).
+            //    Suppress if r > 0.25.
     else:
         rayleigh_trailed = false
 
 ```
 
-**Note (v0.8.2):** The previous Stage 2 PSF-ecc override (`fit_median_ecc > 0.55`)
-has been removed. Trail detection now uses the Rayleigh angle coherence test only.
-High eccentricity without directional coherence indicates optical aberration (coma,
-tilt) or wind shake — not tracking drift — and should not trigger trail mode.
+**Note (v0.9.7):** Trail detection now uses PSF-fit stars (after Moffat/Gaussian
+fitting) instead of detection-stage moments, and includes optical aberration
+suppression. High eccentricity with radial angle pattern or field-dependent
+eccentricity gradient indicates optical aberration (coma, tilt) — not tracking
+drift — and the trail flag is suppressed.
 
 When `possibly_trailed` is true, the statistics computation bypasses the
 eccentricity ≤ 0.8 filter for FWHM and HFR medians. This ensures that
@@ -271,15 +284,12 @@ For reference, the expected R̄² under uniformity is 1/n (e.g., 0.005 for n=200
 
 ## Position Angle (Theta) Source
 
-The theta values used in the Rayleigh test come from stamp-based intensity-weighted
-second-order moments computed during detection (see [detection.md](detection.md)).
-The range is (−π/2, π/2] — an axial orientation, not a full-circle direction.
-The 2θ doubling maps this to (−π, π] for the circular Rayleigh test.
+The theta values used in the Rayleigh test come from PSF-fit stars (Moffat or
+Gaussian fit). The range is (−π/2, π/2] — an axial orientation, not a full-circle
+direction. The 2θ doubling maps this to (−π, π] for the circular Rayleigh test.
 
-For PSF measurement (metrics), theta is also computed from moments rather than the
-Gaussian fit — the moments-based theta is defined for all star shapes (including
-nearly round ones) and carries directional signal even for barely-elongated trail
-knots, while the Gaussian fitter only fits theta for obviously elliptical stars.
+PSF-fit theta is more accurate than detection-stage moments, especially for
+faint or barely-elongated stars where moment-based angles are dominated by noise.
 
 ---
 
@@ -292,5 +302,7 @@ knots, while the Gaussian fitter only fits theta for obviously elliptical stars.
 | Path A R̄² threshold | 0.5 (default, configurable) | Above non-trail coherence (~0.40), below real trails (>0.7) |
 | Path A p threshold | 0.01 | Strict — high confidence required |
 | Path B R̄² floor | 0.15 | Prevents false triggers at high n with spurious coherence |
-| Path B ecc threshold | 0.7 | Requires clearly elongated stars (detection-stage moments are noisy) |
+| Path B ecc threshold | 0.7 | Requires clearly elongated stars |
 | Path B p threshold | 0.05 | Standard significance level |
+| Radial R² threshold | 0.15 | Suppresses trail flag if elongation is radially organized (optics) |
+| Ecc-distance r threshold | 0.25 | Suppresses trail flag if ecc increases with distance (tilt) |

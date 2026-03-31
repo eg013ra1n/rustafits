@@ -1,3 +1,13 @@
+rustafits (0.9.7-1) unstable; urgency=medium
+
+  * Move trail detection to PSF-fit stars (more accurate theta/eccentricity)
+  * Add optical aberration suppression: radial angle coherence test
+    (catches coma/field curvature) and eccentricity-distance Pearson
+    correlation (catches tilt/defocus gradient)
+  * Trail flag suppressed when elongation pattern is optical, not tracking
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Tue, 01 Apr 2026 18:00:00 +0300
+
 rustafits (0.9.6-1) unstable; urgency=medium
 
   * Parallelize star detection: peak detection loop (row-parallel),

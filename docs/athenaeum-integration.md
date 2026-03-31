@@ -336,9 +336,11 @@ For each detected star:
 Trail detection is **advisory** — the pipeline always computes full metrics and
 reports trail status via `trail_r_squared` and `possibly_trailed`.
 
-Trail detection uses the Rayleigh test on detection-stage moments (angle coherence).
-Requires at least 20 detected stars and FWHM ≥ 2.0 px (below this, pixel grid
-quantization biases moment-based angles).
+Trail detection uses the Rayleigh test on PSF-fit stars (angle coherence).
+Requires at least 20 measured stars and FWHM ≥ 2.0 px. Includes optical
+aberration suppression: if the elongation pattern is radial (coma/field curvature)
+or eccentricity increases with distance from center (tilt), the trail flag is
+suppressed.
 
 ### `trail_r_squared`
 

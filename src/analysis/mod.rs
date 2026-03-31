@@ -149,11 +149,11 @@ pub struct AnalysisResult {
     /// 0.0 = uniform (no trail), 1.0 = all stars aligned (strong trail).
     /// A threshold of 0.5 corresponds to R̄ ≈ 0.71 (strong coherence).
     pub trail_r_squared: f32,
-    /// True if the image is likely trailed, based on the Rayleigh test.
-    /// Fires when R̄² > threshold with significant p-value, or when R̄² > 0.15
-    /// with high median eccentricity (catches non-coherent guiding issues).
-    /// Requires ≥20 detected stars and FWHM ≥ 2.0 px (below this, pixel grid
-    /// quantization biases moment-based angles).
+    /// True if the image is likely trailed, based on the Rayleigh test on
+    /// PSF-fit stars. Fires when R̄² > threshold with significant p-value,
+    /// or when R̄² > 0.15 with high median eccentricity. Suppressed if the
+    /// elongation pattern is optical (radial coma or ecc-distance tilt gradient).
+    /// Requires ≥20 measured stars and FWHM ≥ 2.0 px.
     pub possibly_trailed: bool,
     /// Measured FWHM from adaptive two-pass detection (pixels).
     /// This is the FWHM used for the final matched filter kernel.
@@ -626,34 +626,9 @@ impl ImageAnalyzer {
         let bg_map_ref = bg_result.background_map.as_deref();
         let detection_threshold = self.config.detection_sigma * bg_result.noise;
 
-        // ── Trail detection (Rayleigh test on detection-stage moments) ────
-        // Uses 2θ doubling for axial orientation data. R̄² = squared mean
-        // resultant length; p ≈ exp(-n·R̄²) is the asymptotic Rayleigh p-value.
-        // Requires FWHM >= 2.0 px — below this, pixel grid quantization biases
-        // moment-based angles, creating artificial angular coherence.
-        let (trail_r_squared, possibly_trailed) = if detected.len() >= 20 && field_fwhm >= 2.0 {
-            let n = detected.len();
-            let (sum_cos, sum_sin) =
-                detected.iter().fold((0.0f64, 0.0f64), |(sc, ss), s| {
-                    let a = 2.0 * s.theta as f64;
-                    (sc + a.cos(), ss + a.sin())
-                });
-            let r_sq = (sum_cos * sum_cos + sum_sin * sum_sin) / (n as f64 * n as f64);
-            let p = (-(n as f64) * r_sq).exp();
-            let mut eccs: Vec<f32> = detected.iter().map(|s| s.eccentricity).collect();
-            eccs.sort_unstable_by(|a, b| a.total_cmp(b));
-            let median_ecc = if eccs.len() % 2 == 1 {
-                eccs[eccs.len() / 2]
-            } else {
-                (eccs[eccs.len() / 2 - 1] + eccs[eccs.len() / 2]) * 0.5
-            };
-            let threshold = self.config.trail_r_squared_threshold as f64;
-            let trailed = (r_sq > threshold && p < 0.01)       // strong angle coherence
-                || (r_sq > 0.15 && median_ecc > 0.7 && p < 0.05); // moderate coherence + high ecc
-            (r_sq as f32, trailed)
-        } else {
-            (0.0, false)
-        };
+        // Trail detection defaults — computed after PSF measurement (see below).
+        let mut trail_r_squared = 0.0_f32;
+        let mut possibly_trailed = false;
 
         let frame_snr = if bg_result.noise > 0.0 { bg_result.background / bg_result.noise } else { 0.0 };
 
@@ -757,12 +732,84 @@ impl ImageAnalyzer {
             return make_zero_result(stars_detected);
         }
 
+        // ── Trail detection (Rayleigh test on PSF-fit stars) ─────────────
+        // Uses PSF-fit theta and eccentricity (more accurate than detection moments).
+        // Requires FWHM >= 2.0 px (pixel grid quantization) and ≥20 measured stars.
+        if measured.len() >= 20 && field_fwhm >= 2.0 {
+            let n = measured.len();
+            let (sum_cos, sum_sin) =
+                measured.iter().fold((0.0f64, 0.0f64), |(sc, ss), s| {
+                    let a = 2.0 * s.theta as f64;
+                    (sc + a.cos(), ss + a.sin())
+                });
+            let r_sq = (sum_cos * sum_cos + sum_sin * sum_sin) / (n as f64 * n as f64);
+            let p = (-(n as f64) * r_sq).exp();
+            let mut eccs: Vec<f32> = measured.iter().map(|s| s.eccentricity).collect();
+            eccs.sort_unstable_by(|a, b| a.total_cmp(b));
+            let median_ecc = if eccs.len() % 2 == 1 {
+                eccs[eccs.len() / 2]
+            } else {
+                (eccs[eccs.len() / 2 - 1] + eccs[eccs.len() / 2]) * 0.5
+            };
+            let threshold = self.config.trail_r_squared_threshold as f64;
+            trail_r_squared = r_sq as f32;
+            possibly_trailed = (r_sq > threshold && p < 0.01)
+                || (r_sq > 0.15 && median_ecc > 0.7 && p < 0.05);
+
+            // ── Optical aberration suppression ───────────────────────────
+            // If Rayleigh fires, check if the elongation pattern is optical
+            // (coma/tilt) rather than parallel trailing.
+            if possibly_trailed {
+                // 1. Radial angle coherence (catches coma/field curvature):
+                //    If elongation angles point radially from image center,
+                //    it's optics, not trailing.
+                let cx_img = width as f64 / 2.0;
+                let cy_img = height as f64 / 2.0;
+                let (rad_cos, rad_sin) = measured.iter()
+                    .fold((0.0f64, 0.0f64), |(sc, ss), s| {
+                        let phi = (s.y as f64 - cy_img).atan2(s.x as f64 - cx_img);
+                        let delta = 2.0 * (s.theta as f64 - phi);
+                        (sc + delta.cos(), ss + delta.sin())
+                    });
+                let nf = n as f64;
+                let radial_r_sq = (rad_cos * rad_cos + rad_sin * rad_sin) / (nf * nf);
+                let radial_p = (-nf * radial_r_sq).exp();
+                if radial_r_sq > 0.15 && radial_p < 0.05 {
+                    possibly_trailed = false;
+                }
+            }
+            if possibly_trailed {
+                // 2. Eccentricity-distance correlation (catches tilt):
+                //    If eccentricity increases with distance from center,
+                //    it's a field-dependent optical effect, not trailing.
+                let cx_img = width as f32 / 2.0;
+                let cy_img = height as f32 / 2.0;
+                let nf = n as f64;
+                let (sum_d, sum_e) = measured.iter()
+                    .fold((0.0f64, 0.0f64), |(sd, se), s| {
+                        let d = ((s.x - cx_img).powi(2) + (s.y - cy_img).powi(2)).sqrt();
+                        (sd + d as f64, se + s.eccentricity as f64)
+                    });
+                let mean_d = sum_d / nf;
+                let mean_e = sum_e / nf;
+                let (mut cov, mut var_d, mut var_e) = (0.0f64, 0.0f64, 0.0f64);
+                for s in measured.iter() {
+                    let d = ((s.x - cx_img).powi(2) + (s.y - cy_img).powi(2)).sqrt() as f64;
+                    let dd = d - mean_d;
+                    let de = s.eccentricity as f64 - mean_e;
+                    cov += dd * de;
+                    var_d += dd * dd;
+                    var_e += de * de;
+                }
+                let denom = (var_d * var_e).sqrt();
+                if denom > 0.0 && cov / denom > 0.25 {
+                    possibly_trailed = false;
+                }
+            }
+        }
+
         // ── Stage 4: Metrics ─────────────────────────────────────────────
         let t = std::time::Instant::now();
-
-        // Trail detection uses only the Rayleigh test (Stage 1) on detection-stage
-        // angles.  High PSF eccentricity alone is NOT trailing — it can be optical
-        // aberration (coma, tilt) or wind shake without coherent direction.
 
         // FWHM & HFR: ecc ≤ 0.8 filter — elongated profiles inflate
         // geometric-mean FWHM. On trailed frames bypass it.

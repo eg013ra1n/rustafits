@@ -74,10 +74,12 @@ FITS / XISF File
        |
        v
 +-------------------------------+
-| Trail Detection (Stage 1)     |  Rayleigh test on position angles (2 theta)
+| Trail Detection                |  Rayleigh test on PSF-fit position angles (2 theta)
 | (image-level, advisory)       |  Dual-path: strong R^2 OR eccentricity-gated
 | -> trail_r_squared            |  Advisory only — never rejects, always continues
-| -> rayleigh_trailed flag      |  Computed on ALL detected candidates (min 20)
+| -> rayleigh_trailed flag      |  Computed on PSF-fit measured stars (min 20)
+|                               |  Optical aberration suppression: radial angle
+|                               |  test (coma) + ecc-distance correlation (tilt)
 +-------------------------------+
        |
        v
@@ -177,7 +179,7 @@ is advisory only.
 
 ### Rayleigh Test (before PSF measurement)
 
-Uses the Rayleigh test on doubled position angles (2θ) from detection-stage moments.
+Uses the Rayleigh test on doubled position angles (2θ) from PSF-fit stars.
 Requires ≥20 detected stars and FWHM ≥ 2.0 px (below this, pixel grid quantization
 biases moment-based angles). Two paths cover different regimes:
 
