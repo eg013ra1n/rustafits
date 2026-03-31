@@ -54,13 +54,13 @@ FITS / XISF File
 |                               |
 | Pass 1: Separable Gaussian    |  SIMD-accelerated convolution (AVX2/SSE2/NEON)
 |   convolution with FWHM=3.0   |  Zero-sum DAOFIND-style matched filter kernel
+|   + peak detection (parallel)  |  Row-parallel local max + neighbor count (rayon)
 |   + proximity blend rejection  |  Peaks within 2*FWHM: both rejected (blend)
-|   + neighbor count filter      |  Require 3+ neighbors above threshold
 | -> calibrate FWHM via Moffat  |  Free-beta Moffat on 100 brightest (see below)
 |                               |
 | Pass 2 (if FWHM differs >30%)|  Re-detect with calibrated FWHM kernel
 |   + sharpness filter          |  Rejects nebula knots, extended sources
-|   + concentration index       |  Flux(1σ)/Flux(3σ) ratio filter
+|   + concentration index       |  Flux(1σ)/Flux(3σ) ratio filter (parallel)
 |   + edge margin (2*FWHM)     |  Rejects truncated PSFs near borders
 +-------------------------------+
        |

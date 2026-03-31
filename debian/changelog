@@ -1,3 +1,11 @@
+rustafits (0.9.6-1) unstable; urgency=medium
+
+  * Parallelize star detection: peak detection loop (row-parallel),
+    NMS sort (par_sort), and post-NMS stamp/filter processing (par_iter)
+  * 20-36% faster detection on dense star fields (20k-40k stars)
+
+ -- Vilen Sharifov <vilen.sharifov@gmail.com>  Tue, 01 Apr 2026 12:00:00 +0300
+
 rustafits (0.9.5-1) unstable; urgency=medium
 
   * Skip Rayleigh trail test when FWHM < 2.0 px — pixel grid quantization

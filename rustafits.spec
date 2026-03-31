@@ -1,5 +1,5 @@
 Name:           rustafits
-Version:        0.9.5
+Version:        0.9.6
 Release:        1%{?dist}
 Summary:        High-performance FITS/XISF to JPEG converter with auto-stretch
 
@@ -44,6 +44,9 @@ Features:
 %{_bindir}/%{name}
 
 %changelog
+* Tue Apr 01 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.6-1
+- Parallelize star detection: peak detection, NMS sort, post-NMS filters (20-36% faster)
+
 * Sun Mar 30 2026 Vilen Sharifov <vilen.sharifov@gmail.com> - 0.9.5-1
 - Skip Rayleigh trail test when FWHM < 2.0 px (pixel grid quantization false positives)
 - Raise Path B thresholds (R² 0.05→0.15, ecc 0.6→0.7)

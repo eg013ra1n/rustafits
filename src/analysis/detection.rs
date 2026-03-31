@@ -1,5 +1,7 @@
 /// Star detection: DAOFIND-inspired matched filter + proximity blend rejection.
 
+use rayon::prelude::*;
+
 /// A detected star candidate before metric computation.
 #[derive(Clone)]
 pub struct DetectedStar {
@@ -77,45 +79,53 @@ pub fn detect_stars(
 
     // Peak detection: conv > threshold AND conv > all 8 neighbors
     // When noise_map is available, use local adaptive threshold per pixel.
-    let mut peaks: Vec<(usize, usize, f32)> = Vec::new();
-    for y in (radius + 1)..(height - radius - 1) {
-        for x in (radius + 1)..(width - radius - 1) {
-            let c = conv[y * width + x];
-            let local_threshold = if let Some(nm) = noise_map {
-                params.detection_sigma * nm[y * width + x] * kernel_energy_sq.sqrt()
-            } else {
-                threshold
-            };
-            if c <= local_threshold {
-                continue;
-            }
-            // 8-neighbor comparison + minimum neighbor count above threshold.
-            // Requiring ≥3 neighbors above threshold rejects isolated noise peaks
-            // while keeping real stars (which have extended PSF wings).
-            let neighbors = [
-                conv[(y - 1) * width + x - 1],
-                conv[(y - 1) * width + x],
-                conv[(y - 1) * width + x + 1],
-                conv[y * width + x - 1],
-                conv[y * width + x + 1],
-                conv[(y + 1) * width + x - 1],
-                conv[(y + 1) * width + x],
-                conv[(y + 1) * width + x + 1],
-            ];
-            let is_max = neighbors.iter().all(|&v| c > v);
-            if is_max {
-                let above = neighbors.iter().filter(|&&v| v > local_threshold).count();
-                if above >= 3 {
-                    peaks.push((x, y, c));
+    // Parallelized over rows — each row reads only y-1, y, y+1 from read-only conv.
+    let y_start = radius + 1;
+    let y_end = height - radius - 1;
+    let x_start = radius + 1;
+    let x_end = width - radius - 1;
+
+    let conv_ref = conv.as_slice();
+    let mut peaks: Vec<(usize, usize, f32)> = (y_start..y_end)
+        .into_par_iter()
+        .flat_map_iter(|y| {
+            (x_start..x_end).filter_map(move |x| {
+                let c = conv_ref[y * width + x];
+                let local_threshold = if let Some(nm) = noise_map {
+                    params.detection_sigma * nm[y * width + x] * kernel_energy_sq.sqrt()
+                } else {
+                    threshold
+                };
+                if c <= local_threshold {
+                    return None;
                 }
-            }
-        }
-    }
+                // 8-neighbor comparison + minimum neighbor count above threshold.
+                // Requiring ≥3 neighbors above threshold rejects isolated noise peaks
+                // while keeping real stars (which have extended PSF wings).
+                let neighbors = [
+                    conv_ref[(y - 1) * width + x - 1],
+                    conv_ref[(y - 1) * width + x],
+                    conv_ref[(y - 1) * width + x + 1],
+                    conv_ref[y * width + x - 1],
+                    conv_ref[y * width + x + 1],
+                    conv_ref[(y + 1) * width + x - 1],
+                    conv_ref[(y + 1) * width + x],
+                    conv_ref[(y + 1) * width + x + 1],
+                ];
+                let is_max = neighbors.iter().all(|&v| c > v);
+                if !is_max {
+                    return None;
+                }
+                let above = neighbors.iter().filter(|&&v| v > local_threshold).count();
+                if above >= 3 { Some((x, y, c)) } else { None }
+            })
+        })
+        .collect();
 
     // Non-maximum suppression using spatial hashing.
     // Suppression radius = measurement stamp radius (max(8, 4σ+1)) so sidelobes
     // are removed before blend detection (which rejects both peaks unconditionally).
-    peaks.sort_by(|a, b| b.2.total_cmp(&a.2));
+    peaks.par_sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
     let nms_sigma = fwhm / 2.3548;
     let nms_blend_r = (4.0 * nms_sigma + 2.0).max(9.0).ceil() as usize;
     let sup_radius = radius.max(nms_blend_r);
@@ -211,13 +221,14 @@ pub fn detect_stars(
 
     // Process non-blended peaks via stamp-based metrics.
     // Stamp radius = 1×FWHM (smaller than blend_radius to avoid neighbor contamination).
+    // Parallelized — each star's stamp metrics and filters read only from data/conv/bg_map.
     let stamp_r = ((1.5 * fwhm).ceil() as i32).max(3);
-    let mut stars = Vec::new();
-    for (i, &(px, py, _conv_val)) in peak_positions.iter().enumerate() {
-        if blended[i] { continue; }
-        if let Some(star) = process_peak_stamp(
-            px, py, stamp_r, data, width, height, background, bg_map, params,
-        ) {
+    let mut stars: Vec<DetectedStar> = peak_positions.par_iter().enumerate()
+        .filter(|(i, _)| !blended[*i])
+        .filter_map(|(_, &(px, py, _conv_val))| {
+            let star = process_peak_stamp(
+                px, py, stamp_r, data, width, height, background, bg_map, params,
+            )?;
             // ── Pass 2 filters (when field_fwhm is provided) ──
             if let Some(ff) = field_fwhm {
                 // 1. Sharpness
@@ -235,7 +246,7 @@ pub fn detect_stars(
                             + conv[(py + 1) * width + px + 1];
                         let sharpness = (cp - neighbors_sum / 8.0) / cp;
                         if sharpness < 0.1 || sharpness > 0.9 {
-                            continue;
+                            return None;
                         }
                     }
                 }
@@ -270,7 +281,7 @@ pub fn detect_stars(
                 if flux_outer > 0.0 {
                     let ci = flux_inner / flux_outer;
                     if ci < 0.15 || ci > 0.75 {
-                        continue;
+                        return None;
                     }
                 }
 
@@ -280,13 +291,13 @@ pub fn detect_stars(
                     || star.x > (width as f32 - margin)
                     || star.y > (height as f32 - margin)
                 {
-                    continue;
+                    return None;
                 }
             }
 
-            stars.push(star);
-        }
-    }
+            Some(star)
+        })
+        .collect();
 
     // Post-detection centroid dedup: belt-and-suspenders safety net catches any
     // remaining duplicates from NMS edge cases.
