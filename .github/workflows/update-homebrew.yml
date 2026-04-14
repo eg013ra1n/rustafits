@@ -37,6 +37,8 @@ jobs:
             sha256 "${{ env.sha256 }}"
             license "Apache-2.0"
 
+            depends_on "cmake" => :build
+            depends_on "nasm" => :build
             depends_on "rust" => :build
 
             def install
