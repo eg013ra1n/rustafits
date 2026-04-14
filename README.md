@@ -12,6 +12,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
 - **Image Analysis**: Two-pass Moffat-primary PSF calibration with adaptive moments screening, star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MAD noise estimation (optional MRS wavelet)
+- **Fast Star Detection**: Lean single-pass detector that skips PSF fitting, SNR photometry, and trail detection — intended for pipelines that only need `(x, y, flux)` centroids (blind plate solving, quick previews). Runs in ~300–500 ms on a full-frame image vs. seconds for the precise analyzer
 - **JPEG via libjpeg-turbo**: SIMD-accelerated JPEG encoding (NEON on aarch64, AVX2 on x86_64) via turbojpeg
 - **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
 
@@ -159,6 +160,62 @@ fixed-beta Moffat to all detected stars with Gaussian and moments fallbacks. Bac
 uses parallelized mesh-grid with auto-tuned cell size and MAD noise estimation (MRS wavelet
 available via `with_mrs_layers(4)`). OSC/Bayer images are green-interpolated before
 detection and PSF fitting.
+
+### Fast star detection
+
+When you only need rough `(x, y, flux)` centroids — e.g. for blind plate solving, quick
+previews, or any quad-hash matching pipeline — `detect_fast` skips everything the precise
+analyzer does after the first detection pass. No PSF calibration, no Levenberg–Marquardt
+Moffat fitting, no SNR photometry, no trail detection. On a full-frame (~26 Mpx) image this
+drops star detection from ~5–6 s to ~300–500 ms in release builds. Centroid accuracy is
+pass-1 (intensity-weighted, typically ~0.3–0.5 px) — fine for quad matching, insufficient
+for stacking registration.
+
+```rust
+use astroimage::ImageAnalyzer;
+
+let result = ImageAnalyzer::new()
+    .with_detection_sigma(5.0)
+    .with_max_stars(500)
+    .detect_fast("light.fits")?;
+
+println!("{} stars in {:.0} ms ({}x{})",
+    result.stars.len(),
+    result.timing.total_ms,
+    result.width,
+    result.height);
+
+for s in result.stars.iter().take(10) {
+    println!("  ({:.2}, {:.2}) flux={:.0}", s.x, s.y, s.flux);
+}
+```
+
+All three entry-point variants mirror the precise pipeline's:
+
+| Method | Input | Use case |
+|--------|-------|----------|
+| `detect_fast(path)` | FITS / XISF file | Most common entry point |
+| `detect_fast_data(&[f32], w, h, channels)` | Pre-loaded planar f32 | You already decoded pixels elsewhere |
+| `detect_fast_raw(&ImageMetadata, &PixelData)` | Read-but-not-converted | Skip file I/O while keeping u16→f32 + debayer internal |
+
+All three honor the same `ImageAnalyzer` builder settings as `analyze` —
+`with_detection_sigma`, `with_max_stars`, `with_min_star_area`, `with_max_star_area`,
+`with_saturation_fraction`, `without_debayer`, and `with_thread_pool`. Settings related
+to the PSF fit (`with_measure_cap`, `with_fit_max_iter`, `with_fit_tolerance`,
+`with_mrs_layers`, `with_trail_threshold`, `with_optics`) are simply ignored because
+those stages don't run.
+
+Pipeline stages in the fast path:
+
+1. OSC green interpolation (for Bayer frames, same as `analyze`)
+2. Luminance extraction if `channels == 3`
+3. `estimate_background_mesh` (parallelized, MAD noise — MRS wavelet is never called)
+4. Single matched-filter pass of `detect_stars` with fixed FWHM = 3.0 px
+5. Sort by flux descending, truncate to `max_stars`, pack into `FastStar`
+
+**When to use which**: if you need FWHM, eccentricity, SNR, HFR, per-star fit quality,
+or trail detection, use `analyze`. If you only need positions and brightness ordering
+(quad matching, hash lookup, quick counts), use `detect_fast` and take the ~10× speedup.
 
 ### Batch analysis
 
@@ -335,6 +392,37 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 | `snr_ms` | f64 | Per-star SNR computation |
 | `statistics_ms` | f64 | Statistics aggregation |
 | `total_ms` | f64 | Total pipeline wall time |
+
+### FastAnalysisResult fields
+
+Returned by `ImageAnalyzer::detect_fast*`. Lean result type — only what blind plate
+solving and similar pipelines need.
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `width`, `height` | usize | pixels | Image dimensions (after debayer if applicable) |
+| `stars` | Vec\<FastStar\> | — | Stars sorted by flux descending, capped at `max_stars` |
+| `background` | f32 | ADU | Global background level from the mesh estimator |
+| `noise` | f32 | ADU | Background noise sigma (MAD, no MRS wavelet) |
+| `timing` | FastDetectTiming | ms | Per-stage timing breakdown |
+
+### FastStar fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `x`, `y` | f32 | pixels | Intensity-weighted centroid (subpixel, pass-1 accuracy) |
+| `peak` | f32 | ADU | Background-subtracted peak value |
+| `flux` | f32 | ADU | Background-subtracted total flux |
+
+### FastDetectTiming fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `read_ms` | f64 | File I/O (0.0 for `detect_fast_data` / `detect_fast_raw`) |
+| `prep_ms` | f64 | f32 conversion + OSC green interpolation + luminance extraction |
+| `background_ms` | f64 | Mesh-grid background and noise estimation |
+| `detection_ms` | f64 | Single-pass matched-filter detection |
+| `total_ms` | f64 | Wall clock from entry to return |
 
 ### Multi-image concurrent processing
 

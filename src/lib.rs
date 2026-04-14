@@ -10,10 +10,14 @@ pub mod formats;
 mod formats;
 mod output;
 mod pipeline;
+pub mod platesolving;
 mod processing;
 mod types;
 
-pub use analysis::{AnalysisConfig, AnalysisResult, FitMethod, ImageAnalyzer, StageTiming, StarMetrics};
+pub use analysis::{
+    AnalysisConfig, AnalysisResult, FastAnalysisResult, FastDetectTiming, FastStar, FitMethod,
+    ImageAnalyzer, StageTiming, StarMetrics,
+};
 pub use annotate::{
     annotate_image, compute_annotations, create_annotation_layer, AnnotationConfig, ColorScheme,
     StarAnnotation,

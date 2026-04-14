@@ -182,6 +182,59 @@ pub struct AnalysisResult {
     pub stage_timing: StageTiming,
 }
 
+/// A rough star detection result: position + flux only, no PSF metrics.
+///
+/// Produced by [`ImageAnalyzer::detect_fast`] and friends. Intended for
+/// pipelines (blind plate solving, quick previews) that only need `(x, y, flux)`
+/// and can tolerate pass-1-only centroid accuracy (~0.3–0.5 px).
+#[derive(Clone, Debug)]
+pub struct FastStar {
+    /// Intensity-weighted centroid X (subpixel, from pass-1 detection).
+    pub x: f32,
+    /// Intensity-weighted centroid Y (subpixel, from pass-1 detection).
+    pub y: f32,
+    /// Background-subtracted peak value (ADU).
+    pub peak: f32,
+    /// Background-subtracted total flux (ADU).
+    pub flux: f32,
+}
+
+/// Per-stage timing breakdown for the fast detection pipeline.
+#[derive(Clone, Debug, Default)]
+pub struct FastDetectTiming {
+    /// File I/O (0.0 for data/raw entry points).
+    pub read_ms: f64,
+    /// f32 conversion + OSC green interpolation + luminance extraction.
+    pub prep_ms: f64,
+    /// Mesh-grid background & noise estimation (no MRS wavelet).
+    pub background_ms: f64,
+    /// Single-pass matched-filter detection.
+    pub detection_ms: f64,
+    /// Wall clock from entry to return.
+    pub total_ms: f64,
+}
+
+/// Lean analysis result from the fast detector.
+///
+/// Contains only what blind plate solving needs: image dimensions, a
+/// flux-sorted list of rough star centroids, and the background estimate
+/// used to threshold them.
+#[derive(Clone, Debug)]
+pub struct FastAnalysisResult {
+    /// Image width (after debayer if applicable).
+    pub width: usize,
+    /// Image height (after debayer if applicable).
+    pub height: usize,
+    /// Stars sorted by flux descending, capped at `max_stars`.
+    pub stars: Vec<FastStar>,
+    /// Global background level (ADU).
+    pub background: f32,
+    /// Background noise sigma (ADU).
+    pub noise: f32,
+    /// Per-stage timing breakdown.
+    pub timing: FastDetectTiming,
+}
+
 /// Builder configuration for analysis (internal).
 pub struct AnalysisConfig {
     detection_sigma: f32,
@@ -422,6 +475,112 @@ impl ImageAnalyzer {
             Some(pool) => pool.install(do_batch),
             None => do_batch(),
         }
+    }
+
+    /// Fast star detection from a FITS/XISF file.
+    ///
+    /// Runs the matched-filter detector once (no PSF calibration, no LM Moffat
+    /// fitting, no SNR photometry, no trail detection). Produces rough
+    /// `(x, y, flux)` centroids with pass-1 accuracy in ~300–500 ms on a
+    /// full-frame image. Intended for pipelines that only need positions and
+    /// brightness ordering, such as blind plate solving.
+    ///
+    /// For per-star PSF metrics (FWHM, eccentricity, SNR, HFR, beta) use
+    /// [`ImageAnalyzer::analyze`] instead.
+    pub fn detect_fast<P: AsRef<Path>>(&self, path: P) -> Result<FastAnalysisResult> {
+        let path = path.as_ref();
+        match &self.thread_pool {
+            Some(pool) => pool.install(|| self.detect_fast_impl(path)),
+            None => self.detect_fast_impl(path),
+        }
+    }
+
+    /// Fast detection from pre-loaded planar f32 pixel data.
+    ///
+    /// `data`: planar f32 pixel data (for 3-channel: RRRGGGBBB layout).
+    /// See [`ImageAnalyzer::detect_fast`] for pipeline details.
+    pub fn detect_fast_data(
+        &self,
+        data: &[f32],
+        width: usize,
+        height: usize,
+        channels: usize,
+    ) -> Result<FastAnalysisResult> {
+        match &self.thread_pool {
+            Some(pool) => pool.install(|| {
+                self.run_fast_detection(data, width, height, channels)
+            }),
+            None => self.run_fast_detection(data, width, height, channels),
+        }
+    }
+
+    /// Fast detection from pre-read raw pixel data (skips file I/O).
+    ///
+    /// Accepts `ImageMetadata` and borrows `PixelData`, handling u16→f32
+    /// conversion and green-channel interpolation for OSC images internally.
+    pub fn detect_fast_raw(
+        &self,
+        meta: &ImageMetadata,
+        pixels: &PixelData,
+    ) -> Result<FastAnalysisResult> {
+        match &self.thread_pool {
+            Some(pool) => pool.install(|| self.detect_fast_raw_impl(meta, pixels)),
+            None => self.detect_fast_raw_impl(meta, pixels),
+        }
+    }
+
+    fn detect_fast_impl(&self, path: &Path) -> Result<FastAnalysisResult> {
+        let t_read = std::time::Instant::now();
+        let (meta, pixel_data) =
+            formats::read_image(path).context("Failed to read image for fast detection")?;
+        let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+
+        let f32_data = match pixel_data {
+            PixelData::Float32(d) => d,
+            PixelData::Uint16(d) => u16_to_f32(&d),
+        };
+
+        let mut data = f32_data;
+        let width = meta.width;
+        let height = meta.height;
+        let channels = meta.channels;
+
+        if self.config.apply_debayer
+            && meta.bayer_pattern != BayerPattern::None
+            && channels == 1
+        {
+            data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
+        }
+
+        let mut result = self.run_fast_detection(&data, width, height, channels)?;
+        result.timing.read_ms = read_ms;
+        result.timing.total_ms += read_ms;
+        Ok(result)
+    }
+
+    fn detect_fast_raw_impl(
+        &self,
+        meta: &ImageMetadata,
+        pixels: &PixelData,
+    ) -> Result<FastAnalysisResult> {
+        let f32_data = match pixels {
+            PixelData::Float32(d) => std::borrow::Cow::Borrowed(d.as_slice()),
+            PixelData::Uint16(d) => std::borrow::Cow::Owned(u16_to_f32(d)),
+        };
+
+        let mut data = f32_data.into_owned();
+        let width = meta.width;
+        let height = meta.height;
+        let channels = meta.channels;
+
+        if self.config.apply_debayer
+            && meta.bayer_pattern != BayerPattern::None
+            && channels == 1
+        {
+            data = debayer::interpolate_green_f32(&data, width, height, meta.bayer_pattern);
+        }
+
+        self.run_fast_detection(&data, width, height, channels)
     }
 
     fn analyze_raw_impl(
@@ -916,6 +1075,91 @@ impl ImageAnalyzer {
             },
         })
     }
+
+    /// Fast detection pipeline — strips PSF calibration, pass-2 detection,
+    /// per-star LM Moffat fitting, SNR photometry, trail detection, and
+    /// statistics. Only runs the stages blind plate solving needs:
+    /// luminance extraction → mesh background → single-pass `detect_stars`
+    /// → sort/truncate by flux.
+    fn run_fast_detection(
+        &self,
+        data: &[f32],
+        width: usize,
+        height: usize,
+        channels: usize,
+    ) -> Result<FastAnalysisResult> {
+        let pipeline_start = std::time::Instant::now();
+
+        let t_prep = std::time::Instant::now();
+        let lum = if channels == 3 {
+            extract_luminance(data, width, height)
+        } else {
+            data[..width * height].to_vec()
+        };
+        let prep_ms = t_prep.elapsed().as_secs_f64() * 1000.0;
+
+        let det_params = DetectionParams {
+            detection_sigma: self.config.detection_sigma,
+            min_star_area: self.config.min_star_area,
+            max_star_area: self.config.max_star_area,
+            saturation_limit: self.config.saturation_fraction * 65535.0,
+        };
+
+        // ── Background (mesh grid, MAD noise only; MRS wavelet explicitly skipped) ──
+        let t_bg = std::time::Instant::now();
+        let cell_size = background::auto_cell_size(width, height);
+        let bg_result = background::estimate_background_mesh(&lum, width, height, cell_size);
+        let background_ms = t_bg.elapsed().as_secs_f64() * 1000.0;
+
+        // ── Single-pass detection with fixed FWHM=3.0 (no calibration, no pass 2) ──
+        let t_det = std::time::Instant::now();
+        let initial_fwhm = 3.0_f32;
+        let mut detected = detection::detect_stars(
+            &lum,
+            width,
+            height,
+            bg_result.background,
+            bg_result.noise,
+            bg_result.background_map.as_deref(),
+            bg_result.noise_map.as_deref(),
+            &det_params,
+            initial_fwhm,
+            None,
+        );
+        let detection_ms = t_det.elapsed().as_secs_f64() * 1000.0;
+
+        // Sort by flux descending, truncate to max_stars, pack into FastStar.
+        detected.sort_by(|a, b| b.flux.partial_cmp(&a.flux).unwrap_or(std::cmp::Ordering::Equal));
+        if detected.len() > self.config.max_stars {
+            detected.truncate(self.config.max_stars);
+        }
+        let stars: Vec<FastStar> = detected
+            .into_iter()
+            .map(|s| FastStar {
+                x: s.x,
+                y: s.y,
+                peak: s.peak,
+                flux: s.flux,
+            })
+            .collect();
+
+        let total_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+
+        Ok(FastAnalysisResult {
+            width,
+            height,
+            stars,
+            background: bg_result.background,
+            noise: bg_result.noise,
+            timing: FastDetectTiming {
+                read_ms: 0.0,
+                prep_ms,
+                background_ms,
+                detection_ms,
+                total_ms,
+            },
+        })
+    }
 }
 
 impl Default for ImageAnalyzer {
@@ -1206,5 +1450,114 @@ mod tests {
         let wts = [1.0_f32; 6];
         let scwm = sigma_clipped_weighted_median(&vals, &wts);
         assert!(scwm < 4.0, "Outlier should be clipped, got {}", scwm);
+    }
+
+    /// Build a synthetic mono f32 image with Gaussian stars at known positions.
+    /// Background is flat (100 ADU) + Gaussian noise; peak is added on top.
+    fn make_synthetic_field(
+        width: usize,
+        height: usize,
+        stars: &[(f32, f32, f32)], // (cx, cy, peak)
+        sigma: f32,
+        bg: f32,
+    ) -> Vec<f32> {
+        let mut img = vec![bg; width * height];
+        // Deterministic low-amplitude noise so the test is reproducible.
+        for (i, px) in img.iter_mut().enumerate() {
+            let r = ((i.wrapping_mul(2654435761)) & 0xffff) as f32 / 65535.0 - 0.5;
+            *px += r * 10.0;
+        }
+        let radius = (4.0 * sigma).ceil() as i32;
+        for &(cx, cy, peak) in stars {
+            let ix = cx.round() as i32;
+            let iy = cy.round() as i32;
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    let x = ix + dx;
+                    let y = iy + dy;
+                    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                        continue;
+                    }
+                    let rx = x as f32 - cx;
+                    let ry = y as f32 - cy;
+                    let g = peak * (-(rx * rx + ry * ry) / (2.0 * sigma * sigma)).exp();
+                    img[y as usize * width + x as usize] += g;
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn test_fast_detect_synthetic_field() {
+        let width = 256;
+        let height = 256;
+        // 10 stars at known subpixel positions, well separated, varying brightness.
+        let truth: [(f32, f32, f32); 10] = [
+            (32.3, 41.7, 12000.0),
+            (78.1, 50.5, 9000.0),
+            (128.6, 30.2, 14000.0),
+            (200.0, 40.9, 6000.0),
+            (50.8, 120.4, 11000.0),
+            (130.1, 140.7, 8000.0),
+            (210.5, 130.3, 10000.0),
+            (60.2, 200.9, 7000.0),
+            (150.6, 210.4, 13000.0),
+            (220.8, 220.1, 5500.0),
+        ];
+        let sigma = 1.8_f32; // FWHM ≈ 4.2 px
+        let img = make_synthetic_field(width, height, &truth, sigma, 100.0);
+
+        let analyzer = ImageAnalyzer::new()
+            .with_detection_sigma(5.0)
+            .with_max_stars(50)
+            .with_min_star_area(3);
+
+        let result = analyzer
+            .detect_fast_data(&img, width, height, 1)
+            .expect("fast detection succeeds on synthetic field");
+
+        assert_eq!(result.width, width);
+        assert_eq!(result.height, height);
+        assert!(
+            result.stars.len() >= truth.len(),
+            "expected >= {} detections, got {}",
+            truth.len(),
+            result.stars.len()
+        );
+
+        // For every injected star, a detection must be within 0.5 px.
+        let mut matched = 0usize;
+        for &(tx, ty, _) in &truth {
+            let best = result
+                .stars
+                .iter()
+                .map(|s| {
+                    let dx = s.x - tx;
+                    let dy = s.y - ty;
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                best < 0.5,
+                "truth ({:.2},{:.2}) has no detection within 0.5 px (nearest {:.3})",
+                tx, ty, best
+            );
+            matched += 1;
+        }
+        assert_eq!(matched, truth.len());
+
+        // Flux ordering: brightest injected star should be #1 or #2.
+        let brightest_truth = truth
+            .iter()
+            .cloned()
+            .fold(truth[0], |a, b| if b.2 > a.2 { b } else { a });
+        let top = &result.stars[0];
+        let dx = top.x - brightest_truth.0;
+        let dy = top.y - brightest_truth.1;
+        assert!(
+            (dx * dx + dy * dy).sqrt() < 1.5,
+            "brightest detection should be near the brightest truth"
+        );
     }
 }
