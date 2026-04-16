@@ -11,7 +11,7 @@ Rust toolchain only — no system dependencies needed (pure Rust).
 ### Apple Silicon (M1/M2/M3/M4)
 
 ```bash
-cargo build --release
+cargo build --release --all-features
 cd target/release
 tar czf rustafits-macos-aarch64.tar.gz rustafits
 shasum -a 256 rustafits-macos-aarch64.tar.gz > rustafits-macos-aarch64.tar.gz.sha256
@@ -23,7 +23,7 @@ If you're on Apple Silicon but want to build for Intel:
 
 ```bash
 rustup target add x86_64-apple-darwin
-cargo build --release --target x86_64-apple-darwin
+cargo build --release --all-features --target x86_64-apple-darwin
 cd target/x86_64-apple-darwin/release
 tar czf rustafits-macos-x86_64.tar.gz rustafits
 shasum -a 256 rustafits-macos-x86_64.tar.gz > rustafits-macos-x86_64.tar.gz.sha256
@@ -32,7 +32,7 @@ shasum -a 256 rustafits-macos-x86_64.tar.gz > rustafits-macos-x86_64.tar.gz.sha2
 If you're on Intel Mac:
 
 ```bash
-cargo build --release
+cargo build --release --all-features
 cd target/release
 tar czf rustafits-macos-x86_64.tar.gz rustafits
 shasum -a 256 rustafits-macos-x86_64.tar.gz > rustafits-macos-x86_64.tar.gz.sha256
