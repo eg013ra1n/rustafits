@@ -225,34 +225,28 @@ pub fn fit_affine_from_centers(matches: &[QuadMatch]) -> Option<AffineTransform>
         return None;
     }
 
-    // Build least squares: A * params = b
-    // For X: [x, y, 1] * [a1, b1, c1] = Xref
-    // For Y: [x, y, 1] * [a2, b2, c2] = Yref
-    let mut a_mat_x = DMatrix::zeros(n, 3);
+    // Build design matrix A (n×3) and targets (n-vectors) for the pair
+    // [x, y, 1] · [a, b, c]ᵀ = target. Solve via SVD pseudo-inverse instead
+    // of normal-equation LU: the condition number of AᵀA is the SQUARE of
+    // A's, so LU on AᵀA is numerically unstable whenever points are
+    // near-collinear. SVD degrades gracefully and returns the minimum-norm
+    // solution even in rank-deficient cases.
+    let mut a_mat = DMatrix::zeros(n, 3);
     let mut b_vec_x = DVector::zeros(n);
-    let mut a_mat_y = DMatrix::zeros(n, 3);
     let mut b_vec_y = DVector::zeros(n);
 
     for (i, m) in matches.iter().enumerate() {
-        a_mat_x[(i, 0)] = m.image_center.0;
-        a_mat_x[(i, 1)] = m.image_center.1;
-        a_mat_x[(i, 2)] = 1.0;
+        a_mat[(i, 0)] = m.image_center.0;
+        a_mat[(i, 1)] = m.image_center.1;
+        a_mat[(i, 2)] = 1.0;
         b_vec_x[i] = m.catalog_center.0;
-
-        a_mat_y[(i, 0)] = m.image_center.0;
-        a_mat_y[(i, 1)] = m.image_center.1;
-        a_mat_y[(i, 2)] = 1.0;
         b_vec_y[i] = m.catalog_center.1;
     }
 
-    // Solve normal equations
-    let ata_x = a_mat_x.transpose() * &a_mat_x;
-    let atb_x = a_mat_x.transpose() * &b_vec_x;
-    let params_x = ata_x.lu().solve(&atb_x)?;
-
-    let ata_y = a_mat_y.transpose() * &a_mat_y;
-    let atb_y = a_mat_y.transpose() * &b_vec_y;
-    let params_y = ata_y.lu().solve(&atb_y)?;
+    let svd = a_mat.clone().svd(true, true);
+    let eps = 1e-12;
+    let params_x = svd.solve(&b_vec_x, eps).ok()?;
+    let params_y = svd.solve(&b_vec_y, eps).ok()?;
 
     let transform = AffineTransform {
         a1: params_x[0],
@@ -263,14 +257,16 @@ pub fn fit_affine_from_centers(matches: &[QuadMatch]) -> Option<AffineTransform>
         c2: params_y[2],
     };
 
-    // Sanity check: X and Y scales must be similar
+    // Sanity: X/Y axis scales should match to within ~5%. Real pinhole
+    // optics have essentially no aspect skew; the old 0.8–1.2 band let
+    // through badly-conditioned fits.
     let scale_x_sq = transform.a1 * transform.a1 + transform.b1 * transform.b1;
     let scale_y_sq = transform.a2 * transform.a2 + transform.b2 * transform.b2;
     if scale_y_sq < 1e-30 {
         return None;
     }
     let ratio = scale_x_sq / scale_y_sq;
-    if ratio < 0.8 || ratio > 1.2 {
+    if !(0.9..=1.1).contains(&ratio) {
         return None;
     }
 
