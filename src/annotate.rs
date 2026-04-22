@@ -1,5 +1,4 @@
 /// Star annotation overlay: draws detected-star ellipses onto converted images.
-
 use crate::analysis::AnalysisResult;
 use crate::types::ProcessedImage;
 
@@ -112,7 +111,11 @@ pub fn compute_annotations(
             let color = star_color(config, star.eccentricity, star.fwhm, result.median_fwhm);
 
             // Y-flip reflects through the horizontal axis, negating the angle.
-            let theta = if flip_vertical { -star.theta } else { star.theta };
+            let theta = if flip_vertical {
+                -star.theta
+            } else {
+                star.theta
+            };
 
             StarAnnotation {
                 x: x_out,
@@ -139,7 +142,8 @@ pub fn create_annotation_layer(
     config: &AnnotationConfig,
 ) -> Vec<u8> {
     let mut layer = vec![0u8; output_width * output_height * 4];
-    let annotations = compute_annotations(result, output_width, output_height, flip_vertical, config);
+    let annotations =
+        compute_annotations(result, output_width, output_height, flip_vertical, config);
     let lw = config.line_width;
 
     for ann in &annotations {
@@ -182,7 +186,15 @@ pub fn annotate_image(
 
 /// Bounds-checked single pixel write on an RGB/RGBA buffer.
 #[inline]
-fn set_pixel_one(buf: &mut [u8], width: usize, height: usize, bpp: usize, x: i32, y: i32, color: [u8; 3]) {
+fn set_pixel_one(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    bpp: usize,
+    x: i32,
+    y: i32,
+    color: [u8; 3],
+) {
     if x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < height {
         let idx = (y as usize * width + x as usize) * bpp;
         buf[idx] = color[0];
@@ -206,7 +218,16 @@ fn set_pixel_one_rgba(buf: &mut [u8], width: usize, height: usize, x: i32, y: i3
 /// Thick pixel write: draws a kernel around (x,y).
 /// lw=1: single pixel, lw=2: 3px cross (+), lw>=3: 5px diamond.
 #[inline]
-fn set_pixel(buf: &mut [u8], width: usize, height: usize, bpp: usize, x: i32, y: i32, color: [u8; 3], lw: u8) {
+fn set_pixel(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    bpp: usize,
+    x: i32,
+    y: i32,
+    color: [u8; 3],
+    lw: u8,
+) {
     set_pixel_one(buf, width, height, bpp, x, y, color);
     if lw >= 2 {
         set_pixel_one(buf, width, height, bpp, x - 1, y, color);
@@ -224,7 +245,15 @@ fn set_pixel(buf: &mut [u8], width: usize, height: usize, bpp: usize, x: i32, y:
 
 /// Thick pixel write on RGBA buffer.
 #[inline]
-fn set_pixel_rgba(buf: &mut [u8], width: usize, height: usize, x: i32, y: i32, color: [u8; 3], lw: u8) {
+fn set_pixel_rgba(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    color: [u8; 3],
+    lw: u8,
+) {
     set_pixel_one_rgba(buf, width, height, x, y, color);
     if lw >= 2 {
         set_pixel_one_rgba(buf, width, height, x - 1, y, color);
@@ -241,7 +270,18 @@ fn set_pixel_rgba(buf: &mut [u8], width: usize, height: usize, x: i32, y: i32, c
 }
 
 /// Bresenham line drawing on an RGB/RGBA buffer with thickness.
-fn draw_line(buf: &mut [u8], width: usize, height: usize, bpp: usize, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 3], lw: u8) {
+fn draw_line(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    bpp: usize,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: [u8; 3],
+    lw: u8,
+) {
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
@@ -257,12 +297,16 @@ fn draw_line(buf: &mut [u8], width: usize, height: usize, bpp: usize, x0: i32, y
         }
         let e2 = 2 * err;
         if e2 >= dy {
-            if x == x1 { break; }
+            if x == x1 {
+                break;
+            }
             err += dy;
             x += sx;
         }
         if e2 <= dx {
-            if y == y1 { break; }
+            if y == y1 {
+                break;
+            }
             err += dx;
             y += sy;
         }
@@ -270,7 +314,17 @@ fn draw_line(buf: &mut [u8], width: usize, height: usize, bpp: usize, x0: i32, y
 }
 
 /// Bresenham line drawing on an RGBA buffer with thickness.
-fn draw_line_rgba(buf: &mut [u8], width: usize, height: usize, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 3], lw: u8) {
+fn draw_line_rgba(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: [u8; 3],
+    lw: u8,
+) {
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
@@ -286,12 +340,16 @@ fn draw_line_rgba(buf: &mut [u8], width: usize, height: usize, x0: i32, y0: i32,
         }
         let e2 = 2 * err;
         if e2 >= dy {
-            if x == x1 { break; }
+            if x == x1 {
+                break;
+            }
             err += dy;
             x += sx;
         }
         if e2 <= dx {
-            if y == y1 { break; }
+            if y == y1 {
+                break;
+            }
             err += dx;
             y += sy;
         }
@@ -299,7 +357,14 @@ fn draw_line_rgba(buf: &mut [u8], width: usize, height: usize, x0: i32, y0: i32,
 }
 
 /// Draw a rotated ellipse by sampling parametric points and connecting with lines.
-fn draw_ellipse_rgb(buf: &mut [u8], width: usize, height: usize, bpp: usize, ann: &StarAnnotation, lw: u8) {
+fn draw_ellipse_rgb(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    bpp: usize,
+    ann: &StarAnnotation,
+    lw: u8,
+) {
     let steps = 64;
     let (ct, st) = (ann.theta.cos(), ann.theta.sin());
     let mut prev_x = 0i32;
@@ -315,7 +380,9 @@ fn draw_ellipse_rgb(buf: &mut [u8], width: usize, height: usize, bpp: usize, ann
         let py = ry.round() as i32;
 
         if i > 0 {
-            draw_line(buf, width, height, bpp, prev_x, prev_y, px, py, ann.color, lw);
+            draw_line(
+                buf, width, height, bpp, prev_x, prev_y, px, py, ann.color, lw,
+            );
         }
         prev_x = px;
         prev_y = py;
@@ -347,7 +414,14 @@ fn draw_ellipse_rgba(buf: &mut [u8], width: usize, height: usize, ann: &StarAnno
 }
 
 /// Draw a direction tick extending from the ellipse edge along theta.
-fn draw_direction_tick_rgb(buf: &mut [u8], width: usize, height: usize, bpp: usize, ann: &StarAnnotation, lw: u8) {
+fn draw_direction_tick_rgb(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    bpp: usize,
+    ann: &StarAnnotation,
+    lw: u8,
+) {
     let tick_len = ann.semi_major * ann.eccentricity * 1.2;
     if tick_len < 2.0 {
         return;
@@ -360,10 +434,18 @@ fn draw_direction_tick_rgb(buf: &mut [u8], width: usize, height: usize, bpp: usi
     let end_x = start_x + tick_len * ct;
     let end_y = start_y + tick_len * st;
 
-    draw_line(buf, width, height, bpp,
-        start_x.round() as i32, start_y.round() as i32,
-        end_x.round() as i32, end_y.round() as i32,
-        ann.color, lw);
+    draw_line(
+        buf,
+        width,
+        height,
+        bpp,
+        start_x.round() as i32,
+        start_y.round() as i32,
+        end_x.round() as i32,
+        end_y.round() as i32,
+        ann.color,
+        lw,
+    );
 
     // Opposite side
     let start_x2 = ann.x - ann.semi_major * ct;
@@ -371,14 +453,28 @@ fn draw_direction_tick_rgb(buf: &mut [u8], width: usize, height: usize, bpp: usi
     let end_x2 = start_x2 - tick_len * ct;
     let end_y2 = start_y2 - tick_len * st;
 
-    draw_line(buf, width, height, bpp,
-        start_x2.round() as i32, start_y2.round() as i32,
-        end_x2.round() as i32, end_y2.round() as i32,
-        ann.color, lw);
+    draw_line(
+        buf,
+        width,
+        height,
+        bpp,
+        start_x2.round() as i32,
+        start_y2.round() as i32,
+        end_x2.round() as i32,
+        end_y2.round() as i32,
+        ann.color,
+        lw,
+    );
 }
 
 /// Draw a direction tick on an RGBA layer buffer.
-fn draw_direction_tick_rgba(buf: &mut [u8], width: usize, height: usize, ann: &StarAnnotation, lw: u8) {
+fn draw_direction_tick_rgba(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    ann: &StarAnnotation,
+    lw: u8,
+) {
     let tick_len = ann.semi_major * ann.eccentricity * 1.2;
     if tick_len < 2.0 {
         return;
@@ -390,33 +486,52 @@ fn draw_direction_tick_rgba(buf: &mut [u8], width: usize, height: usize, ann: &S
     let end_x = start_x + tick_len * ct;
     let end_y = start_y + tick_len * st;
 
-    draw_line_rgba(buf, width, height,
-        start_x.round() as i32, start_y.round() as i32,
-        end_x.round() as i32, end_y.round() as i32,
-        ann.color, lw);
+    draw_line_rgba(
+        buf,
+        width,
+        height,
+        start_x.round() as i32,
+        start_y.round() as i32,
+        end_x.round() as i32,
+        end_y.round() as i32,
+        ann.color,
+        lw,
+    );
 
     let start_x2 = ann.x - ann.semi_major * ct;
     let start_y2 = ann.y - ann.semi_major * st;
     let end_x2 = start_x2 - tick_len * ct;
     let end_y2 = start_y2 - tick_len * st;
 
-    draw_line_rgba(buf, width, height,
-        start_x2.round() as i32, start_y2.round() as i32,
-        end_x2.round() as i32, end_y2.round() as i32,
-        ann.color, lw);
+    draw_line_rgba(
+        buf,
+        width,
+        height,
+        start_x2.round() as i32,
+        start_y2.round() as i32,
+        end_x2.round() as i32,
+        end_y2.round() as i32,
+        ann.color,
+        lw,
+    );
 }
 
 /// Choose annotation color based on the color scheme and star metrics.
-fn star_color(config: &AnnotationConfig, eccentricity: f32, fwhm: f32, median_fwhm: f32) -> [u8; 3] {
+fn star_color(
+    config: &AnnotationConfig,
+    eccentricity: f32,
+    fwhm: f32,
+    median_fwhm: f32,
+) -> [u8; 3] {
     match config.color_scheme {
         ColorScheme::Uniform => [0, 255, 0],
         ColorScheme::Eccentricity => {
             if eccentricity <= config.ecc_good {
-                [0, 255, 0]       // Green: round, good
+                [0, 255, 0] // Green: round, good
             } else if eccentricity <= config.ecc_warn {
-                [255, 255, 0]     // Yellow: slightly elongated
+                [255, 255, 0] // Yellow: slightly elongated
             } else {
-                [255, 64, 64]     // Red: problem
+                [255, 64, 64] // Red: problem
             }
         }
         ColorScheme::Fwhm => {
@@ -425,11 +540,11 @@ fn star_color(config: &AnnotationConfig, eccentricity: f32, fwhm: f32, median_fw
             }
             let ratio = fwhm / median_fwhm;
             if ratio < config.fwhm_good {
-                [0, 255, 0]       // Green: tight
+                [0, 255, 0] // Green: tight
             } else if ratio < config.fwhm_warn {
-                [255, 255, 0]     // Yellow: somewhat bloated
+                [255, 255, 0] // Yellow: somewhat bloated
             } else {
-                [255, 64, 64]     // Red: very bloated
+                [255, 64, 64] // Red: very bloated
             }
         }
     }
@@ -469,9 +584,14 @@ mod tests {
             median_fwhm_arcsec: None,
             median_hfr_arcsec: None,
             stage_timing: StageTiming {
-                background_ms: 0.0, detection_pass1_ms: 0.0, calibration_ms: 0.0,
-                detection_pass2_ms: 0.0, measurement_ms: 0.0, snr_ms: 0.0,
-                statistics_ms: 0.0, total_ms: 0.0,
+                background_ms: 0.0,
+                detection_pass1_ms: 0.0,
+                calibration_ms: 0.0,
+                detection_pass2_ms: 0.0,
+                measurement_ms: 0.0,
+                snr_ms: 0.0,
+                statistics_ms: 0.0,
+                total_ms: 0.0,
             },
             stars,
         }
@@ -479,7 +599,8 @@ mod tests {
 
     fn make_star(x: f32, y: f32, fwhm: f32, ecc: f32) -> StarMetrics {
         StarMetrics {
-            x, y,
+            x,
+            y,
             peak: 1000.0,
             flux: 5000.0,
             fwhm_x: fwhm,
@@ -528,9 +649,9 @@ mod tests {
     #[test]
     fn test_eccentricity_colors() {
         let config = AnnotationConfig::default();
-        assert_eq!(star_color(&config, 0.3, 5.0, 5.0), [0, 255, 0]);       // below 0.5 → green
-        assert_eq!(star_color(&config, 0.55, 5.0, 5.0), [255, 255, 0]);    // 0.51..0.6 → yellow
-        assert_eq!(star_color(&config, 0.7, 5.0, 5.0), [255, 64, 64]);     // above 0.6 → red
+        assert_eq!(star_color(&config, 0.3, 5.0, 5.0), [0, 255, 0]); // below 0.5 → green
+        assert_eq!(star_color(&config, 0.55, 5.0, 5.0), [255, 255, 0]); // 0.51..0.6 → yellow
+        assert_eq!(star_color(&config, 0.7, 5.0, 5.0), [255, 64, 64]); // above 0.6 → red
     }
 
     #[test]
@@ -545,6 +666,7 @@ mod tests {
             is_color: false,
             channels: 3,
             flip_vertical: false,
+            observational: Default::default(),
         };
 
         annotate_image(&mut image, &result, &AnnotationConfig::default());
@@ -594,11 +716,16 @@ mod tests {
         let anns_no_flip = compute_annotations(&result, 100, 100, false, &config);
         let anns_flipped = compute_annotations(&result, 100, 100, true, &config);
 
-        assert!((anns_no_flip[0].theta - theta).abs() < 1e-6,
-            "without flip, theta should be unchanged");
-        assert!((anns_flipped[0].theta - (-theta)).abs() < 1e-6,
+        assert!(
+            (anns_no_flip[0].theta - theta).abs() < 1e-6,
+            "without flip, theta should be unchanged"
+        );
+        assert!(
+            (anns_flipped[0].theta - (-theta)).abs() < 1e-6,
             "with flip, theta should be negated: got {} expected {}",
-            anns_flipped[0].theta, -theta);
+            anns_flipped[0].theta,
+            -theta
+        );
     }
 
     #[test]
@@ -607,6 +734,9 @@ mod tests {
         draw_line(&mut buf, 10, 10, 3, 0, 0, 9, 9, [255, 0, 0], 1);
         // Check that the diagonal has some red pixels
         let red_count = buf.chunks_exact(3).filter(|px| px[0] == 255).count();
-        assert!(red_count >= 10, "Expected at least 10 red pixels on diagonal");
+        assert!(
+            red_count >= 10,
+            "Expected at least 10 red pixels on diagonal"
+        );
     }
 }

@@ -1,11 +1,11 @@
-use std::io::{BufReader, Read};
 use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 
-use crate::types::{BayerPattern, DataType, ImageMetadata, PixelData};
+use crate::types::{BayerPattern, DataType, FitsMetadata, ImageMetadata, PixelData};
 
 const FITS_BLOCK_SIZE: usize = 2880;
 const FITS_CARD_SIZE: usize = 80;
@@ -20,20 +20,23 @@ struct FitsHeader {
     bscale: f64,
     bayerpat: String,
     roworder: String,
+    observational: FitsMetadata,
 }
 
-fn get_keyword_value(card: &str, keyword: &str) -> Option<String> {
-    if !card.starts_with(keyword) {
+fn get_keyword_and_value(card: &str) -> Option<(String, String)> {
+    if card.len() < 10 {
         return None;
     }
-    let eq_pos = card.find('=')?;
-    let val = card[eq_pos + 1..].trim_start();
-    Some(val.to_string())
+    let keyword = card[..8].trim_end().to_string();
+    if keyword.is_empty() || keyword == "        " {
+        return None;
+    }
+    let eq_pos = card[8..].find('=')?;
+    let val = card[8 + eq_pos + 1..].trim_start();
+    Some((keyword, val.to_string()))
 }
 
-fn parse_int_keyword(card: &str, keyword: &str) -> Option<i32> {
-    let val = get_keyword_value(card, keyword)?;
-    // Take chars until non-digit (or minus sign)
+fn parse_int_value(val: &str) -> Option<i32> {
     let num_str: String = val
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+')
@@ -41,21 +44,14 @@ fn parse_int_keyword(card: &str, keyword: &str) -> Option<i32> {
     num_str.parse().ok()
 }
 
-fn parse_float_keyword(card: &str, keyword: &str) -> Option<f64> {
-    let val = get_keyword_value(card, keyword)?;
+fn parse_float_value(val: &str) -> Option<f64> {
     let num_str: String = val
         .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+' || *c == '.' || *c == 'E' || *c == 'e')
+        .take_while(|c| {
+            c.is_ascii_digit() || *c == '-' || *c == '+' || *c == '.' || *c == 'E' || *c == 'e'
+        })
         .collect();
     num_str.parse().ok()
-}
-
-fn parse_string_keyword(card: &str, keyword: &str) -> Option<String> {
-    let val = get_keyword_value(card, keyword)?;
-    let val = val.trim_start_matches('\'');
-    let end = val.find('\'')?;
-    let s = val[..end].trim_end().to_string();
-    Some(s)
 }
 
 fn read_fits_header(reader: &mut BufReader<File>) -> Result<FitsHeader> {
@@ -69,6 +65,7 @@ fn read_fits_header(reader: &mut BufReader<File>) -> Result<FitsHeader> {
         bscale: 1.0,
         bayerpat: String::new(),
         roworder: String::new(),
+        observational: FitsMetadata::default(),
     };
 
     let mut block = [0u8; FITS_BLOCK_SIZE];
@@ -88,24 +85,146 @@ fn read_fits_header(reader: &mut BufReader<File>) -> Result<FitsHeader> {
                 break;
             }
 
-            if let Some(v) = parse_int_keyword(card, "BITPIX  ") {
-                hdr.bitpix = v;
-            } else if let Some(v) = parse_int_keyword(card, "NAXIS   ") {
-                hdr.naxis = v;
-            } else if let Some(v) = parse_int_keyword(card, "NAXIS1") {
-                hdr.naxis1 = v as usize;
-            } else if let Some(v) = parse_int_keyword(card, "NAXIS2") {
-                hdr.naxis2 = v as usize;
-            } else if let Some(v) = parse_int_keyword(card, "NAXIS3") {
-                hdr.naxis3 = v as usize;
-            } else if let Some(v) = parse_float_keyword(card, "BZERO") {
-                hdr.bzero = v;
-            } else if let Some(v) = parse_float_keyword(card, "BSCALE") {
-                hdr.bscale = v;
-            } else if let Some(v) = parse_string_keyword(card, "BAYERPAT") {
-                hdr.bayerpat = v;
-            } else if let Some(v) = parse_string_keyword(card, "ROWORDER") {
-                hdr.roworder = v;
+            let Some((keyword, raw_value)) = get_keyword_and_value(card) else {
+                continue;
+            };
+
+            let value = raw_value.trim();
+            let stripped = value
+                .strip_prefix('\'')
+                .and_then(|s| s.find('\'').map(|p| &s[..p]))
+                .unwrap_or(value);
+            let clean_value = stripped.trim_end().to_string();
+
+            match keyword.as_str() {
+                "BITPIX" => {
+                    if let Some(v) = parse_int_value(value) {
+                        hdr.bitpix = v;
+                    }
+                }
+                "NAXIS" => {
+                    if let Some(v) = parse_int_value(value) {
+                        hdr.naxis = v;
+                    }
+                }
+                "NAXIS1" => {
+                    if let Some(v) = parse_int_value(value) {
+                        hdr.naxis1 = v as usize;
+                    }
+                }
+                "NAXIS2" => {
+                    if let Some(v) = parse_int_value(value) {
+                        hdr.naxis2 = v as usize;
+                    }
+                }
+                "NAXIS3" => {
+                    if let Some(v) = parse_int_value(value) {
+                        hdr.naxis3 = v as usize;
+                    }
+                }
+                "BZERO" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.bzero = v;
+                    }
+                }
+                "BSCALE" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.bscale = v;
+                    }
+                }
+                "BAYERPAT" => {
+                    hdr.bayerpat = clean_value.clone();
+                    hdr.observational.bayerpat = Some(clean_value);
+                }
+                "ROWORDER" => {
+                    hdr.roworder = clean_value.clone();
+                }
+                "DATE-OBS" | "DATE" => {
+                    hdr.observational.date_obs = Some(clean_value);
+                }
+                "TIME-OBS" | "UT" | "UTSTART" => {
+                    hdr.observational.time_obs = Some(clean_value);
+                }
+                "EXPTIME" | "EXPOSURE" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.observational.exposure = Some(v);
+                    }
+                }
+                "ISO" => {
+                    if let Some(v) = parse_int_value(value) {
+                        hdr.observational.iso = Some(v as u32);
+                    }
+                }
+                "GAIN" | "EGAIN" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.observational.gain = Some(v);
+                    }
+                }
+                "FOCUSLEN" | "FLENGTH" | "FOCALLEN" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.observational.aperture = Some(v);
+                    }
+                }
+                "FNUMBER" | "APTDIA" | "APERTURE" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.observational.aperture = Some(v);
+                    }
+                }
+                "SHUTTER" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.observational.shutter = Some(v);
+                    }
+                }
+                "CCD-TEMP" | "CCD_TEMP" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.observational.ccd_temp = Some(v);
+                    }
+                }
+                "INSTRUME" | "CAMERA" => {
+                    hdr.observational.instrument = Some(clean_value);
+                }
+                "TELESCOP" => {
+                    hdr.observational.telescope = Some(clean_value);
+                }
+                "LENS" | "OPTICS" => {
+                    hdr.observational.lens = Some(clean_value);
+                }
+                "FILTER" => {
+                    hdr.observational.filter = Some(clean_value);
+                }
+                "OBJECT" => {
+                    hdr.observational.object = Some(clean_value);
+                }
+                "RA" | "RA--OBS" | "OBJCTRA" => {
+                    hdr.observational.ra = Some(clean_value);
+                }
+                "DEC" | "DEC-OBS" | "OBJCTDEC" => {
+                    hdr.observational.dec = Some(clean_value);
+                }
+                "ALT" | "EALT" | "ALTI" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.observational.alt = Some(v);
+                    }
+                }
+                "AZ" | "EAZ" | "AZI" => {
+                    if let Some(v) = parse_float_value(value) {
+                        hdr.observational.az = Some(v);
+                    }
+                }
+                "OBSERVER" => {
+                    hdr.observational.observer = Some(clean_value);
+                }
+                "SITE" => {
+                    hdr.observational.site = Some(clean_value);
+                }
+                "NOTES" | "COMMENT" => {
+                    hdr.observational.notes = Some(clean_value);
+                }
+                _ => {
+                    if !clean_value.is_empty() {
+                        hdr.observational.all_keywords.insert(keyword, clean_value);
+                    }
+                }
             }
         }
     }
@@ -164,12 +283,13 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
             let use_par = num_pixels >= PAR_THRESHOLD;
 
             if hdr.bzero == 32768.0 && hdr.bscale == 1.0 {
-                // Fast path: signed→unsigned via byte-swap + XOR 0x8000
                 let convert = |s: &[u8], d: &mut [u16]| {
                     bswap_u16_xor(s, d);
                 };
                 if use_par {
-                    src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                    src.par_chunks(CHUNK * 2)
+                        .zip(u16_data.par_chunks_mut(CHUNK))
+                        .for_each(|(s, d)| convert(s, d));
                 } else {
                     convert(src, &mut u16_data);
                 }
@@ -178,7 +298,9 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
                     bswap_u16(s, d);
                 };
                 if use_par {
-                    src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                    src.par_chunks(CHUNK * 2)
+                        .zip(u16_data.par_chunks_mut(CHUNK))
+                        .for_each(|(s, d)| convert(s, d));
                 } else {
                     convert(src, &mut u16_data);
                 }
@@ -193,7 +315,9 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
                     }
                 };
                 if use_par {
-                    src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                    src.par_chunks(CHUNK * 2)
+                        .zip(u16_data.par_chunks_mut(CHUNK))
+                        .for_each(|(s, d)| convert(s, d));
                 } else {
                     convert(src, &mut u16_data);
                 }
@@ -215,7 +339,9 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
                 }
             };
             if num_pixels >= PAR_THRESHOLD {
-                src.par_chunks(CHUNK * 4).zip(f32_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                src.par_chunks(CHUNK * 4)
+                    .zip(f32_data.par_chunks_mut(CHUNK))
+                    .for_each(|(s, d)| convert(s, d));
             } else {
                 convert(src, &mut f32_data);
             }
@@ -234,7 +360,10 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
                 }
             };
             if num_pixels >= PAR_THRESHOLD {
-                raw_data.par_chunks(CHUNK).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                raw_data
+                    .par_chunks(CHUNK)
+                    .zip(u16_data.par_chunks_mut(CHUNK))
+                    .for_each(|(s, d)| convert(s, d));
             } else {
                 convert(&raw_data, &mut u16_data);
             }
@@ -255,7 +384,9 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
                 }
             };
             if num_pixels >= PAR_THRESHOLD {
-                src.par_chunks(CHUNK * 4).zip(f32_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                src.par_chunks(CHUNK * 4)
+                    .zip(f32_data.par_chunks_mut(CHUNK))
+                    .for_each(|(s, d)| convert(s, d));
             } else {
                 convert(src, &mut f32_data);
             }
@@ -272,14 +403,22 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
                 for i in 0..d.len() {
                     let off = i * 8;
                     let val = f64::from_be_bytes([
-                        s[off], s[off + 1], s[off + 2], s[off + 3],
-                        s[off + 4], s[off + 5], s[off + 6], s[off + 7],
+                        s[off],
+                        s[off + 1],
+                        s[off + 2],
+                        s[off + 3],
+                        s[off + 4],
+                        s[off + 5],
+                        s[off + 6],
+                        s[off + 7],
                     ]);
                     d[i] = (bzero + bscale * val) as f32;
                 }
             };
             if num_pixels >= PAR_THRESHOLD {
-                src.par_chunks(CHUNK * 8).zip(f32_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+                src.par_chunks(CHUNK * 8)
+                    .zip(f32_data.par_chunks_mut(CHUNK))
+                    .for_each(|(s, d)| convert(s, d));
             } else {
                 convert(src, &mut f32_data);
             }
@@ -296,12 +435,12 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
         dtype,
         bayer_pattern,
         flip_vertical,
+        observational: hdr.observational,
     };
 
     Ok((meta, pixels))
 }
 
-/// SIMD-accelerated big-endian u16 byte swap.
 fn bswap_u16(src: &[u8], dst: &mut [u16]) {
     let n = dst.len();
     let mut i = 0;
@@ -309,7 +448,6 @@ fn bswap_u16(src: &[u8], dst: &mut [u16]) {
     #[cfg(target_arch = "aarch64")]
     {
         use std::arch::aarch64::*;
-        // NEON: vrev16q_u8 swaps adjacent bytes in each 16-bit lane (16 bytes = 8 u16 at a time)
         while i + 8 <= n {
             unsafe {
                 let bytes = vld1q_u8(src.as_ptr().add(i * 2));
@@ -327,13 +465,11 @@ fn bswap_u16(src: &[u8], dst: &mut [u16]) {
         }
     }
 
-    // Scalar remainder
     for j in i..n {
         dst[j] = u16::from_be_bytes([src[j * 2], src[j * 2 + 1]]);
     }
 }
 
-/// SIMD-accelerated big-endian u16 byte swap with XOR 0x8000.
 fn bswap_u16_xor(src: &[u8], dst: &mut [u16]) {
     let n = dst.len();
     let mut i = 0;
@@ -361,7 +497,6 @@ fn bswap_u16_xor(src: &[u8], dst: &mut [u16]) {
         }
     }
 
-    // Scalar remainder
     for j in i..n {
         let raw = u16::from_be_bytes([src[j * 2], src[j * 2 + 1]]);
         dst[j] = raw ^ 0x8000;

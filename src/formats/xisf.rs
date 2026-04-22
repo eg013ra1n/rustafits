@@ -8,7 +8,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rayon::prelude::*;
 
-use crate::types::{BayerPattern, DataType, ImageMetadata, PixelData};
+use crate::types::{BayerPattern, DataType, FitsMetadata, ImageMetadata, PixelData};
 
 const XISF_SIGNATURE: &[u8; 8] = b"XISF0100";
 
@@ -124,7 +124,12 @@ fn parse_compression(s: &str) -> Result<(XisfCompression, usize, bool, usize)> {
         1
     };
 
-    Ok((compression, uncompressed_size, byte_shuffled, shuffle_item_size))
+    Ok((
+        compression,
+        uncompressed_size,
+        byte_shuffled,
+        shuffle_item_size,
+    ))
 }
 
 fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
@@ -176,8 +181,7 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
                             info.block_size = size;
                         }
                         "compression" => {
-                            let (comp, uncomp_size, shuffled, item_size) =
-                                parse_compression(&val)?;
+                            let (comp, uncomp_size, shuffled, item_size) = parse_compression(&val)?;
                             info.compression = comp;
                             info.uncompressed_size = uncomp_size;
                             info.byte_shuffled = shuffled;
@@ -247,7 +251,11 @@ fn unshuffle_bytes(data: &mut [u8], item_size: usize) {
     }
 }
 
-fn decompress_block(compressed: &[u8], uncompressed_size: usize, codec: XisfCompression) -> Result<Vec<u8>> {
+fn decompress_block(
+    compressed: &[u8],
+    uncompressed_size: usize,
+    codec: XisfCompression,
+) -> Result<Vec<u8>> {
     match codec {
         XisfCompression::None => Ok(compressed.to_vec()),
         XisfCompression::Zlib => {
@@ -273,10 +281,11 @@ fn decompress_block(compressed: &[u8], uncompressed_size: usize, codec: XisfComp
         XisfCompression::Zstd => {
             let mut output = vec![0u8; uncompressed_size];
             let mut decoder = ruzstd::frame_decoder::FrameDecoder::new();
-            decoder.reset(&compressed[..]).context("zstd decoder reset failed")?;
+            decoder
+                .reset(&compressed[..])
+                .context("zstd decoder reset failed")?;
             let mut cursor = std::io::Cursor::new(&mut output[..]);
-            std::io::copy(&mut decoder, &mut cursor)
-                .context("zstd decompression failed")?;
+            std::io::copy(&mut decoder, &mut cursor).context("zstd decompression failed")?;
             Ok(output)
         }
     }
@@ -298,18 +307,14 @@ fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat) {
         XisfSampleFormat::Uint32 => {
             for i in 0..dst.len() {
                 let off = i * 4;
-                let val = u32::from_le_bytes([
-                    src[off], src[off + 1], src[off + 2], src[off + 3],
-                ]);
+                let val = u32::from_le_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
                 dst[i] = (val >> 16) as f32;
             }
         }
         XisfSampleFormat::Float32 => {
             for i in 0..dst.len() {
                 let off = i * 4;
-                let val = f32::from_le_bytes([
-                    src[off], src[off + 1], src[off + 2], src[off + 3],
-                ]);
+                let val = f32::from_le_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
                 dst[i] = val * 65535.0;
             }
         }
@@ -317,8 +322,14 @@ fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat) {
             for i in 0..dst.len() {
                 let off = i * 8;
                 let val = f64::from_le_bytes([
-                    src[off], src[off + 1], src[off + 2], src[off + 3],
-                    src[off + 4], src[off + 5], src[off + 6], src[off + 7],
+                    src[off],
+                    src[off + 1],
+                    src[off + 2],
+                    src[off + 3],
+                    src[off + 4],
+                    src[off + 5],
+                    src[off + 6],
+                    src[off + 7],
                 ]);
                 dst[i] = (val * 65535.0) as f32;
             }
@@ -340,7 +351,8 @@ fn convert_to_float32(raw_data: &[u8], info: &XisfImageInfo) -> Vec<f32> {
     const PAR_THRESHOLD: usize = CHUNK * 2;
 
     if num_samples >= PAR_THRESHOLD {
-        raw_data.par_chunks(CHUNK * bytes_per_sample)
+        raw_data
+            .par_chunks(CHUNK * bytes_per_sample)
             .zip(float_data.par_chunks_mut(CHUNK))
             .for_each(|(src, dst)| {
                 convert_chunk(src, dst, format);
@@ -365,7 +377,8 @@ fn convert_normal_to_planar(data: &mut Vec<f32>, width: usize, height: usize, ch
     const PAR_ROW_THRESHOLD: usize = 128;
 
     if height >= PAR_ROW_THRESHOLD {
-        r_plane.par_chunks_mut(width)
+        r_plane
+            .par_chunks_mut(width)
             .zip(g_plane.par_chunks_mut(width))
             .zip(b_plane.par_chunks_mut(width))
             .enumerate()
@@ -406,8 +419,7 @@ pub fn read_xisf_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     }
 
     // Bytes 8-11: XML length (little-endian u32)
-    let xml_length =
-        u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    let xml_length = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
 
     if xml_length == 0 || xml_length > 100 * 1024 * 1024 {
         bail!("Invalid XISF header length");
@@ -473,6 +485,7 @@ pub fn read_xisf_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
         dtype: DataType::Float32,
         bayer_pattern: info.bayer_pattern,
         flip_vertical: info.flip_vertical,
+        observational: FitsMetadata::default(),
     };
 
     Ok((meta, PixelData::Float32(float_data)))

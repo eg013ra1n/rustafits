@@ -70,14 +70,30 @@ fn process_u16(
             float_data = fdata;
             is_color = false;
             num_channels = 1;
-            return apply_stretch_and_finalize(float_data, width, height, is_color, num_channels, &meta, config);
+            return apply_stretch_and_finalize(
+                float_data,
+                width,
+                height,
+                is_color,
+                num_channels,
+                &meta,
+                config,
+            );
         }
 
         // Fast path: stretch directly from u16, skip f32 intermediate
         return apply_stretch_u16_and_finalize(&data, width, height, &meta, config);
     }
 
-    apply_stretch_and_finalize(float_data, width, height, is_color, num_channels, &meta, config)
+    apply_stretch_and_finalize(
+        float_data,
+        width,
+        height,
+        is_color,
+        num_channels,
+        &meta,
+        config,
+    )
 }
 
 fn process_f32(
@@ -139,7 +155,15 @@ fn process_f32(
         num_channels = 1;
     }
 
-    apply_stretch_and_finalize(float_data, width, height, is_color, num_channels, &meta, config)
+    apply_stretch_and_finalize(
+        float_data,
+        width,
+        height,
+        is_color,
+        num_channels,
+        &meta,
+        config,
+    )
 }
 
 fn compute_stretch_coefficients_u16(channel_data: &[u16]) -> (f32, f32, f32, f32, f32) {
@@ -172,9 +196,7 @@ fn apply_stretch_u16_and_finalize(
         let (ns, nh, k1, k2, m) = compute_stretch_coefficients_u16(&data[..channel_size]);
 
         let mut temp = vec![0u8; channel_size];
-        stretch::apply_stretch_from_u16(
-            &data[..channel_size], &mut temp, 0, 1, ns, nh, k1, k2, m,
-        );
+        stretch::apply_stretch_from_u16(&data[..channel_size], &mut temp, 0, 1, ns, nh, k1, k2, m);
         if config.rgba_output {
             color::replicate_gray_to_rgba(&temp)
         } else {
@@ -191,6 +213,7 @@ fn apply_stretch_u16_and_finalize(
         is_color: false,
         channels: bpp as u8,
         flip_vertical: meta.flip_vertical,
+        observational: meta.observational.clone(),
     };
 
     if meta.flip_vertical {
@@ -289,5 +312,6 @@ fn apply_stretch_and_finalize(
         is_color,
         channels: bpp as u8,
         flip_vertical: meta.flip_vertical,
+        observational: meta.observational.clone(),
     })
 }
