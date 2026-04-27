@@ -396,7 +396,7 @@ fn cmd_measure(
     lum: &[f32],
     w: usize,
     h: usize,
-    green_mask: Option<&[bool]>,
+    _green_mask: Option<&[bool]>, // unused now but keep for API compat
     opts: &Opts,
 ) -> Result<()> {
     let t = Instant::now();
@@ -706,7 +706,7 @@ fn cmd_query(
     lum: &[f32],
     w: usize,
     h: usize,
-    green_mask: Option<&[bool]>,
+    _green_mask: Option<&[bool]>, // unused now but keep for API compat
     opts: &Opts,
 ) -> Result<()> {
     let (sx, sy) = opts.star_pos.context("--star x,y is required for 'query' subcommand")?;
@@ -1037,7 +1037,7 @@ fn cmd_dump(
     lum: &[f32],
     w: usize,
     h: usize,
-    green_mask: Option<&[bool]>,
+    _green_mask: Option<&[bool]>, // unused now but keep for API compat
     opts: &Opts,
 ) -> Result<()> {
     let (bg, detected, _final_fwhm, _) = run_detection(lum, w, h, opts)?;
