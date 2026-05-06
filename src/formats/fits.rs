@@ -143,7 +143,16 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
         _ => BayerPattern::None,
     };
 
-    let flip_vertical = hdr.roworder == "TOP-DOWN";
+    // Astronomical convention (PixInsight, ds9, Siril, AstroImageJ):
+    //   ROWORDER = 'TOP-DOWN'  → row 0 is the top of the displayed image,
+    //                            screen-row-0 = file-row-0, no flip needed.
+    //   ROWORDER = 'BOTTOM-UP' → row 0 is the bottom; flip for display.
+    //   missing                → astronomical default = bottom-up = flip.
+    //
+    // (Earlier versions of this code had the comparison inverted, which
+    // displayed N.I.N.A. files — explicit TOP-DOWN — flipped relative to
+    // PixInsight's display of the same file.)
+    let flip_vertical = !hdr.roworder.eq_ignore_ascii_case("TOP-DOWN");
 
     let num_pixels = hdr.naxis1 * hdr.naxis2 * channels;
     let bytes_per_pixel = (hdr.bitpix.unsigned_abs() as usize) / 8;

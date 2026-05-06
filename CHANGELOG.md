@@ -5,6 +5,42 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-05-07
+
+### Fixed
+
+- **FITS `ROWORDER` interpretation now matches astronomical-software
+  convention.** The `flip_vertical` flag computed by the FITS reader had
+  its truth condition inverted: it was set when `ROWORDER='TOP-DOWN'`
+  (the case that *doesn't* need a flip) and cleared when `ROWORDER` was
+  absent or `'BOTTOM-UP'` (the cases that *do*). The corrected rule:
+
+  | `ROWORDER`     | `flip_vertical` |
+  | -------------- | --------------- |
+  | `TOP-DOWN`     | `false`         |
+  | `BOTTOM-UP`    | `true`          |
+  | (missing)      | `true`          |
+  | (other)        | `true`          |
+
+  This matches PixInsight, ds9, Siril, and AstroImageJ — all of which
+  treat the absence of `ROWORDER` as bottom-up by default and flip for
+  screen display. The comparison is now case-insensitive so non-canonical
+  spellings (`'top-down'`) are still recognized.
+
+### Behavior change for downstream consumers
+
+This is a **semantics change** for the existing `ImageMetadata.flip_vertical`
+field, not an API change. Files that previously rendered "right-side up"
+under the inverted rule will now render flipped 180° vertically (and vice
+versa). For libraries written by N.I.N.A. and similar capture software
+(which set `ROWORDER='TOP-DOWN'` explicitly), the displayed JPEG will
+*no longer* be flipped — the on-screen orientation will match what
+PixInsight shows for the same file.
+
+Consumers that pass `flip_vertical` through to a UI overlay (e.g., star
+annotations) automatically stay aligned with the rendered image because
+the flag still flows from a single source.
+
 ## [1.0.0] — 2026-04-14
 
 First stable release. Establishes a public API commitment: additive changes may
