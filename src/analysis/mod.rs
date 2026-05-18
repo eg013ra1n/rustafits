@@ -200,6 +200,10 @@ pub struct FastStar {
     pub peak: f32,
     /// Background-subtracted total flux (ADU).
     pub flux: f32,
+    /// Aperture-photometry SNR (`flux / sqrt(flux + π r² σ²)`). Discriminates
+    /// compact point sources from extended structure that has high flux but
+    /// is spread over a large aperture (galaxy/nebula knots).
+    pub snr: f32,
 }
 
 /// Per-stage timing breakdown for the fast detection pipeline.
@@ -1121,11 +1125,12 @@ impl ImageAnalyzer {
         // Already brightest-first and trimmed to max_stars by the detector.
         let stars: Vec<FastStar> = detected
             .into_iter()
-            .map(|s| FastStar {
-                x: s.x,
-                y: s.y,
-                peak: s.peak,
-                flux: s.flux,
+            .map(|(ds, snr)| FastStar {
+                x: ds.x,
+                y: ds.y,
+                peak: ds.peak,
+                flux: ds.flux,
+                snr,
             })
             .collect();
 

@@ -444,7 +444,7 @@ pub fn detect_stars_adaptive(
     height: usize,
     max_stars: usize,
     hfd_min: f32,
-) -> Vec<DetectedStar> {
+) -> Vec<(DetectedStar, f32)> {
     if width < 8 || height < 8 {
         return Vec::new();
     }
@@ -539,16 +539,18 @@ pub fn detect_stars_adaptive(
     stars
         .into_iter()
         .map(|s| {
-            let _ = s.snr;
-            DetectedStar {
-                x: s.x,
-                y: s.y,
-                peak: s.peak,
-                flux: s.flux,
-                area: (s.hfd * s.hfd).max(1.0) as usize,
-                theta: 0.0,
-                eccentricity: 0.0,
-            }
+            (
+                DetectedStar {
+                    x: s.x,
+                    y: s.y,
+                    peak: s.peak,
+                    flux: s.flux,
+                    area: (s.hfd * s.hfd).max(1.0) as usize,
+                    theta: 0.0,
+                    eccentricity: 0.0,
+                },
+                s.snr,
+            )
         })
         .collect()
 }
