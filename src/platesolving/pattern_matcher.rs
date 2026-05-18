@@ -7,6 +7,8 @@
 /// 4. Each match gives a center correspondence (no star ordering ambiguity)
 /// 5. Fit affine from 3+ center correspondences
 
+use std::collections::HashSet;
+
 use nalgebra::{DMatrix, DVector};
 
 pub const QUAD_SIZE: usize = 4;
@@ -65,93 +67,147 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
 
-/// Build quads using nearest-neighbor selection.
-///
-/// For each of the `max_stars` brightest stars, find its 3 nearest neighbors,
-/// compute 6 pairwise distances, sort ascending, normalize by longest.
-/// Deduplicate by center position.
+/// Build quads using nearest-neighbor selection (1 quad per star: the star
+/// plus its 3 nearest neighbors). Thin wrapper over [`build_quads_multi`]
+/// with `group_size = QUAD_SIZE`; behaviour is byte-for-byte identical to the
+/// original implementation so dense-field solving is unaffected.
 pub fn build_quads(stars: &[(f64, f64)], max_stars: usize) -> Vec<Quad> {
+    build_quads_multi(stars, max_stars, QUAD_SIZE)
+}
+
+/// Append the 4-edge ratios + center for the 4 stars `idx` to `quads`,
+/// deduplicating on the sorted star-index set and (legacy) on the center.
+#[allow(clippy::too_many_arguments)]
+fn push_quad_from_indices(
+    stars: &[(f64, f64)],
+    idx: [usize; QUAD_SIZE],
+    quads: &mut Vec<Quad>,
+    seen: &mut HashSet<[usize; QUAD_SIZE]>,
+    dedup_epsilon: f64,
+) {
+    let mut key = idx;
+    key.sort_unstable();
+    if !seen.insert(key) {
+        return;
+    }
+
+    let cx =
+        (stars[idx[0]].0 + stars[idx[1]].0 + stars[idx[2]].0 + stars[idx[3]].0) / 4.0;
+    let cy =
+        (stars[idx[0]].1 + stars[idx[1]].1 + stars[idx[2]].1 + stars[idx[3]].1) / 4.0;
+
+    // Legacy center dedup (preserves original build_quads output exactly).
+    if quads.iter().any(|q: &Quad| {
+        (q.center.0 - cx).abs() < dedup_epsilon && (q.center.1 - cy).abs() < dedup_epsilon
+    }) {
+        return;
+    }
+
+    let mut dists = [0.0f64; NUM_EDGES];
+    let mut k = 0;
+    for a in 0..QUAD_SIZE {
+        for b in (a + 1)..QUAD_SIZE {
+            dists[k] = distance(stars[idx[a]], stars[idx[b]]);
+            k += 1;
+        }
+    }
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let longest = dists[NUM_EDGES - 1];
+    if longest < 1e-15 {
+        return;
+    }
+    let ratios = [
+        dists[0] / longest,
+        dists[1] / longest,
+        dists[2] / longest,
+        dists[3] / longest,
+        dists[4] / longest,
+    ];
+
+    quads.push(Quad {
+        star_indices: idx,
+        ratios,
+        center: (cx, cy),
+        longest_dist: longest,
+    });
+}
+
+/// ASTAP-style quad construction with a tunable per-star group size.
+///
+/// For each of the `max_stars` brightest stars, take its `group_size - 1`
+/// nearest neighbors to form a local group of `group_size` stars, then emit
+/// every C(group_size, 4) sub-quad. `group_size == 4` reproduces the classic
+/// "1 quad per star" behaviour exactly; larger groups (ASTAP's
+/// `find_many_quads`: 6 → 15 quads/star, 5 → 5 quads/star) massively densify
+/// the quad pool for sparse, long-focal-length fields where only a handful of
+/// catalog-depth stars are present — without which a correct quad almost
+/// never forms. Quads are deduplicated globally by their sorted star-index
+/// set (and, for `group_size == 4`, additionally by center to stay identical
+/// to the original).
+pub fn build_quads_multi(
+    stars: &[(f64, f64)],
+    max_stars: usize,
+    group_size: usize,
+) -> Vec<Quad> {
     let n = stars.len().min(max_stars);
+    let g = group_size.max(QUAD_SIZE);
     if n < QUAD_SIZE {
         return Vec::new();
     }
 
     let mut quads = Vec::with_capacity(n);
+    let mut seen: HashSet<[usize; QUAD_SIZE]> = HashSet::new();
     let dedup_epsilon = 1e-6;
+    let n_neighbors = g - 1;
+
+    // Scratch buffer of (index, dist) reused per star.
+    let mut nbrs: Vec<(usize, f64)> = Vec::with_capacity(n.saturating_sub(1));
 
     for i in 0..n {
-        // Find 3 nearest neighbors
-        let mut neighbors: [(usize, f64); 3] = [(0, f64::MAX), (0, f64::MAX), (0, f64::MAX)];
-
+        nbrs.clear();
         for j in 0..n {
             if i == j {
                 continue;
             }
-            let d = distance(stars[i], stars[j]);
-            // Insert into sorted neighbors list if closer than current worst
-            if d < neighbors[2].1 {
-                neighbors[2] = (j, d);
-                // Bubble sort to keep sorted
-                if neighbors[2].1 < neighbors[1].1 {
-                    neighbors.swap(1, 2);
-                }
-                if neighbors[1].1 < neighbors[0].1 {
-                    neighbors.swap(0, 1);
+            nbrs.push((j, distance(stars[i], stars[j])));
+        }
+        if nbrs.len() < n_neighbors {
+            continue;
+        }
+        // Partial selection: the `n_neighbors` smallest distances, then sort
+        // those so group membership is deterministic. For group_size == 4
+        // this yields exactly the original [i, n0, n1, n2] (the 3 nearest).
+        nbrs.select_nth_unstable_by(n_neighbors - 1, |a, b| {
+            a.1.partial_cmp(&b.1).unwrap()
+        });
+        nbrs.truncate(n_neighbors);
+        nbrs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        // Local group: center star + its nearest neighbors.
+        let mut group = [0usize; 6]; // g ≤ 6 in practice; clamp below
+        let gsz = g.min(group.len());
+        group[0] = i;
+        for (slot, &(idx, _)) in nbrs.iter().take(gsz - 1).enumerate() {
+            group[slot + 1] = idx;
+        }
+
+        // Emit every 4-subset of the group.
+        for a in 0..gsz {
+            for b in (a + 1)..gsz {
+                for c in (b + 1)..gsz {
+                    for d in (c + 1)..gsz {
+                        push_quad_from_indices(
+                            stars,
+                            [group[a], group[b], group[c], group[d]],
+                            &mut quads,
+                            &mut seen,
+                            dedup_epsilon,
+                        );
+                    }
                 }
             }
         }
-
-        if neighbors[2].1 == f64::MAX {
-            continue;
-        }
-
-        let indices = [i, neighbors[0].0, neighbors[1].0, neighbors[2].0];
-
-        // Center
-        let cx = (stars[indices[0]].0 + stars[indices[1]].0 + stars[indices[2]].0 + stars[indices[3]].0) / 4.0;
-        let cy = (stars[indices[0]].1 + stars[indices[1]].1 + stars[indices[2]].1 + stars[indices[3]].1) / 4.0;
-
-        // Dedup by center
-        let dup = quads.iter().any(|q: &Quad| {
-            (q.center.0 - cx).abs() < dedup_epsilon && (q.center.1 - cy).abs() < dedup_epsilon
-        });
-        if dup {
-            continue;
-        }
-
-        // Compute 6 pairwise distances
-        let mut dists = [0.0f64; NUM_EDGES];
-        let mut k = 0;
-        for a in 0..QUAD_SIZE {
-            for b in (a + 1)..QUAD_SIZE {
-                dists[k] = distance(stars[indices[a]], stars[indices[b]]);
-                k += 1;
-            }
-        }
-
-        // Sort ascending
-        dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let longest = dists[NUM_EDGES - 1];
-        if longest < 1e-15 {
-            continue;
-        }
-
-        // Normalize by longest → first 5 ratios
-        let ratios = [
-            dists[0] / longest,
-            dists[1] / longest,
-            dists[2] / longest,
-            dists[3] / longest,
-            dists[4] / longest,
-        ];
-
-        quads.push(Quad {
-            star_indices: indices,
-            ratios,
-            center: (cx, cy),
-            longest_dist: longest,
-        });
     }
 
     quads

@@ -7,7 +7,8 @@ pub mod types;
 pub mod wcs;
 
 pub use pattern_matcher::{
-    build_quads, fit_affine_from_centers, match_quads, AffineTransform, Quad, QuadMatch,
+    build_quads, build_quads_multi, fit_affine_from_centers, match_quads, AffineTransform, Quad,
+    QuadMatch,
 };
 pub use projection::GnomonicProjection;
 pub use proper_motion::ProperMotionCorrector;

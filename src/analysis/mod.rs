@@ -10,6 +10,9 @@ pub mod convolution;
 #[cfg(not(feature = "debug-pipeline"))]
 mod convolution;
 
+// Adaptive multi-level detector used by plate solving. Internal.
+mod adaptive_detection;
+
 #[cfg(feature = "debug-pipeline")]
 pub mod detection;
 #[cfg(not(feature = "debug-pipeline"))]
@@ -1076,11 +1079,13 @@ impl ImageAnalyzer {
         })
     }
 
-    /// Fast detection pipeline — strips PSF calibration, pass-2 detection,
-    /// per-star LM Moffat fitting, SNR photometry, trail detection, and
-    /// statistics. Only runs the stages blind plate solving needs:
-    /// luminance extraction → mesh background → single-pass `detect_stars`
-    /// → sort/truncate by flux.
+    /// Fast detection pipeline used by plate solving — luminance extraction
+    /// then the adaptive multi-level detector (falling-threshold ladder with
+    /// occupancy mask, saturation-aware level clip, per-tile deep pass; see
+    /// [`adaptive_detection`]). Replaces the old single global-threshold
+    /// pass, which under-detected the long-focal-length / extended-object
+    /// frames the solver most needs. No PSF calibration / LM fitting / SNR
+    /// photometry / trail detection — the solver only needs `(x, y, flux)`.
     fn run_fast_detection(
         &self,
         data: &[f32],
@@ -1098,41 +1103,22 @@ impl ImageAnalyzer {
         };
         let prep_ms = t_prep.elapsed().as_secs_f64() * 1000.0;
 
-        let det_params = DetectionParams {
-            detection_sigma: self.config.detection_sigma,
-            min_star_area: self.config.min_star_area,
-            max_star_area: self.config.max_star_area,
-            saturation_limit: self.config.saturation_fraction * 65535.0,
-        };
-
-        // ── Background (mesh grid, MAD noise only; MRS wavelet explicitly skipped) ──
         let t_bg = std::time::Instant::now();
-        let cell_size = background::auto_cell_size(width, height);
-        let bg_result = background::estimate_background_mesh(&lum, width, height, cell_size);
+        let (background, noise) =
+            adaptive_detection::background_and_noise(&lum, width, height);
         let background_ms = t_bg.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Single-pass detection with fixed FWHM=3.0 (no calibration, no pass 2) ──
         let t_det = std::time::Instant::now();
-        let initial_fwhm = 3.0_f32;
-        let mut detected = detection::detect_stars(
+        let detected = adaptive_detection::detect_stars_adaptive(
             &lum,
             width,
             height,
-            bg_result.background,
-            bg_result.noise,
-            bg_result.background_map.as_deref(),
-            bg_result.noise_map.as_deref(),
-            &det_params,
-            initial_fwhm,
-            None,
+            self.config.max_stars,
+            0.8,
         );
         let detection_ms = t_det.elapsed().as_secs_f64() * 1000.0;
 
-        // Sort by flux descending, truncate to max_stars, pack into FastStar.
-        detected.sort_by(|a, b| b.flux.partial_cmp(&a.flux).unwrap_or(std::cmp::Ordering::Equal));
-        if detected.len() > self.config.max_stars {
-            detected.truncate(self.config.max_stars);
-        }
+        // Already brightest-first and trimmed to max_stars by the detector.
         let stars: Vec<FastStar> = detected
             .into_iter()
             .map(|s| FastStar {
@@ -1149,8 +1135,8 @@ impl ImageAnalyzer {
             width,
             height,
             stars,
-            background: bg_result.background,
-            noise: bg_result.noise,
+            background,
+            noise,
             timing: FastDetectTiming {
                 read_ms: 0.0,
                 prep_ms,
@@ -1160,6 +1146,7 @@ impl ImageAnalyzer {
             },
         })
     }
+
 }
 
 impl Default for ImageAnalyzer {
