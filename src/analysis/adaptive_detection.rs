@@ -211,7 +211,6 @@ fn hfd_at(
     height: usize,
     sx: usize,
     sy: usize,
-    saturation_limit: f32,
 ) -> Option<(f32, f32, f32, f32, f32, f32)> {
     let mut rs: i32 = 14;
     let annulus_w: i32 = 3;
@@ -238,18 +237,6 @@ fn hfd_at(
     let sd_bg = (1.4826 * median(&mut devs)).max(1.0);
 
     // Flux-weighted centroid + shrink-to-symmetry box.
-    //
-    // Phase 3 (saturation gate): pixels whose RAW value is at or above
-    // `saturation_limit` are EXCLUDED from the centroid sum. Their value
-    // is clipped at the sensor ceiling, so they contribute biased weight
-    // toward whichever side of the flat-topped core saw more spillover
-    // — the source of the 0023 corpus failure (42% of detections had
-    // saturated cores, biasing every quad match by 0.5–2 px and
-    // poisoning the affine fit). The peak / flux / HFD computed below
-    // still see the raw saturated pixels so the SNR rank is preserved.
-    // When `saturation_limit = f32::INFINITY` (the default for callers
-    // that don't set `with_saturation_fraction`), behaviour is
-    // byte-identical to the pre-Phase-3 detector.
     let (cx, cy);
     let (mut sum_val, mut sum_x, mut sum_y);
     loop {
@@ -264,11 +251,7 @@ fn hfd_at(
                 if x < 0 || y < 0 || x as usize >= width || y as usize >= height {
                     continue;
                 }
-                let raw = lum[y as usize * width + x as usize];
-                if raw >= saturation_limit {
-                    continue;
-                }
-                let val = raw - star_bg;
+                let val = lum[y as usize * width + x as usize] - star_bg;
                 if val > 3.0 * sd_bg {
                     sum_val += val as f64;
                     sum_x += val as f64 * x as f64;
@@ -403,7 +386,6 @@ fn scan_region(
     detection_level: f32,
     noise: f32,
     hfd_min: f32,
-    saturation_limit: f32,
     mask: &mut [u8],
     out: &mut Vec<Star>,
     max_stars: usize,
@@ -428,7 +410,7 @@ fn scan_region(
                 continue;
             }
             if let Some((cx, cy, hfd, flux, peak, snr)) =
-                hfd_at(lum, width, height, x, y, saturation_limit)
+                hfd_at(lum, width, height, x, y)
             {
                 if hfd > hfd_min && hfd <= 30.0 && snr > 10.0 {
                     let mi = (cy.round() as i32).clamp(0, height as i32 - 1) as usize
@@ -462,7 +444,6 @@ pub fn detect_stars_adaptive(
     height: usize,
     max_stars: usize,
     hfd_min: f32,
-    saturation_limit: f32,
 ) -> Vec<(DetectedStar, f32)> {
     if width < 8 || height < 8 {
         return Vec::new();
@@ -482,7 +463,7 @@ pub fn detect_stars_adaptive(
                 if star_level > 30.0 * noise {
                     scan_region(
                         lum, width, height, 0, 0, width, height, bg, star_level,
-                        noise, hfd_min, saturation_limit, &mut mask, &mut stars, max_stars,
+                        noise, hfd_min, &mut mask, &mut stars, max_stars,
                     );
                 }
             }
@@ -490,7 +471,7 @@ pub fn detect_stars_adaptive(
                 if star_level2 > 30.0 * noise {
                     scan_region(
                         lum, width, height, 0, 0, width, height, bg,
-                        star_level2, noise, hfd_min, saturation_limit, &mut mask, &mut stars,
+                        star_level2, noise, hfd_min, &mut mask, &mut stars,
                         max_stars,
                     );
                 }
@@ -498,7 +479,7 @@ pub fn detect_stars_adaptive(
             2 => {
                 scan_region(
                     lum, width, height, 0, 0, width, height, bg,
-                    30.0 * noise, noise, hfd_min, saturation_limit, &mut mask, &mut stars,
+                    30.0 * noise, noise, hfd_min, &mut mask, &mut stars,
                     max_stars,
                 );
             }
@@ -539,8 +520,8 @@ pub fn detect_stars_adaptive(
                         let (lbg, lnoise) = local_bg_noise(&samp);
                         scan_region(
                             lum, width, height, x0, y0, x1, y1, lbg,
-                            7.0 * lnoise, lnoise.max(noise), hfd_min, saturation_limit,
-                            &mut mask, &mut stars, max_stars,
+                            7.0 * lnoise, lnoise.max(noise), hfd_min, &mut mask,
+                            &mut stars, max_stars,
                         );
                     }
                 }

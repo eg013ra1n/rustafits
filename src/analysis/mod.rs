@@ -1113,21 +1113,12 @@ impl ImageAnalyzer {
         let background_ms = t_bg.elapsed().as_secs_f64() * 1000.0;
 
         let t_det = std::time::Instant::now();
-        // Phase 3: `saturation_fraction` now flows into `hfd_at` so callers
-        // who set `with_saturation_fraction(< 1.0)` get unbiased centroids
-        // on saturated stars (pixels at/above the limit are excluded from
-        // the centroid sum but still contribute to peak/flux/SNR). Default
-        // `saturation_fraction = 0.95` → limit ≈ 62 258 ADU; callers that
-        // don't change the default get the same behaviour as before only
-        // for pixels at 62 258+ (the canonical 16-bit saturation envelope).
-        let saturation_limit = self.config.saturation_fraction * 65535.0;
         let detected = adaptive_detection::detect_stars_adaptive(
             &lum,
             width,
             height,
             self.config.max_stars,
             0.8,
-            saturation_limit,
         );
         let detection_ms = t_det.elapsed().as_secs_f64() * 1000.0;
 
