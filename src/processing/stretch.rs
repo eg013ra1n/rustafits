@@ -88,13 +88,33 @@ pub struct StretchParams {
 pub fn compute_stretch_params(data: &[f32], max_input: f32) -> StretchParams {
     const MAX_SAMPLES: usize = 500_000;
 
+    // Skip non-finite samples: float FITS/XISF data commonly carries NaN
+    // (registration borders, rejected pixels). Quickselect is purely
+    // comparison-based and NaN compares false against everything, so NaN
+    // in the sample set yields a NaN median/MADN → NaN shadows/midtones →
+    // every pixel stretches to NaN → saturating cast renders the whole
+    // frame black with no error.
     let num_samples = data.len().min(MAX_SAMPLES);
-    let mut samples = if data.len() <= MAX_SAMPLES {
-        data.to_vec()
+    let mut samples: Vec<f32> = if data.len() <= MAX_SAMPLES {
+        data.iter().copied().filter(|v| v.is_finite()).collect()
     } else {
         let step = data.len() / MAX_SAMPLES;
-        (0..num_samples).map(|i| data[i * step]).collect()
+        (0..num_samples)
+            .map(|i| data[i * step])
+            .filter(|v| v.is_finite())
+            .collect()
     };
+
+    if samples.is_empty() {
+        // Every sample was NaN/Inf (fully blank float frame): neutral
+        // params instead of NaN-poisoned ones. midtones = 0.5 is the
+        // identity midtones transfer.
+        return StretchParams {
+            shadows: 0.0,
+            highlights: 1.0,
+            midtones: 0.5,
+        };
+    }
 
     let median = find_median(&mut samples);
 
@@ -497,5 +517,100 @@ fn apply_stretch_neon(
     for idx in i..count {
         output[output_offset + idx * stride] =
             stretch_pixel(channel_data[idx], native_shadows, native_highlights, k1, k2, midtones);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-noise so tests don't need a rand dependency.
+    fn synth_background(n: usize, level: f32, spread: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = (i as f32 * 0.731).sin() * (i as f32 * 0.0137).cos();
+                level + t * spread
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nan_heavy_samples_produce_finite_params() {
+        // ~30% NaN (registration-border case). Pre-fix this poisoned the
+        // MADN median and every parameter came back NaN → all-black frame.
+        let mut data = synth_background(10_000, 500.0, 30.0);
+        for i in 0..data.len() {
+            if i % 3 == 0 {
+                data[i] = f32::NAN;
+            }
+        }
+        let p = compute_stretch_params(&data, 65536.0);
+        assert!(p.shadows.is_finite(), "shadows must be finite, got {}", p.shadows);
+        assert!(p.highlights.is_finite(), "highlights must be finite");
+        assert!(p.midtones.is_finite(), "midtones must be finite");
+        assert!(p.highlights > p.shadows, "stretch range must be non-empty");
+
+        // And real pixel values must still render non-black through the
+        // stretch (the background level should land mid-gray, not 0).
+        let hs = 1.0 / (p.highlights - p.shadows);
+        let ns = p.shadows * 65536.0;
+        let nh = p.highlights * 65536.0;
+        let k1 = (p.midtones - 1.0) * hs * 255.0 / 65536.0;
+        let k2 = (2.0 * p.midtones - 1.0) * hs / 65536.0;
+        let bg = stretch_pixel(500.0, ns, nh, k1, k2, p.midtones);
+        assert!(bg > 10, "background must render visibly, got {}", bg);
+    }
+
+    #[test]
+    fn all_nan_falls_back_to_neutral_params() {
+        let data = vec![f32::NAN; 4096];
+        let p = compute_stretch_params(&data, 65536.0);
+        assert_eq!(p.shadows, 0.0);
+        assert_eq!(p.highlights, 1.0);
+        assert_eq!(p.midtones, 0.5);
+    }
+
+    #[test]
+    fn inf_samples_are_ignored() {
+        let mut data = synth_background(10_000, 500.0, 30.0);
+        data[100] = f32::INFINITY;
+        data[200] = f32::NEG_INFINITY;
+        let clean = synth_background(10_000, 500.0, 30.0);
+        let p_dirty = compute_stretch_params(&data, 65536.0);
+        let p_clean = compute_stretch_params(&clean, 65536.0);
+        // Two Inf samples out of 10k must not move the params measurably.
+        assert!((p_dirty.shadows - p_clean.shadows).abs() < 1e-4);
+        assert!((p_dirty.midtones - p_clean.midtones).abs() < 1e-4);
+    }
+
+    /// The STF is scale-adaptive: the same image in the u16 ADU domain and
+    /// as PixInsight-style [0,1] floats must stretch to (nearly) the same
+    /// 8-bit output. Locks in behavior verified during the 2026-06-10 audit
+    /// so future max_input changes can't silently break float rendering.
+    #[test]
+    fn unit_range_floats_stretch_like_u16() {
+        let adu = synth_background(50_000, 500.0, 30.0);
+        let unit: Vec<f32> = adu.iter().map(|v| v / 65535.0).collect();
+
+        let pa = compute_stretch_params(&adu, 65536.0);
+        let pu = compute_stretch_params(&unit, 65536.0);
+
+        let render = |p: &StretchParams, v: f32| -> u8 {
+            let hs = 1.0 / (p.highlights - p.shadows);
+            let ns = p.shadows * 65536.0;
+            let nh = p.highlights * 65536.0;
+            let k1 = (p.midtones - 1.0) * hs * 255.0 / 65536.0;
+            let k2 = (2.0 * p.midtones - 1.0) * hs / 65536.0;
+            stretch_pixel(v, ns, nh, k1, k2, p.midtones)
+        };
+
+        for &probe in &[440.0f32, 500.0, 560.0, 800.0, 5000.0, 65000.0] {
+            let a = render(&pa, probe) as i32;
+            let u = render(&pu, probe / 65535.0) as i32;
+            assert!(
+                (a - u).abs() <= 3,
+                "u16-domain ({probe} ADU) → {a}, [0,1]-domain → {u}: must agree within 3"
+            );
+        }
     }
 }

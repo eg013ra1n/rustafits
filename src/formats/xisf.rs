@@ -285,8 +285,11 @@ fn decompress_block(compressed: &[u8], uncompressed_size: usize, codec: XisfComp
 fn convert_chunk(src: &[u8], dst: &mut [f32], format: XisfSampleFormat) {
     match format {
         XisfSampleFormat::Uint8 => {
+            // ×257 (not ×256) so 255 maps to 65535, matching the u16 domain
+            // exactly — ×256 tops out at 65280 and renders 8-bit data ~0.4%
+            // darker than the same image stored as u16.
             for i in 0..dst.len() {
-                dst[i] = src[i] as f32 * 256.0;
+                dst[i] = src[i] as f32 * 257.0;
             }
         }
         XisfSampleFormat::Uint16 => {

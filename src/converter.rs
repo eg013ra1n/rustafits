@@ -30,7 +30,8 @@ impl ImageConverter {
     }
 
     pub fn with_downscale(mut self, factor: usize) -> Self {
-        self.downscale = factor;
+        // Factor 0 would divide-by-zero in the downscale kernels.
+        self.downscale = factor.max(1);
         self
     }
 
