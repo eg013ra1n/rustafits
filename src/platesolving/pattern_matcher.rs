@@ -1,6 +1,6 @@
-/// ASTAP-style plate solving: nearest-neighbor quad matching with center correspondences.
+/// Quad-based plate solving: nearest-neighbour quad matching with center correspondences.
 ///
-/// Algorithm (from rastap / ASTAP):
+/// Algorithm:
 /// 1. For each star, find 3 nearest neighbors → 1 quad per star
 /// 2. Compute 6 pairwise distances, sort, normalize by longest → scale-invariant ratios
 /// 3. Brute-force compare ratios with tolerance (early exit on first mismatch)
@@ -133,18 +133,18 @@ fn push_quad_from_indices(
     });
 }
 
-/// ASTAP-style quad construction with a tunable per-star group size.
+/// Quad construction with a tunable per-star group size.
 ///
 /// For each of the `max_stars` brightest stars, take its `group_size - 1`
 /// nearest neighbors to form a local group of `group_size` stars, then emit
 /// every C(group_size, 4) sub-quad. `group_size == 4` reproduces the classic
-/// "1 quad per star" behaviour exactly; larger groups (ASTAP's
-/// `find_many_quads`: 6 → 15 quads/star, 5 → 5 quads/star) massively densify
-/// the quad pool for sparse, long-focal-length fields where only a handful of
-/// catalog-depth stars are present — without which a correct quad almost
-/// never forms. Quads are deduplicated globally by their sorted star-index
-/// set (and, for `group_size == 4`, additionally by center to stay identical
-/// to the original).
+/// "1 quad per star" behaviour exactly; larger groups (6 → 15 quads/star,
+/// 5 → 5 quads/star) massively densify the quad pool for sparse,
+/// long-focal-length fields where only a handful of catalog-depth stars are
+/// present — without which a correct quad almost never forms. Quads are
+/// deduplicated globally by their sorted star-index set (and, for
+/// `group_size == 4`, additionally by center to stay identical to the
+/// original).
 pub fn build_quads_multi(
     stars: &[(f64, f64)],
     max_stars: usize,
