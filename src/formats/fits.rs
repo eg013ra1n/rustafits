@@ -130,6 +130,12 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     let hdr = read_fits_header(&mut reader)?;
 
     let channels = if hdr.naxis >= 3 && hdr.naxis3 > 0 {
+        if hdr.naxis3 != 1 && hdr.naxis3 != 3 {
+            bail!(
+                "unsupported NAXIS3={}: expected 1 (mono) or 3 (RGB)",
+                hdr.naxis3
+            );
+        }
         hdr.naxis3
     } else {
         1
@@ -407,4 +413,77 @@ unsafe fn bswap_u16_xor_ssse3(src: &[u8], dst: &mut [u16], start: usize, n: usiz
         i += 8;
     }
     i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Formats a single 80-byte FITS header card: an 8-char keyword field,
+    /// `= `, then the value, right-padded with spaces to `FITS_CARD_SIZE`.
+    fn make_card(keyword: &str, value: impl std::fmt::Display) -> String {
+        let mut card = format!("{:<8}= {}", keyword, value);
+        card.truncate(FITS_CARD_SIZE);
+        format!("{:<width$}", card, width = FITS_CARD_SIZE)
+    }
+
+    /// Concatenates cards, appends an END card, then pads with spaces to a
+    /// multiple of `FITS_BLOCK_SIZE` (the reader always reads full blocks).
+    fn build_header_block(cards: &[String]) -> Vec<u8> {
+        let mut bytes: Vec<u8> = cards.iter().flat_map(|c| c.bytes()).collect();
+        bytes.extend(format!("{:<width$}", "END", width = FITS_CARD_SIZE).bytes());
+        let rem = bytes.len() % FITS_BLOCK_SIZE;
+        if rem != 0 {
+            bytes.extend(std::iter::repeat(b' ').take(FITS_BLOCK_SIZE - rem));
+        }
+        bytes
+    }
+
+    /// Writes a minimal synthetic 16-bit FITS file (2x2xNAXIS3, zero-filled
+    /// pixel data) with the given NAXIS/NAXIS3 to a temp path for testing.
+    fn write_synthetic_fits(path: &Path, naxis: i32, naxis3: i32) {
+        let cards = vec![
+            make_card("SIMPLE", "T"),
+            make_card("BITPIX", 16),
+            make_card("NAXIS", naxis),
+            make_card("NAXIS1", 2),
+            make_card("NAXIS2", 2),
+            make_card("NAXIS3", naxis3),
+        ];
+        let mut bytes = build_header_block(&cards);
+        let channels = if naxis >= 3 { naxis3.max(1) as usize } else { 1 };
+        let pixel_bytes = 2 * 2 * channels * 2; // BITPIX=16 -> 2 bytes/pixel
+        bytes.extend(std::iter::repeat(0u8).take(pixel_bytes));
+        std::fs::write(path, bytes).expect("failed to write synthetic FITS test file");
+    }
+
+    #[test]
+    fn read_fits_image_rejects_invalid_naxis3() {
+        let path = std::env::temp_dir()
+            .join(format!("rustafits_test_naxis3_invalid_{}.fits", std::process::id()));
+        write_synthetic_fits(&path, 3, 5);
+
+        let result = read_fits_image(&path);
+        let _ = std::fs::remove_file(&path);
+
+        match result {
+            Ok(_) => panic!("NAXIS3=5 must be rejected, not silently accepted"),
+            Err(err) => assert!(
+                err.to_string().contains("NAXIS3=5"),
+                "unexpected error message: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn read_fits_image_accepts_naxis3_rgb() {
+        let path = std::env::temp_dir()
+            .join(format!("rustafits_test_naxis3_rgb_{}.fits", std::process::id()));
+        write_synthetic_fits(&path, 3, 3);
+
+        let result = read_fits_image(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_ok(), "NAXIS3=3 must still parse: {:?}", result.err());
+    }
 }
