@@ -591,6 +591,12 @@ impl ImageAnalyzer {
         let (meta, pixel_data) =
             formats::read_image(path).context("Failed to read image for fast detection")?;
         let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "read",
+            duration_ms = read_ms,
+            path = %path.display(),
+            "fast detection stage timing"
+        );
 
         let f32_data = match pixel_data {
             PixelData::Float32(d) => d,
@@ -728,6 +734,13 @@ impl ImageAnalyzer {
         }
         // noise_layers == 0: keep MAD noise from mesh-grid (already in bg_result.noise)
         let background_ms = t.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "background",
+            duration_ms = background_ms,
+            background = bg_result.background,
+            noise = bg_result.noise,
+            "analysis stage timing"
+        );
 
         // ── Stage 2, Pass 1: Discovery ───────────────────────────────────
         let t = std::time::Instant::now();
@@ -743,6 +756,12 @@ impl ImageAnalyzer {
             )
         };
         let detection_pass1_ms = t.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "detect_pass1",
+            duration_ms = detection_pass1_ms,
+            count = pass1_stars.len(),
+            "analysis stage timing"
+        );
 
         // Select calibration stars: brightest, not saturated, not too elongated
         let t = std::time::Instant::now();
@@ -807,6 +826,12 @@ impl ImageAnalyzer {
         }
 
         let calibration_ms = t.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "calibration",
+            duration_ms = calibration_ms,
+            count = calibration_stars.len(),
+            "analysis stage timing"
+        );
 
         // Source-mask background re-estimation skipped for speed.
         // The sigma-clipped cell stats already reject >30% star-contaminated
@@ -838,6 +863,12 @@ impl ImageAnalyzer {
             )
         };
         let detection_pass2_ms = t.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "detect_pass2",
+            duration_ms = detection_pass2_ms,
+            count = detected.len(),
+            "analysis stage timing"
+        );
 
         let bg_map_ref = bg_result.background_map.as_deref();
         let detection_threshold = self.config.detection_sigma * bg_result.noise;
@@ -851,6 +882,14 @@ impl ImageAnalyzer {
         let pass1_detections = pass1_stars.len();
 
         let make_zero_result = |stars_detected: usize| {
+            let total_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+            tracing::debug!(
+                stage = "total",
+                duration_ms = total_ms,
+                stars_detected,
+                count = 0,
+                "analysis pipeline finished (no stars measured)"
+            );
             Ok(AnalysisResult {
                 width, height, source_channels: channels,
                 background: bg_result.background, noise: bg_result.noise,
@@ -868,7 +907,7 @@ impl ImageAnalyzer {
                 stage_timing: StageTiming {
                     background_ms: 0.0, detection_pass1_ms: 0.0, calibration_ms: 0.0,
                     detection_pass2_ms: 0.0, measurement_ms: 0.0, snr_ms: 0.0,
-                    statistics_ms: 0.0, total_ms: pipeline_start.elapsed().as_secs_f64() * 1000.0,
+                    statistics_ms: 0.0, total_ms,
                 },
             })
         };
@@ -943,6 +982,14 @@ impl ImageAnalyzer {
         let gaussian_count = measured.iter()
             .filter(|s| matches!(s.fit_method, FitMethod::Gaussian))
             .count();
+        tracing::debug!(
+            stage = "measurement",
+            duration_ms = measurement_ms,
+            count = stars_measured,
+            moffat_count,
+            gaussian_count,
+            "analysis stage timing"
+        );
 
         if measured.is_empty() {
             return make_zero_result(stars_detected);
@@ -1067,6 +1114,12 @@ impl ImageAnalyzer {
         let t = std::time::Instant::now();
         snr::compute_star_snr(&lum, width, height, &mut measured, median_fwhm);
         let snr_ms = t.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "snr",
+            duration_ms = snr_ms,
+            count = measured.len(),
+            "analysis stage timing"
+        );
 
         let t = std::time::Instant::now();
         let mut snr_vals: Vec<f32> = measured.iter().map(|s| s.snr).collect();
@@ -1110,8 +1163,23 @@ impl ImageAnalyzer {
                 hfr_arcsec: plate_scale.map(|s| m.hfr * s),
             })
             .collect();
+        let stars_count = stars.len();
         let statistics_ms = statistics_ms_before_snr + t.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "statistics",
+            duration_ms = statistics_ms,
+            count = stars_count,
+            "analysis stage timing"
+        );
         let total_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "total",
+            duration_ms = total_ms,
+            stars_detected,
+            stars_measured,
+            count = stars_count,
+            "analysis pipeline finished"
+        );
 
         Ok(AnalysisResult {
             width, height, source_channels: channels,
@@ -1163,11 +1231,23 @@ impl ImageAnalyzer {
             data[..width * height].to_vec()
         };
         let prep_ms = t_prep.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "prep",
+            duration_ms = prep_ms,
+            "fast detection stage timing"
+        );
 
         let t_bg = std::time::Instant::now();
         let (background, noise) =
             adaptive_detection::background_and_noise(&lum, width, height);
         let background_ms = t_bg.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "background",
+            duration_ms = background_ms,
+            background,
+            noise,
+            "fast detection stage timing"
+        );
 
         let t_det = std::time::Instant::now();
         let detected = adaptive_detection::detect_stars_adaptive(
@@ -1178,6 +1258,13 @@ impl ImageAnalyzer {
             0.8,
         );
         let detection_ms = t_det.elapsed().as_secs_f64() * 1000.0;
+        let detected_count = detected.len();
+        tracing::debug!(
+            stage = "detect",
+            duration_ms = detection_ms,
+            count = detected_count,
+            "fast detection stage timing"
+        );
 
         // Already brightest-first and trimmed to max_stars by the detector.
         // Build pass-1 FastStar list (sx/sy/fwhm = 0 — will be filled if
@@ -1247,6 +1334,12 @@ impl ImageAnalyzer {
         // --- end PSF refinement -----------------------------------------------
 
         let total_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            stage = "total",
+            duration_ms = total_ms,
+            count = detected_count,
+            "fast detection pipeline finished"
+        );
 
         Ok(FastAnalysisResult {
             width,

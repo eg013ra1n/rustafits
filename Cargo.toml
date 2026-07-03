@@ -39,6 +39,7 @@ quick-xml = "0.37"
 base64 = "0.22"
 rayon = "1.10"
 nalgebra = "0.33"
+tracing = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
