@@ -20,6 +20,8 @@ pub struct AnnotationConfig {
     pub color_scheme: ColorScheme,
     /// Draw a direction tick along the elongation axis.
     pub show_direction_tick: bool,
+    /// Ellipse semi-axis scale in units of FWHM (semi-major = fwhm_x × scale).
+    pub ellipse_scale: f32,
     /// Minimum ellipse semi-axis radius in output pixels.
     pub min_radius: f32,
     /// Maximum ellipse semi-axis radius in output pixels.
@@ -43,6 +45,7 @@ impl Default for AnnotationConfig {
         AnnotationConfig {
             color_scheme: ColorScheme::Eccentricity,
             show_direction_tick: true,
+            ellipse_scale: 1.2,
             min_radius: 6.0,
             max_radius: 60.0,
             line_width: 2,
@@ -102,12 +105,12 @@ pub fn compute_annotations(
                 star.y * scale_y
             };
 
-            // Semi-axes: scale FWHM to output, multiply by 2.5 for visibility, then clamp.
+            // Semi-axes: scale FWHM to output, multiply by ellipse_scale, then clamp.
             // metrics.rs guarantees fwhm_x >= fwhm_y with theta along major axis.
             let raw_a = star.fwhm_x * scale_x;
             let raw_b = star.fwhm_y * scale_y;
-            let semi_major = (raw_a * 2.5).clamp(config.min_radius, config.max_radius);
-            let semi_minor = (raw_b * 2.5).clamp(config.min_radius, config.max_radius);
+            let semi_major = (raw_a * config.ellipse_scale).clamp(config.min_radius, config.max_radius);
+            let semi_minor = (raw_b * config.ellipse_scale).clamp(config.min_radius, config.max_radius);
 
             let color = star_color(config, star.eccentricity, star.fwhm, result.median_fwhm);
 
