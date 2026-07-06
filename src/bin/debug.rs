@@ -229,7 +229,10 @@ fn run() -> Result<()> {
         "measure" => cmd_measure(&lum, width, height, green_mask.as_deref(), &opts),
         "fit" => cmd_fit(&lum, width, height, &opts),
         "query" => cmd_query(&lum, width, height, green_mask.as_deref(), &opts),
-        "pipeline" => cmd_pipeline(&lum, width, height, channels, green_mask.as_deref(), &opts),
+        // `lum` is already a single extracted luminance plane — pass channels=1
+        // regardless of the source channel count, or analyze_data will attempt
+        // a second luminance extraction and index past the buffer on RGB input.
+        "pipeline" => cmd_pipeline(&lum, width, height, 1, green_mask.as_deref(), &opts),
         "dump" => cmd_dump(&lum, width, height, green_mask.as_deref(), &opts),
         other => bail!("Unknown subcommand: {}", other),
     }

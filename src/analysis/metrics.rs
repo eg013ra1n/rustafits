@@ -437,8 +437,19 @@ fn measure_single_star(
     });
     let stamp_mask_ref = stamp_mask.as_deref();
 
-    // Robust sigma estimate used by all paths (HFR, moments, Gaussian fit)
+    // Robust sigma estimate used by all paths (HFR, moments, Gaussian fit).
+    // Floor at the field sigma when calibration provided one: the per-star
+    // half-max walk breaks on broad low-amplitude profiles (defocus) — the
+    // local-bg annulus at r∈[4,8] sits inside the profile and the peak reads
+    // a single noisy pixel — collapsing sigma and with it the LM fit window
+    // (sub-pixel FWHM fits with low residuals). The field value from bright-
+    // star calibration is the reliable lower bound for the fit window; the
+    // per-star estimate still wins whenever it reads larger.
     let robust_sigma = estimate_sigma_halfmax(&stamp, stamp_w, rel_cx, rel_cy);
+    let robust_sigma = match field_fwhm {
+        Some(ff) => robust_sigma.max(ff / 2.3548),
+        None => robust_sigma,
+    };
     let hfr_radius = 5.0_f32.max(4.0 * robust_sigma);
 
     // Compute HFR within the star vicinity (not the entire stamp)
@@ -1353,6 +1364,49 @@ mod tests {
             }
         }
         data
+    }
+
+    #[test]
+    fn test_broad_faint_star_fwhm_does_not_collapse() {
+        // Defocused-frame regression (m101 2023 set): a broad low-amplitude
+        // star with a hot pixel at the centroid. The per-star half-max sigma
+        // estimate collapses (local-bg annulus r∈[4,8] sits inside the profile,
+        // peak reads the 1px spike), shrinking the LM fit window to ~5px and
+        // producing a sub-pixel FWHM fit. With field_fwhm known (~12px from
+        // calibration), the measured FWHM must stay in the star's true regime.
+        let width = 120;
+        let height = 120;
+        let background = 500.0_f32;
+        let true_sigma = 5.1_f32; // FWHM ≈ 12px
+        let amp = 60.0_f32;
+        let mut data = make_star_image(width, height, 60.0, 60.0, amp, true_sigma, background);
+        data[60 * width + 60] += 80.0; // hot pixel on the centroid
+
+        let star = DetectedStar {
+            x: 60.0,
+            y: 60.0,
+            peak: amp + 80.0,
+            flux: 2.0 * std::f32::consts::PI * true_sigma * true_sigma * amp,
+            area: 510,
+            theta: 0.0,
+            eccentricity: 0.1,
+        };
+
+        let field_fwhm = 12.0_f32;
+        let measured = measure_stars(
+            &data, width, height, std::slice::from_ref(&star),
+            background, None, None,
+            Some(3.0), 25, 1e-4, 5,
+            Some(field_fwhm),
+        );
+
+        assert_eq!(measured.len(), 1, "star must be measured");
+        let fwhm = measured[0].fwhm;
+        assert!(
+            fwhm > 6.0,
+            "broad faint star FWHM collapsed: got {:.2}px, true ~12px",
+            fwhm
+        );
     }
 
     #[test]
