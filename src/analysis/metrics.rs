@@ -624,16 +624,23 @@ fn measure_with_moments(
     })
 }
 
-/// Compute ellipse parameters from intensity-weighted second-order moments.
-/// Returns `(theta, sigma_major, sigma_minor)` where theta is the position angle
-/// of the major axis in radians, and sigmas are sqrt(eigenvalue) of the 2×2
-/// covariance matrix.
-fn moments_ellipse(stamp: &[f32], stamp_w: usize, cx: f32, cy: f32) -> (f64, f64, f64) {
+/// Compute ellipse parameters from intensity-weighted second-order moments
+/// within `radius` of the nominal centre. Returns `(theta, sigma_major,
+/// sigma_minor)` where theta is the position angle of the major axis in
+/// radians, and sigmas are sqrt(eigenvalue) of the 2×2 covariance matrix.
+///
+/// The radius limit matters: these moments initialise the LM ellipse fit,
+/// and the (square) stamp extends past the circular fitting disc — corners
+/// and any neighbouring star in them would skew the init axis ratio and
+/// angle enough to strand the fit in a rounder local minimum (seen against
+/// PixInsight DynamicPSF per-star references on real frames).
+fn moments_ellipse(stamp: &[f32], stamp_w: usize, cx: f32, cy: f32, radius: f64) -> (f64, f64, f64) {
     let stamp_h = stamp.len() / stamp_w;
     let mut m_xx = 0.0_f64;
     let mut m_yy = 0.0_f64;
     let mut m_xy = 0.0_f64;
     let mut sum_w = 0.0_f64;
+    let radius_sq = radius * radius;
 
     for sy in 0..stamp_h {
         for sx in 0..stamp_w {
@@ -643,6 +650,9 @@ fn moments_ellipse(stamp: &[f32], stamp_w: usize, cx: f32, cy: f32) -> (f64, f64
             }
             let dx = sx as f64 - cx as f64;
             let dy = sy as f64 - cy as f64;
+            if dx * dx + dy * dy > radius_sq {
+                continue;
+            }
             m_xx += val * dx * dx;
             m_yy += val * dy * dy;
             m_xy += val * dx * dy;
@@ -758,7 +768,7 @@ fn measure_with_gaussian_fit(
     // Use moments to get initial theta and per-axis sigmas, then scale
     // to match the halfmax geometric mean (moments give good axis ratio +
     // angle, halfmax gives good absolute scale).
-    let (mom_theta, mom_major, mom_minor) = moments_ellipse(stamp, stamp_w, init_cx, init_cy);
+    let (mom_theta, mom_major, mom_minor) = moments_ellipse(stamp, stamp_w, init_cx, init_cy, fitting_radius);
     let scale = init_sigma as f64 / (mom_major * mom_minor).sqrt().max(0.1);
     let init_sx = (mom_major * scale).max(0.5);
     let init_sy = (mom_minor * scale).max(0.5);
@@ -900,7 +910,7 @@ fn measure_with_moffat_fit(
         annulus_vals[annulus_vals.len() / 2]
     };
 
-    let (mom_theta, mom_major, mom_minor) = moments_ellipse(stamp, stamp_w, init_cx, init_cy);
+    let (mom_theta, mom_major, mom_minor) = moments_ellipse(stamp, stamp_w, init_cx, init_cy, fitting_radius);
     let scale = init_sigma as f64 / (mom_major * mom_minor).sqrt().max(0.1);
     let init_sx = (mom_major * scale).max(0.5);
     let init_sy = (mom_minor * scale).max(0.5);
@@ -1364,6 +1374,79 @@ mod tests {
             }
         }
         data
+    }
+
+    #[test]
+    fn test_moment_init_confined_to_fitting_disc() {
+        // Regression for the elongated-star ecc/theta underestimate found
+        // against PixInsight DynamicPSF per-star references (m42 30s frame,
+        // e.g. the star at (3821, 2531): true ecc ~0.55/θ +78°, measured
+        // 0.18/θ 69° before the fix). moments_ellipse initialises the LM
+        // ellipse fit; computed over the whole (square) stamp it is skewed
+        // by stamp corners and neighbouring stars outside the circular
+        // fitting disc, and the fit strands in a rounder local minimum.
+        let size = 41;
+        let mut stamp = vec![0.0_f32; size * size];
+        // Central star: sigma 2.0 × 1.2 at +45° → ecc 0.8
+        let theta = std::f32::consts::FRAC_PI_4;
+        let (ct, st) = (theta.cos(), theta.sin());
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f32 - 20.0;
+                let dy = y as f32 - 20.0;
+                let u = dx * ct + dy * st;
+                let v = -dx * st + dy * ct;
+                stamp[y * size + x] +=
+                    8000.0 * (-u * u / (2.0 * 2.0 * 2.0) - v * v / (2.0 * 1.2 * 1.2)).exp();
+            }
+        }
+        // Bright round neighbour toward the stamp corner at (+12, −12):
+        // inside the stamp, outside a ~6px fitting disc, along −45°.
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f32 - 32.0;
+                let dy = y as f32 - 8.0;
+                stamp[y * size + x] +=
+                    30000.0 * (-(dx * dx + dy * dy) / (2.0 * 1.3 * 1.3)).exp();
+            }
+        }
+
+        let fitting_radius = 6.0_f64;
+
+        // Confined to the fitting disc: the init must reflect the central
+        // star — major axis along +45°, axis ratio ~2.0/1.2.
+        let (t, major, minor) = moments_ellipse(&stamp, size, 20.0, 20.0, fitting_radius);
+        let dt = {
+            let mut d = (t.to_degrees() - 45.0) % 180.0;
+            if d > 90.0 { d -= 180.0; }
+            if d < -90.0 { d += 180.0; }
+            d.abs()
+        };
+        assert!(dt < 10.0, "confined init theta {:.1}° expected ~+45°", t.to_degrees());
+        let ratio = major / minor;
+        assert!(
+            (1.3..2.2).contains(&ratio),
+            "confined init axis ratio {:.2} expected ~1.67",
+            ratio
+        );
+
+        // Whole-stamp moments (the pre-fix behaviour, radius spanning the
+        // stamp diagonal) are dominated by the neighbour: major axis flips
+        // toward −45° with a wildly inflated ratio. This is what used to
+        // poison the LM init.
+        let (t_bad, major_bad, minor_bad) = moments_ellipse(&stamp, size, 20.0, 20.0, 60.0);
+        let dt_bad = {
+            let mut d = (t_bad.to_degrees() - (-45.0)) % 180.0;
+            if d > 90.0 { d -= 180.0; }
+            if d < -90.0 { d += 180.0; }
+            d.abs()
+        };
+        assert!(
+            dt_bad < 10.0 && major_bad / minor_bad > 3.0,
+            "whole-stamp moments should be neighbour-dominated (θ {:.1}°, ratio {:.2}) — \
+             if this starts failing the fixture no longer exercises the poisoning scenario",
+            t_bad.to_degrees(), major_bad / minor_bad
+        );
     }
 
     #[test]

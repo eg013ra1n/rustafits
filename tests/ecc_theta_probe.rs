@@ -7,7 +7,8 @@
 //! from population/statistics effects seen in PixInsight comparisons.
 //!
 //! Ignored by default — it prints tables rather than asserting:
-//!     cargo test --release --test ecc_theta_probe -- --ignored --nocapture
+//!     cargo test --release --features debug-pipeline --test ecc_theta_probe -- --ignored --nocapture
+#![cfg(feature = "debug-pipeline")]
 
 use astroimage::analysis::detection::DetectedStar;
 use astroimage::analysis::metrics;
