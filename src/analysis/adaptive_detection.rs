@@ -388,7 +388,7 @@ fn scan_region(
     hfd_min: f32,
     mask: &mut [u8],
     out: &mut Vec<Star>,
-    max_stars: usize,
+    budget: usize,
 ) {
     let cross = 4.0 * noise;
     for y in y0.max(1)..y1.min(height.saturating_sub(1)) {
@@ -426,7 +426,12 @@ fn scan_region(
                             hfd,
                             snr,
                         });
-                        if out.len() >= max_stars {
+                        // Safety bound only — the star cap is applied AFTER a
+                        // completed scan (flux sort + truncate). Returning at
+                        // max_stars here truncated dense frames in row-major
+                        // scan order: cocoon.fits came back as a horizontal
+                        // stripe (all 500 stars at y < 1470 of 4176).
+                        if out.len() >= budget {
                             return;
                         }
                     }
@@ -449,6 +454,9 @@ pub fn detect_stars_adaptive(
         return Vec::new();
     }
     let max_stars = max_stars.max(8);
+    // Per-scan safety bound: well above any real frame's star count at the
+    // ladder levels, only there to bound memory on pathological input.
+    let scan_budget = (max_stars * 64).max(8192);
     let (bg, noise) = background_and_noise(lum, width, height);
     let (star_level, star_level2) = star_levels(lum, bg, noise, max_stars);
 
@@ -463,7 +471,7 @@ pub fn detect_stars_adaptive(
                 if star_level > 30.0 * noise {
                     scan_region(
                         lum, width, height, 0, 0, width, height, bg, star_level,
-                        noise, hfd_min, &mut mask, &mut stars, max_stars,
+                        noise, hfd_min, &mut mask, &mut stars, scan_budget,
                     );
                 }
             }
@@ -472,7 +480,7 @@ pub fn detect_stars_adaptive(
                     scan_region(
                         lum, width, height, 0, 0, width, height, bg,
                         star_level2, noise, hfd_min, &mut mask, &mut stars,
-                        max_stars,
+                        scan_budget,
                     );
                 }
             }
@@ -480,7 +488,7 @@ pub fn detect_stars_adaptive(
                 scan_region(
                     lum, width, height, 0, 0, width, height, bg,
                     30.0 * noise, noise, hfd_min, &mut mask, &mut stars,
-                    max_stars,
+                    scan_budget,
                 );
             }
             _ => {
@@ -493,11 +501,8 @@ pub fn detect_stars_adaptive(
                 };
                 let tw = width.div_ceil(nx);
                 let th = height.div_ceil(ny);
-                'tiles: for ty in 0..ny {
+                for ty in 0..ny {
                     for tx in 0..nx {
-                        if stars.len() >= max_stars {
-                            break 'tiles;
-                        }
                         let x0 = tx * tw;
                         let y0 = ty * th;
                         let x1 = (x0 + tw).min(width);
@@ -521,7 +526,7 @@ pub fn detect_stars_adaptive(
                         scan_region(
                             lum, width, height, x0, y0, x1, y1, lbg,
                             7.0 * lnoise, lnoise.max(noise), hfd_min, &mut mask,
-                            &mut stars, max_stars,
+                            &mut stars, scan_budget,
                         );
                     }
                 }
@@ -553,4 +558,120 @@ pub fn detect_stars_adaptive(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add_star(data: &mut [f32], width: usize, x: f32, y: f32, amp: f32, sigma: f32) {
+        let height = data.len() / width;
+        let r = (4.0 * sigma).ceil() as i32;
+        let inv = 1.0 / (2.0 * sigma * sigma);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let px = x as i32 + dx;
+                let py = y as i32 + dy;
+                if px >= 1 && (px as usize) < width - 1 && py >= 1 && (py as usize) < height - 1 {
+                    let ddx = px as f32 - x;
+                    let ddy = py as f32 - y;
+                    data[py as usize * width + px as usize] +=
+                        amp * (-(ddx * ddx + ddy * ddy) * inv).exp();
+                }
+            }
+        }
+    }
+
+    /// The max_stars cap must select the BRIGHTEST stars frame-wide, not the
+    /// first ones in scan order. Regression: on dense frames the row-major
+    /// scan filled the cap from the top of the image and returned — the fast
+    /// detector only ever saw a horizontal stripe (cocoon.fits: all 500
+    /// stars at y < 1470 of 4176, 3% overlap with the slow path's top-100).
+    #[test]
+    fn cap_keeps_brightest_not_first_in_scan_order() {
+        // Dense-frame regression (cocoon.fits): one bright wide halo eats the
+        // brightest-pixel budget the ladder levels derive from, the working
+        // level drops below hundreds of ordinary stars, and the row-major
+        // scan fills the max_stars cap from the TOP of the frame and returns
+        // — the fast detector only ever saw a horizontal stripe (all 500
+        // cocoon stars at y < 1470 of 4176; 3% overlap with the slow path's
+        // top-100). The cap must keep the brightest stars frame-wide.
+        let width = 512;
+        let height = 512;
+        let mut data = vec![100.0_f32; width * height];
+        // Wide bright halo: keeps levels 1-2 high (they only ever see it).
+        add_star(&mut data, width, 256.0, 40.0, 30000.0, 12.0);
+        // 10×18 grid of EQUAL ordinary stars over the whole frame — far more
+        // than max_stars, all admitted by the same ladder level.
+        for gy in 0..18 {
+            for gx in 0..10 {
+                add_star(
+                    &mut data, width,
+                    30.0 + gx as f32 * 48.0,
+                    85.0 + gy as f32 * 21.0,
+                    6000.0,
+                    1.6,
+                );
+            }
+        }
+        // A row of clearly BRIGHTER stars at the very bottom — scanned last,
+        // below the halo-driven levels 1-2, above the ordinary grid.
+        for gx in 0..8 {
+            add_star(&mut data, width, 50.0 + gx as f32 * 56.0, 486.0, 12000.0, 1.6);
+        }
+        // Deterministic mild noise so levels are sane.
+        let mut rng = 12345u64;
+        for v in data.iter_mut() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v += ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 6.0;
+        }
+
+        let max_stars = 24;
+        let stars = detect_stars_adaptive(&data, width, height, max_stars, 1.0);
+        assert!(stars.len() >= 16, "expected detections, got {}", stars.len());
+        let bright_bottom = stars.iter().filter(|(s, _)| s.y > 470.0).count();
+        assert!(
+            bright_bottom >= 6,
+            "scan-order bias: only {}/8 of the brightest (bottom-row) stars made the cap; got {} stars, y range [{:.0},{:.0}]",
+            bright_bottom,
+            stars.len(),
+            stars.iter().map(|(s, _)| s.y).fold(f32::MAX, f32::min),
+            stars.iter().map(|(s, _)| s.y).fold(f32::MIN, f32::max),
+        );
+    }
+}
+
+#[cfg(all(test, feature = "debug-pipeline"))]
+mod diag {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn cocoon_top_structure() {
+        let path = "tests/cocoon.fits";
+        if !std::path::Path::new(path).exists() { return; }
+        let (meta, pixels) = crate::formats::read_image(std::path::Path::new(path)).unwrap();
+        let (lum, w, h, _, _) = crate::analysis::prepare_luminance(&meta, &pixels, true);
+        let stars = detect_stars_adaptive(&lum, w, h, 8000, 0.8);
+        eprintln!("total {}", stars.len());
+        eprintln!("top 25 by flux (x y flux area~hfd2 snr):");
+        for (s, snr) in stars.iter().take(25) {
+            eprintln!("  {:7.1} {:7.1} {:10.0} {:5} {:7.1}", s.x, s.y, s.flux, s.area, snr);
+        }
+        // hfd distribution among top 500 vs rest
+        let hfd = |a: usize| (a as f32).sqrt();
+        let mut top: Vec<f32> = stars.iter().take(500).map(|(s, _)| hfd(s.area)).collect();
+        let mut rest: Vec<f32> = stars.iter().skip(500).map(|(s, _)| hfd(s.area)).collect();
+        top.sort_by(|a, b| a.total_cmp(b)); rest.sort_by(|a, b| a.total_cmp(b));
+        eprintln!("hfd p10/p50/p90 top500: {:.1}/{:.1}/{:.1}  rest: {:.1}/{:.1}/{:.1}",
+            top[top.len()/10], top[top.len()/2], top[top.len()*9/10],
+            rest[rest.len()/10], rest[rest.len()/2], rest[rest.len()*9/10]);
+        // surface-brightness ranking: flux/hfd^2 = flux/area
+        let mut by_sb: Vec<&(DetectedStar, f32)> = stars.iter().collect();
+        by_sb.sort_by(|a, b| (b.0.flux / b.0.area as f32).total_cmp(&(a.0.flux / a.0.area as f32)));
+        eprintln!("top 25 by flux/area (x y flux area snr):");
+        for e in by_sb.iter().take(25) {
+            eprintln!("  {:7.1} {:7.1} {:10.0} {:5} {:7.1}", e.0.x, e.0.y, e.0.flux, e.0.area, e.1);
+        }
+    }
 }
