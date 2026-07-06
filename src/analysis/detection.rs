@@ -138,6 +138,17 @@ pub fn detect_stars(
     let mut grid: Vec<Vec<usize>> = vec![Vec::new(); grid_w * grid_h];
 
     let mut peak_positions: Vec<(usize, usize, f32)> = Vec::new();
+    // Pass-2 contamination: a kept peak that suppressed a comparable-strength
+    // neighbor has that neighbor's star inside its measurement window — the
+    // fit would read one elongated pseudo-star (blend). Track and reject on
+    // pass 2 (see the centroid-distance sweep below for the fragmented case).
+    const BLEND_CONV_RATIO: f32 = 0.25;
+    // Contamination distance = the per-star LM fitting disc in metrics.rs
+    // (max(5, 4σ)); a companion outside it barely touches the fit.
+    let fit_disc_r = (4.0 * nms_sigma).max(5.0);
+    let fit_disc_r_sq = fit_disc_r * fit_disc_r;
+    let mut contaminated: Vec<bool> = Vec::new();
+    let mut kept_pos_of_peak: Vec<u32> = vec![u32::MAX; peaks.len()];
 
     for (i, &(px, py, conv_val)) in peaks.iter().enumerate() {
         let gx = px / cell_size;
@@ -149,24 +160,37 @@ pub fn detect_stars(
         let gx_hi = (gx + 2).min(grid_w);
         let gy_hi = (gy + 2).min(grid_h);
 
-        let mut is_suppressed = false;
+        let mut suppressed_by: Option<(usize, f32)> = None;
         'outer: for ngy in gy_lo..gy_hi {
             for ngx in gx_lo..gx_hi {
                 for &kept_idx in &grid[ngy * grid_w + ngx] {
                     let (kx, ky, _) = peaks[kept_idx];
                     let dx = px as f32 - kx as f32;
                     let dy = py as f32 - ky as f32;
-                    if dx * dx + dy * dy <= sup_radius_sq {
-                        is_suppressed = true;
+                    let d_sq = dx * dx + dy * dy;
+                    if d_sq <= sup_radius_sq {
+                        suppressed_by = Some((kept_idx, d_sq));
                         break 'outer;
                     }
                 }
             }
         }
 
-        if !is_suppressed {
-            grid[gy * grid_w + gx].push(i);
-            peak_positions.push((px, py, conv_val));
+        match suppressed_by {
+            Some((kept_idx, d_sq)) => {
+                // Peaks are processed brightest-first, so conv_val ≤ kept conv.
+                if d_sq <= fit_disc_r_sq
+                    && conv_val >= BLEND_CONV_RATIO * peaks[kept_idx].2
+                {
+                    contaminated[kept_pos_of_peak[kept_idx] as usize] = true;
+                }
+            }
+            None => {
+                grid[gy * grid_w + gx].push(i);
+                kept_pos_of_peak[i] = peak_positions.len() as u32;
+                contaminated.push(false);
+                peak_positions.push((px, py, conv_val));
+            }
         }
     }
 
@@ -223,9 +247,10 @@ pub fn detect_stars(
     // Stamp radius = 1×FWHM (smaller than blend_radius to avoid neighbor contamination).
     // Parallelized — each star's stamp metrics and filters read only from data/conv/bg_map.
     let stamp_r = ((1.5 * fwhm).ceil() as i32).max(3);
-    let mut stars: Vec<DetectedStar> = peak_positions.par_iter().enumerate()
+    let mut stars: Vec<(DetectedStar, bool)> = peak_positions.par_iter().enumerate()
         .filter(|(i, _)| !blended[*i])
-        .filter_map(|(_, &(px, py, _conv_val))| {
+        .filter_map(|(i, &(px, py, _conv_val))| {
+            let is_contaminated = contaminated[i];
             let star = process_peak_stamp(
                 px, py, stamp_r, data, width, height, background, bg_map, params,
             )?;
@@ -295,7 +320,7 @@ pub fn detect_stars(
                 }
             }
 
-            Some(star)
+            Some((star, is_contaminated))
         })
         .collect();
 
@@ -303,21 +328,73 @@ pub fn detect_stars(
     // remaining duplicates from NMS edge cases.
     let dedup_radius = (fwhm * 0.5).max(1.5_f32);
     let dedup_radius_sq = dedup_radius * dedup_radius;
-    stars.sort_by(|a, b| b.flux.total_cmp(&a.flux));
-    let mut deduped: Vec<DetectedStar> = Vec::with_capacity(stars.len());
-    for star in stars.drain(..) {
-        let is_dup = deduped.iter().any(|k| {
-            let dx = star.x - k.x;
-            let dy = star.y - k.y;
+    stars.sort_by(|a, b| b.0.flux.total_cmp(&a.0.flux));
+    let mut deduped: Vec<(DetectedStar, bool)> = Vec::with_capacity(stars.len());
+    for entry in stars.drain(..) {
+        let is_dup = deduped.iter().any(|(k, _)| {
+            let dx = entry.0.x - k.x;
+            let dy = entry.0.y - k.y;
             dx * dx + dy * dy <= dedup_radius_sq
         });
         if !is_dup {
-            deduped.push(star);
+            deduped.push(entry);
         }
     }
     stars = deduped;
 
+    // Pass-2 centroid blend sweep: NMS works on convolution-peak positions,
+    // but a close pair can fragment into two survivors whose final centroids
+    // sit well inside each other's fitting windows (peaks 11px apart,
+    // centroids 6px). Any two measured stars closer than the measurement
+    // blend radius corrupt each other — reject both, matching the peak-based
+    // rejection above.
+    let mut reject = vec![false; stars.len()];
+    if field_fwhm.is_some() && stars.len() > 1 {
+        let sweep_r_sq = fit_disc_r * fit_disc_r;
+        let cell = fit_disc_r.ceil().max(1.0) as usize;
+        let gw = (width + cell - 1) / cell;
+        let gh = (height + cell - 1) / cell;
+        let mut cgrid: Vec<Vec<usize>> = vec![Vec::new(); gw * gh];
+        for (i, (s, _)) in stars.iter().enumerate() {
+            let gx = ((s.x.max(0.0) as usize) / cell).min(gw - 1);
+            let gy = ((s.y.max(0.0) as usize) / cell).min(gh - 1);
+            cgrid[gy * gw + gx].push(i);
+        }
+        for (i, (s, _)) in stars.iter().enumerate() {
+            let gx = ((s.x.max(0.0) as usize) / cell).min(gw - 1);
+            let gy = ((s.y.max(0.0) as usize) / cell).min(gh - 1);
+            let gx_lo = gx.saturating_sub(1);
+            let gy_lo = gy.saturating_sub(1);
+            let gx_hi = (gx + 2).min(gw);
+            let gy_hi = (gy + 2).min(gh);
+            for ngy in gy_lo..gy_hi {
+                for ngx in gx_lo..gx_hi {
+                    for &j in &cgrid[ngy * gw + ngx] {
+                        if j <= i { continue; }
+                        let dx = s.x - stars[j].0.x;
+                        let dy = s.y - stars[j].0.y;
+                        if dx * dx + dy * dy <= sweep_r_sq {
+                            reject[i] = true;
+                            reject[j] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let drop_contaminated = field_fwhm.is_some();
     stars
+        .into_iter()
+        .zip(reject)
+        .filter_map(|((star, is_contaminated), rejected)| {
+            if rejected || (drop_contaminated && is_contaminated) {
+                None
+            } else {
+                Some(star)
+            }
+        })
+        .collect()
 }
 
 /// Compute star metrics from a stamp around a peak position.
@@ -498,6 +575,64 @@ mod tests {
         }
 
         data
+    }
+
+    #[test]
+    fn test_close_pair_rejected_not_measured_as_one() {
+        // Blend regression (1_18_r_1_P bench frame): two stars closer than the
+        // NMS suppression radius collapse to ONE surviving peak — the weaker
+        // is silently suppressed and the survivor gets measured with the
+        // companion inside its fitting window, producing an elongated
+        // pseudo-star (~30% of measured stars on dense oversampled fields).
+        // On pass 2 the survivor of a comparable-strength suppression must be
+        // rejected like the existing wide-pair blend rejection does.
+        let width = 200;
+        let height = 200;
+        let background = 1000.0;
+        let noise = 50.0;
+        // Two close pairs (8px: fragments into two centroids; 7px: NMS
+        // swallows the weaker conv peak) + one isolated star.
+        let star_defs = vec![
+            (50.0, 50.0, 5000.0, 2.0),
+            (58.0, 50.0, 4000.0, 2.0),
+            (50.0, 150.0, 5000.0, 2.0),
+            (57.0, 150.0, 4000.0, 2.0),
+            (150.0, 150.0, 5000.0, 2.0),
+        ];
+        let data = make_star_field(width, height, &star_defs, background, noise);
+
+        let params = DetectionParams {
+            detection_sigma: 5.0,
+            min_star_area: 5,
+            max_star_area: 2000,
+            saturation_limit: 0.95 * 65535.0,
+        };
+
+        let fwhm = 2.0 * 2.3548;
+        // Pass 2 (field_fwhm known): the pair must not survive as a single
+        // measurable detection.
+        let stars = detect_stars(
+            &data, width, height, background, noise, None, None,
+            &params, fwhm, Some(fwhm),
+        );
+
+        for (px, py, label) in [(54.0, 50.0, "8px pair"), (53.5, 150.0, "7px pair")] {
+            let near_pair: Vec<_> = stars.iter()
+                .filter(|s| ((s.x - px).powi(2) + (s.y - py).powi(2)).sqrt() < 12.0)
+                .collect();
+            assert!(
+                near_pair.is_empty(),
+                "{} must be rejected on pass 2, got {} detection(s) at {:?}",
+                label,
+                near_pair.len(),
+                near_pair.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>()
+            );
+        }
+
+        let isolated: Vec<_> = stars.iter()
+            .filter(|s| ((s.x - 150.0).powi(2) + (s.y - 150.0).powi(2)).sqrt() < 4.0)
+            .collect();
+        assert_eq!(isolated.len(), 1, "isolated star must still be detected");
     }
 
     #[test]
