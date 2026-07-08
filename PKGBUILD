@@ -20,12 +20,12 @@ build() {
     cd "$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
-    cargo build --release --locked
+    cargo build --release --all-features --locked
 }
 
 check() {
     cd "$pkgname-$pkgver"
-    cargo test --release --locked
+    cargo test --release --all-features --locked
 }
 
 package() {

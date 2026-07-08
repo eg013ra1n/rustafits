@@ -44,7 +44,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --all-features
 
       - name: Package binary
         run: |
@@ -90,7 +90,7 @@ jobs:
 
       - name: Build with cargo
         run: |
-          cargo build --release
+          cargo build --release --all-features
 
       - name: Create .deb package manually
         run: |

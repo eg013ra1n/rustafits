@@ -27,6 +27,7 @@ required-features = ["debug-pipeline"]
 
 [features]
 debug-pipeline = []
+jpg = ["dep:turbojpeg"]
 
 [dependencies]
 anyhow = "1.0"
@@ -34,7 +35,7 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
 ruzstd = "0.7"
 image = { version = "0.25", default-features = false, features = ["png"] }
-turbojpeg = "1.4"
+turbojpeg = { version = "1.4", optional = true }
 quick-xml = "0.37"
 base64 = "0.22"
 rayon = "1.10"
