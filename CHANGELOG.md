@@ -5,6 +5,16 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `encode_jpeg` — in-memory RGB/RGBA → baseline JPEG (4:2:0) encoding on the
+  library surface, for embedders that need JPEG bytes without a file write
+  (Athenaeum's Perseus preview). Backed by the same libjpeg-turbo path
+  `save_image` uses; RGBA alpha is read and discarded, so callers pass frames
+  through without a de-interleaving copy.
+
 ## [1.0.1] — 2026-05-07
 
 ### Fixed
