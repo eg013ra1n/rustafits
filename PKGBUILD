@@ -7,7 +7,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/eg013ra1n/rustafits"
 license=('Apache-2.0')
 depends=()
-makedepends=('rust' 'cargo' 'cmake')
+makedepends=('rust' 'cargo')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/eg013ra1n/$pkgname/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')  # Update with actual checksum after first release
 

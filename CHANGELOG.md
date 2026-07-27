@@ -5,6 +5,28 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **JPEG encoding moved off the `turbojpeg` C binding to a pure-Rust
+  libjpeg-turbo reimplementation** (`libjpeg-turbo-rs`, pinned to `=0.6.3`).
+  Output bytes are identical (baseline, 4:2:0, same quality scale) and encode
+  time is within a few percent on x86_64; NEON keeps aarch64 at parity.
+
+  The point is the build, not the speed: `turbojpeg-sys` compiled
+  libjpeg-turbo from source and therefore required **cmake and nasm**. Those
+  are now gone from the README install instructions, the Homebrew formula, the
+  PKGBUILD, the RPM spec and every CI job — `cargo install rustafits`,
+  `cargo build --target aarch64-...` and distro packaging need nothing beyond
+  the Rust toolchain. The crate is now what `rustafits.spec` already claimed:
+  no C dependencies.
+
+  `output.rs` also gained a public `encode_jpeg(data, w, h, channels, quality)`
+  entry point. RGBA buffers are handed to the encoder as-is — it discards alpha
+  internally — so the per-frame `width * height * 3` de-interleaving copy is
+  gone.
+
 ## [1.0.1] — 2026-05-07
 
 ### Fixed

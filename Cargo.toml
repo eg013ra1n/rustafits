@@ -34,7 +34,15 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
 ruzstd = "0.7"
 image = { version = "0.25", default-features = false, features = ["png"] }
-turbojpeg = "1.4"
+# Pure-Rust JPEG encoder (libjpeg-turbo reimplementation) with NEON on aarch64
+# and AVX2/SSE2 on x86_64, plus scalar fallbacks. Replaces the `turbojpeg` C
+# binding: same output bytes and ~the same speed, but no cmake/nasm build step,
+# so `cargo install rustafits`, cross-compilation and distro packaging need
+# nothing but the Rust toolchain. Pinned exactly — the crate is young and
+# pre-1.0, so a minor bump gets reviewed rather than picked up silently.
+# NOTE: its `simd` feature is ON by default — do NOT pass default-features =
+# false here or every SIMD path (NEON/AVX2) silently falls back to scalar.
+libjpeg-turbo-rs = "=0.6.3"
 quick-xml = "0.37"
 base64 = "0.22"
 rayon = "1.10"
@@ -43,6 +51,9 @@ tracing = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+# Independent decoder for tests/jpeg_encoder.rs. Deliberately NOT the decode
+# side of libjpeg-turbo-rs: a symmetric bug there would pass a self-round-trip.
+jpeg-decoder = { version = "0.3", default-features = false }
 
 [profile.release]
 lto = true

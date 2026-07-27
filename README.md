@@ -13,7 +13,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
 - **Image Analysis**: Two-pass Moffat-primary PSF calibration with adaptive moments screening, star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MAD noise estimation (optional MRS wavelet)
 - **Fast Star Detection**: Lean single-pass detector that skips PSF fitting, SNR photometry, and trail detection — intended for pipelines that only need `(x, y, flux)` centroids (blind plate solving, quick previews). Runs in ~300–500 ms on a full-frame image vs. seconds for the precise analyzer
-- **JPEG via libjpeg-turbo**: SIMD-accelerated JPEG encoding (NEON on aarch64, AVX2 on x86_64) via turbojpeg
+- **Pure-Rust JPEG Encoder**: SIMD-accelerated JPEG encoding (NEON on aarch64, AVX2/SSE2 on x86_64, scalar fallback elsewhere) — no C toolchain, no cmake/nasm
 - **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
 
 ## Supported Formats
@@ -31,18 +31,9 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 cargo install rustafits
 ```
 
-**Build requirements:** cmake (and nasm on x86_64) for the turbojpeg SIMD JPEG encoder.
-
-```bash
-# macOS
-brew install cmake nasm
-
-# Debian/Ubuntu
-sudo apt install cmake nasm
-
-# Arch Linux
-sudo pacman -S cmake nasm
-```
+**Build requirements:** none beyond the Rust toolchain. Every dependency is
+pure Rust, so `cargo install` and cross-compilation work on x86_64 and aarch64
+without cmake, nasm, or a C compiler.
 
 ### From Source
 
@@ -526,7 +517,7 @@ rustafits/
 │       └── color.rs         # Color conversions (SIMD)
 ```
 
-**Dependencies**: anyhow, flate2 (rust_backend), lz4_flex, ruzstd, image (PNG only), turbojpeg (libjpeg-turbo), quick-xml, base64, rayon
+**Dependencies**: anyhow, flate2 (rust_backend), lz4_flex, ruzstd, image (PNG only), libjpeg-turbo-rs (pure-Rust JPEG encoder), quick-xml, base64, rayon
 
 ## Troubleshooting
 
