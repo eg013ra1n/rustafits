@@ -146,6 +146,10 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
     };
 
     let mut reader = Reader::from_str(xml);
+    // Permissive dangling-`&` retained deliberately (0.36-era behavior; XISF
+    // headers are machine-written but a malformed one should still render —
+    // cycle decision 2026-07-29).
+    reader.config_mut().allow_dangling_amp = true;
     let mut found_image = false;
 
     loop {
@@ -566,6 +570,32 @@ mod tests {
             "decompressed to all zeros — the decoder is not being driven"
         );
         assert_eq!(got, expected, "decompressed payload");
+    }
+
+    /// quick-xml 0.41 rejects a lone `&` in text content by default, where 0.37
+    /// read through. We opt back into the permissive behavior, so a header
+    /// carrying one must still parse — and still yield correct geometry.
+    #[test]
+    fn dangling_ampersand_in_header_text_still_parses() {
+        let xml = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0">"#,
+            r#"<Property id="note">Dark & Flat calibration</Property>"#,
+            r#"<Image geometry="32:16:1" sampleFormat="UInt16" colorSpace="Gray""#,
+            r#" pixelStorage="Planar" location="attachment:4096:1024"/>"#,
+            r#"</xisf>"#,
+        );
+
+        let info = parse_xisf_xml(xml)
+            .expect("a lone `&` in text content must not fail the header parse");
+
+        // Not just "no error": the element *after* the dangling `&` must still
+        // have been reached and read correctly.
+        assert_eq!(info.width, 32, "width");
+        assert_eq!(info.height, 16, "height");
+        assert_eq!(info.channels, 1, "channels");
+        assert_eq!(info.sample_format, XisfSampleFormat::Uint16, "sampleFormat");
+        assert_eq!(info.attachment_pos, 4096, "attachment position");
+        assert_eq!(info.block_size, 1024, "block size");
     }
 
     /// A block that does not yield exactly the declared size must be an error,
