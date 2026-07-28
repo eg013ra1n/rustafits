@@ -31,18 +31,18 @@ debug-pipeline = []
 [dependencies]
 anyhow = "1.0"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
-lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
-ruzstd = "0.7"
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode"] }
+ruzstd = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
-turbojpeg = "1.4"
-quick-xml = "0.37"
-base64 = "0.22"
+turbojpeg = "1.5"
+quick-xml = "0.41"
+base64 = "0.23"
 rayon = "1.10"
-nalgebra = "0.33"
+nalgebra = "0.35"
 tracing = "0.1"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # Independent decoder for tests/jpeg_encoder.rs. Deliberately NOT the encoder's
 # own decode side: a symmetric bug there would pass a self-round-trip.
 jpeg-decoder = { version = "0.3", default-features = false }

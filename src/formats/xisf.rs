@@ -154,7 +154,11 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
                 found_image = true;
                 for attr in e.attributes().flatten() {
                     let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                    let val = attr.unescape_value().unwrap_or_default();
+                    // XISF headers are XML 1.0; 1.0 and 1.1 normalization differ
+                    // only for \x85/\x2028, which cannot appear in these values.
+                    let val = attr
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .unwrap_or_default();
 
                     match key {
                         "geometry" => {
@@ -266,17 +270,41 @@ fn decompress_block(compressed: &[u8], uncompressed_size: usize, codec: XisfComp
             Ok(output)
         }
         XisfCompression::Lz4 | XisfCompression::Lz4hc => {
-            let output = lz4_flex::decompress(compressed, uncompressed_size)
+            // `lz4_flex::decompress` (the crate-root re-export) is deprecated and
+            // gated behind `alloc`, which this crate does not enable. Decompress
+            // into a buffer of the size the header declares instead — that size is
+            // authoritative for XISF, so a short read means a corrupt block.
+            let mut output = vec![0u8; uncompressed_size];
+            let written = lz4_flex::block::decompress_into(compressed, &mut output)
                 .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {}", e))?;
+            if written != uncompressed_size {
+                bail!(
+                    "LZ4 decompression size mismatch: got {} bytes, header declares {}",
+                    written,
+                    uncompressed_size
+                );
+            }
             Ok(output)
         }
         XisfCompression::Zstd => {
+            // Must be `StreamingDecoder`, not a bare `FrameDecoder`: the latter's
+            // `Read` impl only drains an already-decoded internal buffer and never
+            // pulls from the source, so reading it yields 0 bytes and leaves the
+            // output zero-filled — a silently black image. `StreamingDecoder` owns
+            // the source and drives block decoding on each read.
             let mut output = vec![0u8; uncompressed_size];
-            let mut decoder = ruzstd::frame_decoder::FrameDecoder::new();
-            decoder.reset(&compressed[..]).context("zstd decoder reset failed")?;
+            let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed)
+                .map_err(|e| anyhow::anyhow!("zstd decoder init failed: {}", e))?;
             let mut cursor = std::io::Cursor::new(&mut output[..]);
-            std::io::copy(&mut decoder, &mut cursor)
-                .context("zstd decompression failed")?;
+            let written = std::io::copy(&mut decoder, &mut cursor)
+                .context("zstd decompression failed")? as usize;
+            if written != uncompressed_size {
+                bail!(
+                    "zstd decompression size mismatch: got {} bytes, header declares {}",
+                    written,
+                    uncompressed_size
+                );
+            }
             Ok(output)
         }
     }
@@ -495,4 +523,61 @@ fn extract_embedded_data(xml: &str) -> Result<String> {
         }
     }
     bail!("Failed to find embedded data in XISF")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 128-byte payload compressed by the `zstd` CLI (an encoder independent
+    /// of ruzstd, so a symmetric round-trip bug cannot hide here).
+    const ZSTD_FRAME: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x80, 0x01, 0x04, 0x00, 0x00, 0x00, 0xf3, 0x6e, 0xe6, 0xdd,
+        0xda, 0x4c, 0xcd, 0xbb, 0xc0, 0x2a, 0xb4, 0x99, 0xa7, 0x08, 0x9b, 0x77, 0x8e, 0xe6, 0x81,
+        0x55, 0x75, 0xc4, 0x68, 0x33, 0x5b, 0xa2, 0x4f, 0x11, 0x42, 0x80, 0x36, 0xef, 0x29, 0x5e,
+        0x1c, 0xcd, 0x10, 0x3c, 0x03, 0xab, 0xf7, 0x19, 0xea, 0x88, 0xdd, 0xf7, 0xd1, 0x66, 0xc4,
+        0xd5, 0xb7, 0x44, 0xab, 0xb3, 0x9e, 0x22, 0x92, 0x91, 0x85, 0x00, 0x78, 0x6f, 0x6c, 0xde,
+        0x5f, 0x4d, 0x53, 0xbc, 0x46, 0x2b, 0x39, 0x9a, 0x2d, 0x09, 0x20, 0x78, 0x13, 0xe7, 0x07,
+        0x56, 0xfa, 0xc4, 0xee, 0x33, 0xe1, 0xa2, 0xd4, 0x11, 0xc8, 0x80, 0xbb, 0xef, 0xae, 0x5e,
+        0xa2, 0xcd, 0x95, 0x3c, 0x89, 0xab, 0x7c, 0x1a, 0x6f, 0x89, 0x63, 0xf8, 0x56, 0x67, 0x4a,
+        0xd6, 0x3d, 0x45, 0x30, 0xb4, 0x24, 0x23, 0x17, 0x92, 0x0a, 0x01, 0xfe, 0x6f, 0xf1, 0xde,
+        0xe5, 0x4d, 0x96, 0x04, 0x31, 0x7d,
+    ];
+
+    /// The bytes ZSTD_FRAME encodes: 64 u16 values, little-endian.
+    fn expected_payload() -> Vec<u8> {
+        (0..64u64)
+            .flat_map(|i| (((i * 2_654_435_761) >> 7) as u16).to_le_bytes())
+            .collect()
+    }
+
+    /// Regression: a bare `FrameDecoder` never pulls from its source, so the
+    /// Zstd arm used to return a zero-filled buffer and report success — every
+    /// Zstd-compressed XISF silently decoded to a black frame.
+    #[test]
+    fn zstd_block_decompresses_to_the_real_bytes() {
+        let expected = expected_payload();
+        let got = decompress_block(ZSTD_FRAME, expected.len(), XisfCompression::Zstd)
+            .expect("zstd decompression should succeed");
+
+        assert_eq!(got.len(), expected.len(), "decompressed length");
+        assert!(
+            got.iter().any(|&b| b != 0),
+            "decompressed to all zeros — the decoder is not being driven"
+        );
+        assert_eq!(got, expected, "decompressed payload");
+    }
+
+    /// A block that does not yield exactly the declared size must be an error,
+    /// never a partially-filled (silently zero-padded) buffer.
+    #[test]
+    fn zstd_block_size_mismatch_is_reported() {
+        let declared = expected_payload().len() + 64;
+        let err = decompress_block(ZSTD_FRAME, declared, XisfCompression::Zstd)
+            .expect_err("a short block must not be reported as success");
+        assert!(
+            err.to_string().contains("size mismatch"),
+            "unexpected error: {err}"
+        );
+    }
 }
