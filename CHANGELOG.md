@@ -19,10 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **JPEG encoding moved off the `turbojpeg` C binding to a pure-Rust
   libjpeg-turbo reimplementation** (`libjpeg-turbo-rs`, pinned to `=0.8.0`).
-  Output is **byte-identical** — verified on the full-frame `cocoon`, `mono` and
-  `osc` test images, whose encoded JPEGs hash the same under both backends — and
-  encode time is unchanged (69.1 ms vs 69.0 ms for a 6252×4176 frame at q90 on
-  Apple Silicon).
+  Output was **byte-identical** in every comparison run — the full-frame
+  `cocoon`, `mono` and `osc` test images hash the same under both backends on
+  aarch64, and a width sweep matches C libjpeg-turbo byte-for-byte on aarch64
+  and x86_64 — and encode time is unchanged (69.1 ms vs 69.0 ms for a 6252×4176
+  frame at q90 on Apple Silicon).
 
   The point is the build, not the speed: `turbojpeg-sys` compiled libjpeg-turbo
   from source and therefore required **cmake and nasm**. Those are now gone from
@@ -39,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `save_image` no longer builds an intermediate RGB copy for RGBA frames: the
   encoder reads 4 bytes per pixel and discards alpha itself, so a `W*H*3`
   allocation per frame is gone.
+
+- **Out-of-range JPEG quality now clamps to 1..=100 instead of returning an
+  error.** The `turbojpeg` binding rejected a quality outside 1..=100; the new
+  encoder clamps, and `encode_jpeg` now makes that explicit. This also changes
+  `ImageConverter::save_processed` (shipped in 1.0.1), which passes its
+  `quality` argument straight through — a call that used to fail with
+  `Image save failed` now succeeds at the clamped quality.
+  `ImageConverter::with_quality` and the CLI already clamped/validated, so they
+  are unaffected.
 
 ## [1.0.1] — 2026-05-07
 

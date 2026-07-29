@@ -48,6 +48,14 @@ pub fn encode_jpeg(
         );
     }
 
+    // Output byte-matches the old turbojpeg build not because of the arguments
+    // below but because of the four defaults this shim fixes internally
+    // (`CompressParams::new` + `high_level::compress`): IsLow DCT, Annex-K
+    // quantization tables scaled by quality, standard Annex-K Huffman tables
+    // (no two-pass optimization), and no restart interval — the same choices C
+    // libjpeg-turbo makes by default. None of them is part of this function's
+    // signature, so the `=0.8.0` pin in Cargo.toml is what protects the parity;
+    // a version bump can change any of them silently.
     libjpeg_turbo_rs::compress(
         data,
         width,

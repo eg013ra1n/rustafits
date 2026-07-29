@@ -131,15 +131,23 @@ fn psnr(mse: f64) -> f64 {
 }
 
 /// The encoder pads the trailing MCU (16x16 at 4:2:0) with synthetic samples
-/// whenever a dimension is not a multiple of 16. Implementations disagree on
-/// how to fill that padding — libjpeg-turbo and `libjpeg-turbo-rs` produce
-/// different (equally valid) bytes when `width % 16` lands in 1..=8, i.e. when
-/// the second luma block column of the last MCU is entirely synthetic.
+/// whenever a dimension is not a multiple of 16. The format does not dictate
+/// how that padding is filled, so two conforming encoders may emit different
+/// (equally valid) bytes there — this test therefore asserts nothing about
+/// byte-identity with any other implementation.
 ///
-/// That is allowed. What is NOT allowed is padding influencing a pixel inside
-/// the image. This sweeps every `width % 16` and `height % 16` residue and
-/// checks the border strip specifically, at quality 95 where JPEG loss is small
-/// enough that real damage cannot hide behind it.
+/// As it happens the pinned `libjpeg-turbo-rs` 0.8.0 *does* match C
+/// libjpeg-turbo byte-for-byte at every width; that is a measured property of
+/// the pin, not a contract, and it was NOT true of 0.6.x — see
+/// `docs/libjpeg-turbo-rs-issue.md` (upstream issue #362) for the divergence
+/// that used to exist at `width % 16` in 1..=8 and how to re-check it after a
+/// version bump. Do not turn that observation into an assertion here: it would
+/// fail for a legitimately different encoder.
+///
+/// What IS a contract, for any encoder: padding must never influence a pixel
+/// inside the image. This sweeps every `width % 16` and `height % 16` residue
+/// and checks the border strip specifically, at quality 95 where JPEG loss is
+/// small enough that real damage cannot hide behind it.
 #[test]
 fn edge_mcu_padding_never_leaks_into_the_image() {
     for extra_w in 0..16usize {
@@ -185,7 +193,10 @@ fn edge_mcu_padding_never_leaks_into_the_image() {
 fn rgba_input_encodes_identically_to_hand_stripped_rgb() {
     for (w, h) in [(96usize, 96usize), (99, 97), (104, 100), (67, 43)] {
         let rgba = synth(w, h, 4);
-        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let rgb: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
 
         let from_rgba = encode_jpeg(&rgba, w, h, 4, 90).expect("rgba encode failed");
         let from_rgb = encode_jpeg(&rgb, w, h, 3, 90).expect("rgb encode failed");

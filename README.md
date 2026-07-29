@@ -13,7 +13,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
 - **Image Analysis**: Two-pass Moffat-primary PSF calibration with adaptive moments screening, star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MAD noise estimation (optional MRS wavelet)
 - **Fast Star Detection**: Lean single-pass detector that skips PSF fitting, SNR photometry, and trail detection — intended for pipelines that only need `(x, y, flux)` centroids (blind plate solving, quick previews). Runs in ~300–500 ms on a full-frame image vs. seconds for the precise analyzer
-- **Pure-Rust JPEG Encoder**: SIMD-accelerated JPEG encoding (NEON on aarch64, AVX2/SSE2 on x86_64, scalar fallback elsewhere) — byte-compatible with C libjpeg-turbo, but no C toolchain, no cmake/nasm
+- **Pure-Rust JPEG Encoder**: SIMD-accelerated JPEG encoding (NEON on aarch64, AVX2/SSE2 on x86_64, scalar fallback elsewhere) — baseline 4:2:0, no C toolchain, no cmake/nasm
 - **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
 
 ## Supported Formats
