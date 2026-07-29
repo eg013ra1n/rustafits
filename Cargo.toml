@@ -42,7 +42,6 @@ nalgebra = "0.35"
 tracing = "0.1"
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
 # Independent decoder for tests/jpeg_encoder.rs. Deliberately NOT the encoder's
 # own decode side: a symmetric bug there would pass a self-round-trip.
 jpeg-decoder = { version = "0.3", default-features = false }
