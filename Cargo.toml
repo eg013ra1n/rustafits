@@ -34,7 +34,17 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode"] }
 ruzstd = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
-turbojpeg = "1.5"
+# Pure-Rust libjpeg-turbo reimplementation with NEON on aarch64 and AVX2/SSE2 on
+# x86_64, plus scalar fallbacks. Replaces the `turbojpeg` C binding: same
+# baseline/4:2:0 output contract and comparable speed, but no cmake/nasm build
+# step, so `cargo install rustafits`, cross-compilation and distro packaging need
+# nothing but the Rust toolchain. Pinned exactly — the crate is young and pre-1.0,
+# so a minor bump gets reviewed rather than picked up silently.
+# NOTE: `simd` is a DEFAULT feature — never add `default-features = false` here or
+# every SIMD path (NEON/AVX2) silently falls back to scalar.
+# 0.8.0 is the first release we build on: it carries the fix for the 4:2:0
+# trailing-MCU divergence we reported upstream (see docs/libjpeg-turbo-rs-issue.md).
+libjpeg-turbo-rs = "=0.8.0"
 quick-xml = "0.41"
 base64 = "0.23"
 rayon = "1.10"

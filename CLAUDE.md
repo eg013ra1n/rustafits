@@ -60,7 +60,10 @@ Pipeline flow for u16 data:
 - `types.rs` — `PixelData`, `ImageMetadata`, `ProcessedImage`, `BayerPattern`
 - `converter.rs` — `ImageConverter` builder with optional `Arc<rayon::ThreadPool>`
 - `pipeline.rs` — orchestrates read → process → encode
-- `output.rs` — JPEG/PNG file writing
+- `output.rs` — JPEG/PNG file writing, plus the public `encode_jpeg` in-memory
+  entry point. JPEG goes through `libjpeg-turbo-rs` (pure Rust, NEON/AVX2, no
+  cmake/nasm); PNG through `image`. RGBA is passed to the JPEG encoder
+  unchanged — it drops alpha itself, so do NOT de-interleave to RGB first.
 - `formats/` — `fits.rs` (FITS reader), `xisf.rs` (XISF reader with zlib/LZ4/Zstd decompression)
 - `processing/` — `stretch.rs`, `debayer.rs`, `binning.rs`, `downscale.rs`, `color.rs`
 - `analysis/` — `background.rs` (mesh-grid + MRS wavelet), `detection.rs` (DAOFIND), `fitting.rs` (two-pass Moffat-primary PSF calibration, LmResult + fit_residual), `metrics.rs` (fit_residual per star), `snr.rs`, `convolution.rs`, `render.rs`, `mod.rs` (two-stage trail detection, residual-weighted statistics)
@@ -68,7 +71,7 @@ Pipeline flow for u16 data:
 
 ### SIMD Strategy
 
-SSE2 baseline on x86_64, AVX2 via runtime detection, NEON on aarch64. All operations have scalar fallbacks. SIMD-accelerated: stretch, binning, u16→f32, gray→RGB, debayer.
+SSE2 baseline on x86_64, AVX2 via runtime detection, NEON on aarch64. All operations have scalar fallbacks. The JPEG encoder dependency follows the same rule (its own NEON/AVX2 paths, scalar fallback) — its `simd` feature is ON by default, so never add `default-features = false` to it. SIMD-accelerated: stretch, binning, u16→f32, gray→RGB, debayer.
 
 Key gotcha: `_mm_shuffle_epi8` (pshufb) requires SSSE3, not SSE2 — gray→RGB on SSE2 falls back to scalar.
 
@@ -90,6 +93,18 @@ Test files in `tests/`:
 
 Always test changes against all four files when modifying processing code.
 
+`tests/jpeg_encoder.rs` needs no fixtures: it guards the JPEG encoder with
+synthetic images and decodes them with `jpeg-decoder` — deliberately an
+*independent* decoder, not the decode side of `libjpeg-turbo-rs`, so a symmetric
+bug there cannot pass a self-round-trip. When bumping the pinned
+`libjpeg-turbo-rs` version, also run it under an x86_64 target
+(`cargo test --target x86_64-apple-darwin`): the encoder bug documented in
+`docs/libjpeg-turbo-rs-issue.md` was byte-clean on aarch64 and only visible on
+x86_64.
+
 ## Release
 
-CI builds Linux x86_64 on tag push (`v*.*.*`). macOS is built manually (see `BUILD_MACOS.md`). Packages: Homebrew tap, AUR, Debian, RPM spec.
+No system build dependencies: every dep is pure Rust, so packaging recipes and CI
+jobs must not reintroduce cmake/nasm. CI builds Linux x86_64 on tag push
+(`v*.*.*`). macOS is built manually (see `BUILD_MACOS.md`). Packages: Homebrew
+tap, AUR, Debian, RPM spec.

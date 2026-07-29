@@ -5,7 +5,6 @@ class Rustafits < Formula
   sha256 "CHECKSUM_HERE"
   license "Apache-2.0"
 
-  depends_on "cmake" => :build
   depends_on "rust" => :build
 
   def install

@@ -11,9 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `encode_jpeg` — in-memory RGB/RGBA → baseline JPEG (4:2:0) encoding on the
   library surface, for embedders that need JPEG bytes without a file write
-  (Athenaeum's Perseus preview). Backed by the same libjpeg-turbo path
-  `save_image` uses; RGBA alpha is read and discarded, so callers pass frames
-  through without a de-interleaving copy.
+  (Athenaeum's Perseus preview). Backed by the same encoder `save_image` uses;
+  RGBA alpha is read and discarded, so callers pass frames through without a
+  de-interleaving copy.
+
+### Changed
+
+- **JPEG encoding moved off the `turbojpeg` C binding to a pure-Rust
+  libjpeg-turbo reimplementation** (`libjpeg-turbo-rs`, pinned to `=0.8.0`).
+  Output is **byte-identical** — verified on the full-frame `cocoon`, `mono` and
+  `osc` test images, whose encoded JPEGs hash the same under both backends — and
+  encode time is unchanged (69.1 ms vs 69.0 ms for a 6252×4176 frame at q90 on
+  Apple Silicon).
+
+  The point is the build, not the speed: `turbojpeg-sys` compiled libjpeg-turbo
+  from source and therefore required **cmake and nasm**. Those are now gone from
+  the README install instructions, the Homebrew formula, the PKGBUILD, the RPM
+  spec and the CI jobs — `cargo install rustafits`, cross-compilation and distro
+  packaging need nothing beyond the Rust toolchain. The crate is now what
+  `rustafits.spec` already claimed: no C dependencies.
+
+  0.8.0 is the first release we build on because it carries the fix for a 4:2:0
+  trailing-MCU divergence from C libjpeg-turbo that we reported upstream
+  (issue #362, fixed in 0.7.0). See `docs/libjpeg-turbo-rs-issue.md` for the
+  verification table and the re-check procedure for future version bumps.
+
+- `save_image` no longer builds an intermediate RGB copy for RGBA frames: the
+  encoder reads 4 bytes per pixel and discards alpha itself, so a `W*H*3`
+  allocation per frame is gone.
 
 ## [1.0.1] — 2026-05-07
 

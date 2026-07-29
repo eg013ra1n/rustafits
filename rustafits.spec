@@ -9,7 +9,6 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildRequires:  rust-packaging >= 21
 BuildRequires:  cargo
-BuildRequires:  cmake
 BuildRequires:  rust
 
 %description
