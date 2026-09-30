@@ -5,6 +5,21 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- FITS headers and data layout are now parsed by
+  [`fitsio-pure`](https://github.com/OrbitalCommons/fitsio-pure) (pure Rust);
+  the byte-order and scaling conversions are unchanged, and output is
+  bit-identical on every file the old reader accepted.
+
+### Added
+
+- Tile-compressed FITS (`.fz`: RICE_1, GZIP_1, GZIP_2), gzipped FITS
+  (`.fits.gz`), the `.fts` extension, and images stored in the first
+  extension HDU behind an empty primary.
+
 ## [1.3.0] — 2026-09-20
 
 Fifteen commits since 1.2.0, from three cycles of the stacking work in the

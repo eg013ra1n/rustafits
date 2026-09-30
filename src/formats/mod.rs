@@ -40,11 +40,21 @@ fn is_xisf(path: &Path) -> bool {
     false
 }
 
+fn has_fits_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ["fits", "fit", "fts", "fz"].iter().any(|f| ext.eq_ignore_ascii_case(f)))
+}
+
 fn is_fits(path: &Path) -> bool {
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if ext.eq_ignore_ascii_case("fits") || ext.eq_ignore_ascii_case("fit") {
-            return true;
-        }
+    if has_fits_extension(path) {
+        return true;
+    }
+    // Gzipped FITS: `.fits.gz`, `.fit.gz`, `.fts.gz`
+    if path.extension().and_then(|e| e.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
+        && path.file_stem().is_some_and(|stem| has_fits_extension(Path::new(stem)))
+    {
+        return true;
     }
     // Check magic bytes: "SIMPLE  ="
     if let Ok(mut f) = File::open(path) {

@@ -1,18 +1,18 @@
-use std::io::{BufReader, Read};
-use std::fs::File;
+use std::borrow::Cow;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use fitsio_pure::hdu::{parse_fits, Hdu, HduInfo};
+use fitsio_pure::image::{extract_bscale_bzero, image_dimensions, serialize_image};
+use fitsio_pure::tiled::read_tiled_image;
+use fitsio_pure::value::Value;
 use rayon::prelude::*;
 
 use crate::types::{BayerPattern, DataType, ImageMetadata, PixelData};
 
-const FITS_BLOCK_SIZE: usize = 2880;
-const FITS_CARD_SIZE: usize = 80;
-
 struct FitsHeader {
-    bitpix: i32,
-    naxis: i32,
+    bitpix: i64,
+    naxis: usize,
     naxis1: usize,
     naxis2: usize,
     naxis3: usize,
@@ -22,100 +22,37 @@ struct FitsHeader {
     roworder: String,
 }
 
-fn get_keyword_value(card: &str, keyword: &str) -> Option<String> {
-    if !card.starts_with(keyword) {
-        return None;
-    }
-    let eq_pos = card.find('=')?;
-    let val = card[eq_pos + 1..].trim_start();
-    Some(val.to_string())
+fn string_keyword(hdu: &Hdu, keyword: &str) -> String {
+    hdu.cards
+        .iter()
+        .find(|card| card.keyword_str() == keyword)
+        .and_then(|card| match &card.value {
+            Some(Value::String(s)) => Some(s.trim_end().to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
-fn parse_int_keyword(card: &str, keyword: &str) -> Option<i32> {
-    let val = get_keyword_value(card, keyword)?;
-    // Take chars until non-digit (or minus sign)
-    let num_str: String = val
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+')
-        .collect();
-    num_str.parse().ok()
-}
-
-fn parse_float_keyword(card: &str, keyword: &str) -> Option<f64> {
-    let val = get_keyword_value(card, keyword)?;
-    let num_str: String = val
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+' || *c == '.' || *c == 'E' || *c == 'e')
-        .collect();
-    num_str.parse().ok()
-}
-
-fn parse_string_keyword(card: &str, keyword: &str) -> Option<String> {
-    let val = get_keyword_value(card, keyword)?;
-    let val = val.trim_start_matches('\'');
-    let end = val.find('\'')?;
-    let s = val[..end].trim_end().to_string();
-    Some(s)
-}
-
-fn read_fits_header(reader: &mut BufReader<File>) -> Result<FitsHeader> {
-    let mut hdr = FitsHeader {
-        bitpix: 0,
-        naxis: 0,
-        naxis1: 0,
-        naxis2: 0,
-        naxis3: 0,
-        bzero: 0.0,
-        bscale: 1.0,
-        bayerpat: String::new(),
-        roworder: String::new(),
+fn read_fits_header(hdu: &Hdu) -> Result<FitsHeader> {
+    let bitpix = match &hdu.info {
+        HduInfo::Primary { bitpix, .. } | HduInfo::Image { bitpix, .. } => *bitpix,
+        HduInfo::CompressedImage { zbitpix, .. } => *zbitpix,
+        _ => bail!("FITS HDU is not an image"),
+    };
+    let naxes = image_dimensions(hdu)?;
+    let (bscale, bzero) = extract_bscale_bzero(&hdu.cards);
+    let hdr = FitsHeader {
+        bitpix,
+        naxis: naxes.len(),
+        naxis1: naxes.first().copied().unwrap_or(0),
+        naxis2: naxes.get(1).copied().unwrap_or(0),
+        naxis3: naxes.get(2).copied().unwrap_or(0),
+        bzero,
+        bscale,
+        bayerpat: string_keyword(hdu, "BAYERPAT"),
+        roworder: string_keyword(hdu, "ROWORDER"),
     };
 
-    let mut block = [0u8; FITS_BLOCK_SIZE];
-    let mut found_end = false;
-
-    while !found_end {
-        reader
-            .read_exact(&mut block)
-            .context("Failed to read FITS header block")?;
-
-        for i in 0..(FITS_BLOCK_SIZE / FITS_CARD_SIZE) {
-            let card_bytes = &block[i * FITS_CARD_SIZE..(i + 1) * FITS_CARD_SIZE];
-            let card = std::str::from_utf8(card_bytes).unwrap_or("");
-
-            if card.starts_with("END") && card.as_bytes().get(3).map_or(true, |&b| b == b' ') {
-                found_end = true;
-                break;
-            }
-
-            if let Some(v) = parse_int_keyword(card, "BITPIX  ") {
-                hdr.bitpix = v;
-            } else if let Some(v) = parse_int_keyword(card, "NAXIS   ") {
-                hdr.naxis = v;
-            } else if let Some(v) = parse_int_keyword(card, "NAXIS1") {
-                hdr.naxis1 = v as usize;
-            } else if let Some(v) = parse_int_keyword(card, "NAXIS2") {
-                hdr.naxis2 = v as usize;
-            } else if let Some(v) = parse_int_keyword(card, "NAXIS3") {
-                hdr.naxis3 = v as usize;
-            } else if let Some(v) = parse_float_keyword(card, "BZERO") {
-                hdr.bzero = v;
-            } else if let Some(v) = parse_float_keyword(card, "BSCALE") {
-                hdr.bscale = v;
-            } else if let Some(v) = parse_string_keyword(card, "BAYERPAT") {
-                hdr.bayerpat = v;
-            } else if let Some(v) = parse_string_keyword(card, "ROWORDER") {
-                hdr.roworder = v;
-            }
-        }
-    }
-
-    if hdr.bitpix == 0 {
-        bail!("Missing BITPIX keyword in FITS header");
-    }
-    if hdr.naxis < 2 {
-        bail!("FITS image must have at least 2 dimensions");
-    }
     if hdr.naxis1 == 0 || hdr.naxis2 == 0 {
         bail!("Invalid FITS image dimensions");
     }
@@ -123,11 +60,23 @@ fn read_fits_header(reader: &mut BufReader<File>) -> Result<FitsHeader> {
     Ok(hdr)
 }
 
-pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
-    let file = File::open(path).context("Failed to open FITS file")?;
-    let mut reader = BufReader::new(file);
+/// The image is the primary HDU, or for files whose primary HDU is empty
+/// (tile-compressed `.fz` files always are), the first image extension.
+fn image_hdu(hdus: &[Hdu]) -> Result<&Hdu> {
+    hdus.iter()
+        .find(|hdu| image_dimensions(hdu).is_ok_and(|naxes| naxes.len() >= 2))
+        .context("FITS image must have at least 2 dimensions")
+}
 
-    let hdr = read_fits_header(&mut reader)?;
+pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
+    let mut file = std::fs::read(path).context("Failed to open FITS file")?;
+    if fitsio_pure::gzip::is_gzip(&file) {
+        file = fitsio_pure::gzip::decompress(&file).context("Failed to decompress FITS file")?;
+    }
+    let fits = parse_fits(&file).context("Failed to parse FITS file")?;
+    let hdu = image_hdu(&fits.hdus)?;
+
+    let hdr = read_fits_header(hdu)?;
 
     let channels = if hdr.naxis >= 3 && hdr.naxis3 > 0 {
         if hdr.naxis3 != 1 && hdr.naxis3 != 3 {
@@ -164,10 +113,14 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     let bytes_per_pixel = (hdr.bitpix.unsigned_abs() as usize) / 8;
     let data_size = num_pixels * bytes_per_pixel;
 
-    let mut raw_data = vec![0u8; data_size];
-    reader
-        .read_exact(&mut raw_data)
-        .context("Failed to read FITS data")?;
+    // Tiles decompress to native-endian pixels; serialising them back to
+    // big-endian lets both kinds of file share the conversions below.
+    let raw_data: Cow<[u8]> = if matches!(hdu.info, HduInfo::CompressedImage { .. }) {
+        Cow::Owned(serialize_image(&read_tiled_image(&file, hdu)?))
+    } else {
+        Cow::Borrowed(&file[hdu.data_start..])
+    };
+    let raw_data = raw_data.get(..data_size).context("Failed to read FITS data")?;
 
     const CHUNK: usize = 65536;
     const PAR_THRESHOLD: usize = CHUNK * 2;
@@ -251,7 +204,7 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
             if num_pixels >= PAR_THRESHOLD {
                 raw_data.par_chunks(CHUNK).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
             } else {
-                convert(&raw_data, &mut u16_data);
+                convert(raw_data, &mut u16_data);
             }
 
             (DataType::Uint16, PixelData::Uint16(u16_data))
@@ -418,6 +371,7 @@ unsafe fn bswap_u16_xor_ssse3(src: &[u8], dst: &mut [u16], start: usize, n: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fitsio_pure::{BLOCK_SIZE as FITS_BLOCK_SIZE, CARD_SIZE as FITS_CARD_SIZE};
 
     /// Formats a single 80-byte FITS header card: an 8-char keyword field,
     /// `= `, then the value, right-padded with spaces to `FITS_CARD_SIZE`.

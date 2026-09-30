@@ -21,7 +21,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 
 | Format | Extensions | Data Types |
 |--------|-----------|------------|
-| FITS | `.fits`, `.fit` | 8/16/32-bit int, 32/64-bit float |
+| FITS | `.fits`, `.fit`, `.fts`, tile-compressed `.fz`, gzipped `.fits.gz` | 8/16/32-bit int, 32/64-bit float |
 | XISF | `.xisf` | All sample formats, zlib/LZ4/Zstd compression |
 
 ## Installation

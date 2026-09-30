@@ -50,6 +50,7 @@ base64 = "0.23"
 rayon = "1.10"
 nalgebra = "0.35"
 tracing = "0.1"
+fitsio-pure = "0.13.4"
 
 [dev-dependencies]
 # Independent decoder for tests/jpeg_encoder.rs. Deliberately NOT the encoder's

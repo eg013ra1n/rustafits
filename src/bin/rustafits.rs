@@ -9,7 +9,7 @@ fn print_usage(program: &str) {
     eprintln!("Usage: {} <input> <output.jpg> [OPTIONS]", program);
     eprintln!();
     eprintln!("Supported input formats:");
-    eprintln!("  .fits, .fit   - FITS (Flexible Image Transport System)");
+    eprintln!("  .fits, .fit, .fts - FITS (Flexible Image Transport System), also .fz and .gz");
     eprintln!("  .xisf         - XISF (PixInsight native format)");
     eprintln!();
     eprintln!("Options:");
