@@ -460,7 +460,7 @@ pub fn fit_moffat_2d(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, None, max_iter, conv_tol, max_rejects)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, None, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
 }
 
 /// Fit 2D elliptical Moffat with fixed beta (7 free parameters).
@@ -482,7 +482,58 @@ pub fn fit_moffat_2d_fixed_beta(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, Some(beta), max_iter, conv_tol, max_rejects)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, Some(beta), max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
+}
+
+/// Fit 2D elliptical Moffat with fixed beta (7 free parameters), the θ column of the Jacobian carrying its correct
+/// sign, `∂Q/∂θ = 2uv·(1/α_x² − 1/α_y²)`.
+///
+/// [`fit_moffat_2d`] and [`fit_moffat_2d_fixed_beta`] build that column with the opposite sign (every release
+/// through 1.3.0). With it the solver's θ step points uphill: once the other parameters have absorbed what they can,
+/// every step is rejected and the fit stops away from the minimum — on a noiseless elliptical star started 5° off,
+/// at 44.8° for a true 30°. Those two entry points keep the column they shipped, so what they return does not
+/// change; this one is the corrected fit, otherwise identical (same arguments, same solver, same acceptance rules).
+///
+/// Named for the conditioned stamps its first caller hands it (centred on the stamp, amplitude-normalised, so every
+/// parameter is O(1)); it is correct on any input.
+pub fn fit_moffat_2d_fixed_beta_conditioned(
+    pixels: &[PixelSample],
+    init_b: f64,
+    init_a: f64,
+    init_x0: f64,
+    init_y0: f64,
+    init_sigma_x: f64,
+    init_sigma_y: f64,
+    init_theta: f64,
+    beta: f64,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
+) -> Option<Moffat2DResult> {
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, Some(beta), max_iter, conv_tol, max_rejects, ThetaColumn::Corrected)
+}
+
+/// Which sign the Moffat solver's θ column carries — the one private difference between
+/// [`fit_moffat_2d_fixed_beta_conditioned`] and the two entry points that shipped before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThetaColumn {
+    /// `2uv·(1/α_y² − 1/α_x²)`, the NEGATIVE of `∂Q/∂θ`: what [`fit_moffat_2d`] and [`fit_moffat_2d_fixed_beta`]
+    /// have always built, kept so their output does not move.
+    Legacy,
+    /// `∂Q/∂θ = 2uv·(1/α_x² − 1/α_y²)`, from `∂u/∂θ = v`, `∂v/∂θ = −u`.
+    Corrected,
+}
+
+impl ThetaColumn {
+    /// The θ factor of the Jacobian row, `∂Q/∂θ` up to this column's sign. `Legacy` is the expression the solver
+    /// always evaluated, operand for operand, so its result is bit-identical.
+    #[inline(always)]
+    fn dq_dtheta(self, u: f64, v: f64, inv_ax2: f64, inv_ay2: f64) -> f64 {
+        match self {
+            ThetaColumn::Legacy => 2.0 * u * v * (inv_ay2 - inv_ax2),
+            ThetaColumn::Corrected => 2.0 * u * v * (inv_ax2 - inv_ay2),
+        }
+    }
 }
 
 /// Evaluate the 2D Moffat model at a single point.
@@ -515,6 +566,7 @@ fn fit_moffat_2d_impl(
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
+    theta_column: ThetaColumn,
 ) -> Option<Moffat2DResult> {
     if pixels.len() < 12 {
         return None;
@@ -538,6 +590,7 @@ fn fit_moffat_2d_impl(
         max_iter,
         conv_tol,
         max_rejects,
+        theta_column,
     );
 
     let alpha_x = params[4].abs();
@@ -657,6 +710,7 @@ fn lm_solve_moffat_impl(
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
+    theta_column: ThetaColumn,
 ) -> LmResult {
     // The solver never re-enters itself, so the borrow always succeeds; the
     // fallback keeps a future caller from panicking rather than degrading.
@@ -668,6 +722,7 @@ fn lm_solve_moffat_impl(
             max_iter,
             conv_tol,
             max_rejects,
+            theta_column,
             &mut scratch,
         ),
         Err(_) => lm_solve_moffat_with(
@@ -677,6 +732,7 @@ fn lm_solve_moffat_impl(
             max_iter,
             conv_tol,
             max_rejects,
+            theta_column,
             &mut MoffatScratch::default(),
         ),
     })
@@ -689,6 +745,7 @@ fn lm_solve_moffat_with(
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
+    theta_column: ThetaColumn,
     scratch: &mut MoffatScratch,
 ) -> LmResult {
     // The reuse seam's contract: `residual_cost_moffat_into` resolves its
@@ -778,7 +835,7 @@ fn lm_solve_moffat_with(
             j[4] = a_dpq * (-2.0 * u * u / (ax * ax * ax));
             j[5] = a_dpq * (-2.0 * v * v / (ay * ay * ay));
 
-            let dq_dtheta = 2.0 * u * v * (inv_ay2 - inv_ax2);
+            let dq_dtheta = theta_column.dq_dtheta(u, v, inv_ax2, inv_ay2);
             j[6] = a_dpq * dq_dtheta;
 
             // Only include dM/dbeta when beta is free — the one `ln` in the
@@ -976,7 +1033,7 @@ fn residual_cost_moffat_into(
 /// regression is caught at the fixture level. Do not "improve" it.
 #[cfg(test)]
 mod reference {
-    use super::{LmResult, PixelSample};
+    use super::{LmResult, PixelSample, ThetaColumn};
 
     pub fn cholesky_solve_alloc(mat: &[f64], rhs: &[f64], np: usize) -> Option<Vec<f64>> {
         let mut l = vec![0.0_f64; np * np];
@@ -1045,6 +1102,7 @@ mod reference {
         max_iter: usize,
         conv_tol: f64,
         max_rejects: usize,
+        theta_column: ThetaColumn,
     ) -> LmResult {
         let np = if fixed_beta.is_some() { 7 } else { 8 };
         let mut lambda = 1e-3_f64;
@@ -1100,7 +1158,7 @@ mod reference {
                 j[4] = a_dpq * (-2.0 * u * u / (ax * ax * ax));
                 j[5] = a_dpq * (-2.0 * v * v / (ay * ay * ay));
 
-                let dq_dtheta = 2.0 * u * v * (inv_ay2 - inv_ax2);
+                let dq_dtheta = theta_column.dq_dtheta(u, v, inv_ax2, inv_ay2);
                 j[6] = a_dpq * dq_dtheta;
 
                 if fixed_beta.is_none() {
@@ -1711,6 +1769,7 @@ mod tests {
                     CALIBRATION_MAX_ITER,
                     CALIBRATION_CONV_TOL,
                     CALIBRATION_MAX_REJECTS,
+                    ThetaColumn::Legacy,
                 );
                 let mut was = init;
                 let r_was = reference::lm_solve_moffat(
@@ -1720,6 +1779,7 @@ mod tests {
                     CALIBRATION_MAX_ITER,
                     CALIBRATION_CONV_TOL,
                     CALIBRATION_MAX_REJECTS,
+                    ThetaColumn::Legacy,
                 );
 
                 // Ruling C-4 — arithmetic only, the control flow is untouched.
@@ -1860,5 +1920,219 @@ mod tests {
             MoffatExponent::new(f64::NAN),
             MoffatExponent::Real(_)
         ));
+    }
+
+    // ── The conditioned entry point: the θ column with its correct sign ─────
+
+    /// A noiseless elliptical Moffat (`B = 0`, `A = 1`) on an `n × n` stamp centred on `(cx, cy)`, through the
+    /// module's own model.
+    fn moffat_stamp(n: usize, cx: f64, cy: f64, ax: f64, ay: f64, theta: f64, beta: f64) -> Vec<PixelSample> {
+        let params = [0.0, 1.0, cx, cy, ax, ay, theta, beta];
+        let mut px = Vec::with_capacity(n * n);
+        for y in 0..n {
+            for x in 0..n {
+                let (x, y) = (x as f64, y as f64);
+                px.push(PixelSample { x, y, value: evaluate_moffat_2d(&params, x, y) });
+            }
+        }
+        px
+    }
+
+    fn result_bits(r: &Moffat2DResult) -> [u64; 9] {
+        [
+            r.b.to_bits(),
+            r.a.to_bits(),
+            r.x0.to_bits(),
+            r.y0.to_bits(),
+            r.alpha_x.to_bits(),
+            r.alpha_y.to_bits(),
+            r.theta.to_bits(),
+            r.beta.to_bits(),
+            r.fit_residual.to_bits(),
+        ]
+    }
+
+    /// The θ column the solver builds, `A·(∂(1+Q)^(−β)/∂Q)·∂Q/∂θ` (`a_dpq * column.dq_dtheta(..)` exactly as
+    /// `lm_solve_moffat_with` writes it), against a central difference of the model in θ on a small elliptical stamp,
+    /// pixel by pixel. The corrected column matches it; the legacy one is its exact negative everywhere.
+    #[test]
+    fn the_corrected_theta_column_is_the_central_difference_of_the_model() {
+        let h = 1e-6;
+        let mut checked = 0_usize;
+        for &(ax, ay, theta, beta) in &[(2.0_f64, 3.5_f64, 0.6_f64, 4.0_f64), (3.2, 1.7, -1.1, 2.5)] {
+            let params = [0.02, 0.9, 4.3, 3.8, ax, ay, theta, beta];
+            let (cos_t, sin_t) = (theta.cos(), theta.sin());
+            let (inv_ax2, inv_ay2) = (1.0 / (ax * ax), 1.0 / (ay * ay));
+            for y in 0..9 {
+                for x in 0..9 {
+                    let (x, y) = (x as f64, y as f64);
+                    let (dx, dy) = (x - params[2], y - params[3]);
+                    let u = dx * cos_t + dy * sin_t;
+                    let v = -dx * sin_t + dy * cos_t;
+                    let base = 1.0 + u * u * inv_ax2 + v * v * inv_ay2;
+                    let power = base.powf(-beta);
+                    let a_dpq = params[1] * (-beta * (power / base));
+                    let corrected = a_dpq * ThetaColumn::Corrected.dq_dtheta(u, v, inv_ax2, inv_ay2);
+                    let legacy = a_dpq * ThetaColumn::Legacy.dq_dtheta(u, v, inv_ax2, inv_ay2);
+
+                    let (mut up, mut down) = (params, params);
+                    up[6] += h;
+                    down[6] -= h;
+                    let fd = (evaluate_moffat_2d(&up, x, y) - evaluate_moffat_2d(&down, x, y)) / (2.0 * h);
+
+                    assert!(
+                        (corrected - fd).abs() <= 1e-8,
+                        "corrected column {corrected:e} vs central difference {fd:e} at ({x}, {y}), params {params:?}"
+                    );
+                    assert_eq!(legacy.to_bits(), (-corrected).to_bits(), "legacy column at ({x}, {y})");
+                    if fd.abs() > 1e-3 {
+                        assert!(legacy * fd < 0.0, "the legacy column has the wrong sign at ({x}, {y})");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 60, "the stamps must carry a real θ gradient: {checked} pixels");
+    }
+
+    #[test]
+    fn conditioned_convergence_does_not_stop_on_a_theta_step() {
+        // a noiseless elliptical Moffat (αx 2.5, αy 4, θ 30°, β 4) sampled on a 31×31 stamp, started with θ off by 5°
+        // and everything else exact: the conditioned solver ends within 1° of 30°; the vector-norm solver is recorded
+        // (`the_legacy_entry_points_are_output_identical_to_1_3_0`: θ 44.84°, not converged)
+        let pixels = moffat_stamp(31, 15.0, 15.0, 2.5, 4.0, 30f64.to_radians(), 4.0);
+        let r = fit_moffat_2d_fixed_beta_conditioned(
+            &pixels,
+            0.0,
+            1.0,
+            15.0,
+            15.0,
+            2.5 * 0.6,
+            4.0 * 0.6,
+            35f64.to_radians(),
+            4.0,
+            100,
+            1e-5,
+            5,
+        )
+        .unwrap();
+        assert!((r.theta.to_degrees() - 30.0).abs() < 1.0, "theta {}", r.theta.to_degrees());
+    }
+
+    /// A pin, not RED: `fit_moffat_2d_fixed_beta` and `fit_moffat_2d` keep the θ column every release through 1.3.0
+    /// shipped, so their output on the input above is bit for bit what 1.3.0 (8321412) gives — recorded there before
+    /// the conditioned entry point was added. The numbers are the stall the legacy column causes: from a 35° start the
+    /// fit walks AWAY from the true 30°.
+    #[test]
+    fn the_legacy_entry_points_are_output_identical_to_1_3_0() {
+        let pixels = moffat_stamp(31, 15.0, 15.0, 2.5, 4.0, 30f64.to_radians(), 4.0);
+        let fixed = fit_moffat_2d_fixed_beta(
+            &pixels,
+            0.0,
+            1.0,
+            15.0,
+            15.0,
+            2.5 * 0.6,
+            4.0 * 0.6,
+            35f64.to_radians(),
+            4.0,
+            100,
+            1e-5,
+            5,
+        )
+        .unwrap();
+        // θ 44.838°, not converged.
+        assert_eq!(
+            result_bits(&fixed),
+            [
+                0x3f3597d2f746f108,
+                0x3fef2644e43b3e52,
+                0x402e000000000000,
+                0x402e000000000000,
+                0x4003d8f7cfb9d57a,
+                0x400f1ab3020d95ce,
+                0x3fe90ad307042a7c,
+                0x4010000000000000,
+                0x3f8177ab7774f2fb,
+            ]
+        );
+        assert!(!fixed.converged);
+        let free = fit_moffat_2d(
+            &pixels,
+            0.0,
+            1.0,
+            15.0,
+            15.0,
+            2.5 * 0.6,
+            4.0 * 0.6,
+            35f64.to_radians(),
+            100,
+            1e-5,
+            5,
+        )
+        .unwrap();
+        // θ 48.396°, β 1.87, not converged.
+        assert_eq!(
+            result_bits(&free),
+            [
+                0xbf61565c765f8519,
+                0x3fefaedc7e5b15b2,
+                0x402e000000000000,
+                0x402e000000000000,
+                0x3ff8d134924b8a6c,
+                0x40039d13198561fa,
+                0x3feb078330706328,
+                0x3ffdf1d4ebb0f55c,
+                0x3f87d78dba90a921,
+            ]
+        );
+        assert!(!free.converged);
+    }
+
+    /// Ruling C-4 for the corrected column: the shipped solver and the frozen pre-C3 reference, both on the corrected
+    /// column, run the same control flow (iterations, verdict) and land within the C3 tolerances on every stamp of
+    /// the C3 grid — the column is threaded through both the same way.
+    #[test]
+    fn c3_contract_holds_for_the_corrected_theta_column() {
+        let fixtures = fixture_stars();
+        let modes: [Option<f64>; 5] = [Some(2.5), Some(4.0), Some(6.0), Some(10.0), None];
+        let mut cases = 0_usize;
+        for f in &fixtures {
+            for &fixed_beta in &modes {
+                let init = moffat_init(f, fixed_beta);
+                let tag = format!("{} fixed_beta={fixed_beta:?}", f.label);
+                let mut now = init;
+                let r_now = lm_solve_moffat_impl(
+                    &f.pixels,
+                    &mut now,
+                    fixed_beta,
+                    CALIBRATION_MAX_ITER,
+                    CALIBRATION_CONV_TOL,
+                    CALIBRATION_MAX_REJECTS,
+                    ThetaColumn::Corrected,
+                );
+                let mut was = init;
+                let r_was = reference::lm_solve_moffat(
+                    &f.pixels,
+                    &mut was,
+                    fixed_beta,
+                    CALIBRATION_MAX_ITER,
+                    CALIBRATION_CONV_TOL,
+                    CALIBRATION_MAX_REJECTS,
+                    ThetaColumn::Corrected,
+                );
+                assert_eq!(r_now.iters, r_was.iters, "iteration count: {tag}");
+                assert_eq!(r_now.converged, r_was.converged, "convergence verdict: {tag}");
+                let pos = (now[2] - was[2]).abs().max((now[3] - was[3]).abs());
+                assert!(pos <= 1e-5, "position {pos:.3e} px: {tag}");
+                let (flux_now, flux_was) = (moffat_flux(&now), moffat_flux(&was));
+                let flux = if flux_was != 0.0 { ((flux_now - flux_was) / flux_was).abs() } else { 0.0 };
+                assert!(flux <= 1e-5, "flux {flux:.3e} relative: {tag}");
+                let beta = if was[7] != 0.0 { ((now[7] - was[7]) / was[7]).abs() } else { 0.0 };
+                assert!(beta <= 1e-5, "beta {beta:.3e} relative: {tag}");
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 180, "fixture x mode grid");
     }
 }
