@@ -460,7 +460,7 @@ pub fn fit_moffat_2d(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::FreeLinear, LEGACY_MAX_BETA, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::FreeLinear, LEGACY_MAX_BETA, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy, GuardedStep::Counted)
 }
 
 /// Fit 2D elliptical Moffat with fixed beta (7 free parameters).
@@ -482,7 +482,7 @@ pub fn fit_moffat_2d_fixed_beta(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), LEGACY_MAX_BETA, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), LEGACY_MAX_BETA, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy, GuardedStep::Counted)
 }
 
 /// Fit 2D elliptical Moffat with fixed beta (7 free parameters), the θ column of the Jacobian carrying its correct
@@ -492,7 +492,8 @@ pub fn fit_moffat_2d_fixed_beta(
 /// through 1.3.0). With it the solver's θ step points uphill: once the other parameters have absorbed what they can,
 /// every step is rejected and the fit stops away from the minimum — on a noiseless elliptical star started 5° off,
 /// at 44.8° for a true 30°. Those two entry points keep the column they shipped, so what they return does not
-/// change; this one is the corrected fit, otherwise identical (same arguments, same solver, same acceptance rules).
+/// change; this one is the corrected fit, otherwise identical (same arguments, same solver, same acceptance rules)
+/// but for its guarded steps (below).
 ///
 /// Named for the conditioned stamps its first caller hands it (centred on the stamp, amplitude-normalised, so every
 /// parameter is O(1)); it is correct on any input.
@@ -500,6 +501,14 @@ pub fn fit_moffat_2d_fixed_beta(
 /// Its β has no ceiling: any fixed β ≥ 1 is fitted, where the two older entry points refuse β > 20 — its caller's
 /// β is the median of [`fit_moffat_2d_bounded`] fits, which reach the Gaussian limit at large β. Below 20 its output
 /// is what it always was.
+///
+/// Its guarded steps are [`fit_moffat_2d_bounded`]'s: until the solve has accepted a step, a step the guard refuses
+/// (α under 0.5, or the centroid moved more than 2 px) raises the damping without counting toward `max_rejects`
+/// ([`GuardedStep::UncountedBeforeFirstStep`]), and a solve that accepted no step and whose start did not pass the
+/// convergence test is refused (`None`), never returned as a fit. A star whose top is censored, started under it
+/// (`A` = the clipped maximum), overshoots the guard on its first steps; counted, five such refusals ended the solve
+/// on its start, which this entry point returned. Every other solve runs step for step as before: the two rules part
+/// only in a solve the counted rule ended before its first accepted step, and that solve had returned its start.
 pub fn fit_moffat_2d_fixed_beta_conditioned(
     pixels: &[PixelSample],
     init_b: f64,
@@ -514,7 +523,7 @@ pub fn fit_moffat_2d_fixed_beta_conditioned(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), f64::INFINITY, max_iter, conv_tol, max_rejects, ThetaColumn::Corrected)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), f64::INFINITY, max_iter, conv_tol, max_rejects, ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep)
 }
 
 /// Result of [`fit_moffat_2d_bounded`]: the parameters of [`Moffat2DResult`] plus the solver's iteration count.
@@ -781,18 +790,22 @@ impl ThetaColumn {
 }
 
 /// What a step the Moffat solver's guard refuses (α under 0.5, or the centroid moved more than 2 px) does to the
-/// reject budget — the one private difference [`fit_moffat_2d_bounded`]'s solve makes beside [`BetaParam`] and
-/// [`Sampling`].
+/// reject budget, and whether a solve that accepted no step is a fit — the one private difference between the
+/// branch-new entry points ([`fit_moffat_2d_bounded`], [`fit_moffat_2d_fixed_beta_conditioned`]) and the 1.3.0 ones
+/// beside [`BetaParam`], [`ThetaColumn`] and [`Sampling`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuardedStep {
-    /// Counted like a step whose cost did not improve: `max_rejects` refused steps in a row end the solve. What
-    /// [`fit_moffat_2d`], [`fit_moffat_2d_fixed_beta`] and [`fit_moffat_2d_fixed_beta_conditioned`] have always done,
-    /// kept so their output does not move.
+    /// Counted like a step whose cost did not improve: `max_rejects` refused steps in a row end the solve, and a solve
+    /// that ends on its start is returned like any other. What [`fit_moffat_2d`] and [`fit_moffat_2d_fixed_beta`]
+    /// have always done, kept so their output does not move.
     Counted,
     /// Not counted until the solve has accepted a step: from a start far from the data the linearised step overshoots
     /// the guard, and it is too long, not worse, so it raises λ — the next step is shorter — without spending the
     /// budget. Each raise doubles the next one, so a few of them bring any step inside the guard. Once a step has
-    /// been accepted, refusals count as they always have (a fit that keeps proposing to leave is stopped there).
+    /// been accepted, refusals count as they always have (a fit that keeps proposing to leave is stopped there). A
+    /// solve that still accepted no step returns its start, which is not a fit: its entry point refuses it unless the
+    /// start itself passed the convergence test. What [`fit_moffat_2d_bounded`] and
+    /// [`fit_moffat_2d_fixed_beta_conditioned`] do.
     UncountedBeforeFirstStep,
 }
 
@@ -881,7 +894,8 @@ const LEGACY_MAX_BETA: f64 = 20.0;
 /// [`fit_moffat_2d`], [`fit_moffat_2d_fixed_beta`] and [`fit_moffat_2d_fixed_beta_conditioned`]: `beta_param` is
 /// `Fixed` or `FreeLinear` (start β 3.0), and the acceptance is the one they always applied — `α < 0.3`, `A ≤ 0`
 /// or β outside [1, `max_beta`] refuses the fit (`max_beta` is [`LEGACY_MAX_BETA`] for the two 1.3.0 entry points,
-/// none for the conditioned one).
+/// none for the conditioned one). Under [`GuardedStep::UncountedBeforeFirstStep`] (the conditioned one) a solve that
+/// accepted no step and did not converge is refused too.
 #[allow(clippy::too_many_arguments)]
 fn fit_moffat_2d_impl(
     pixels: &[PixelSample],
@@ -898,6 +912,7 @@ fn fit_moffat_2d_impl(
     conv_tol: f64,
     max_rejects: usize,
     theta_column: ThetaColumn,
+    guarded_step: GuardedStep,
 ) -> Option<Moffat2DResult> {
     debug_assert!(
         !matches!(beta_param, BetaParam::FreeLn { .. }),
@@ -914,7 +929,7 @@ fn fit_moffat_2d_impl(
             final_cost,
             ..
         },
-        ..
+        moved,
     } = solve_moffat_2d(
         pixels,
         init_b,
@@ -931,8 +946,12 @@ fn fit_moffat_2d_impl(
         max_rejects,
         theta_column,
         Sampling::Point,
-        GuardedStep::Counted,
+        guarded_step,
     )?;
+    // The solve never left its start and the start did not converge: the fitter could not move (A4, Task 9).
+    if guarded_step == GuardedStep::UncountedBeforeFirstStep && !moved && !converged {
+        return None;
+    }
 
     let alpha_x = params[4].abs();
     let alpha_y = params[5].abs();
@@ -3073,6 +3092,67 @@ mod tests {
         let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 0.0, 0.0, sigma, sigma, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5, 1)
             .expect("a start that is the fit is a fit");
         assert!(r.iters == 1 && r.converged && r.a == 1.0 && r.alpha_x == alpha && r.beta == start[7].exp(), "{r:?}");
+    }
+
+    /// A fixed-β result for a failure message (`Moffat2DResult` has no `Debug`).
+    fn show(r: &Moffat2DResult) -> String {
+        format!(
+            "B {} A {} centre ({}, {}) alpha ({}, {}) theta {} beta {} converged {}",
+            r.b, r.a, r.x0, r.y0, r.alpha_x, r.alpha_y, r.theta, r.beta, r.converged
+        )
+    }
+
+    /// A4 (Task 9 fix round): the fit at a fixed β of a censored star leaves its start. The star of
+    /// [`censored_star`] fitted at its own β 2.5 from where its caller starts it (B = 0, A = 1 — the clipped maximum,
+    /// 50× under the truth — round at F 2.5 px): every early step overshoots the 2 px centroid guard, and five such
+    /// refusals, counted, ended the solve on its start and returned it as a fit (A 1, the start α, the centre at the
+    /// seed). Now the refused steps only raise λ until one is accepted, and the fit converges on the star: the centre
+    /// within 0.01 px, the FWHM within 5 % (2.125 for 2.2). The amplitude reads 20 % high (59.8 for 50): the point
+    /// model's peak, extrapolated from the wings of an undersampled star whose pixels integrate the light; the start
+    /// read 0.96.
+    #[test]
+    fn a_censored_star_at_a_fixed_beta_leaves_its_start() {
+        let (kept, a0) = censored_star();
+        let sigma = 2.5 / 2.354_820_045;
+        let r = fit_moffat_2d_fixed_beta_conditioned(&kept, 0.0, 1.0, 0.0, 0.0, sigma, sigma, 0.0, 2.5, 300, 1e-5, 5)
+            .expect("the censored star is fitted");
+        let fwhm = (r.fwhm_x() * r.fwhm_y()).sqrt();
+        println!("censored at beta 2.5: amplitude {} fwhm {fwhm} centre ({}, {}) converged {}", r.a * a0, r.x0, r.y0, r.converged);
+        assert!(r.a != 1.0 && r.x0 != 0.0 && r.y0 != 0.0, "the fit never left its start: {}", show(&r));
+        assert!(r.converged, "{}", show(&r));
+        assert!((r.a * a0 / 50.0 - 1.0).abs() < 0.25, "amplitude {}", r.a * a0);
+        assert!((fwhm / 2.2 - 1.0).abs() < 0.05, "fwhm {fwhm}");
+        assert!((r.x0 - 0.3).abs() < 0.01 && (r.y0 + 0.2).abs() < 0.01, "centre ({}, {})", r.x0, r.y0);
+    }
+
+    /// A4: at a fixed β, too, a solve that accepted no step is not a fit. The censored star with an iteration limit
+    /// its guard-refused first steps use up returned its start (A 1, the start α); it is refused now. A start that
+    /// already satisfies the convergence test is a fit: a noiseless star rendered at the start itself is returned as
+    /// is, converged. The 1.3.0 fixed-β entry point is unchanged: it still returns the unmoved start.
+    #[test]
+    fn a_fixed_beta_solve_that_accepted_no_step_is_refused_unless_its_start_converged() {
+        let (kept, _) = censored_star();
+        let sigma = 2.5 / 2.354_820_045;
+        let r = fit_moffat_2d_fixed_beta_conditioned(&kept, 0.0, 1.0, 0.0, 0.0, sigma, sigma, 0.0, 2.5, 3, 1e-5, 5);
+        assert!(r.is_none(), "a solve that never moved is returned: {}", r.as_ref().map_or_else(String::new, show));
+        let legacy = fit_moffat_2d_fixed_beta(&kept, 0.0, 1.0, 0.0, 0.0, sigma, sigma, 0.0, 2.5, 300, 1e-5, 5)
+            .expect("the 1.3.0 entry point returns its start");
+        assert!(legacy.a == 1.0 && legacy.x0 == 0.0 && legacy.y0 == 0.0, "{}", show(&legacy));
+        // The start the solver builds (`solve_moffat_2d`), and pixels its own cost pass reads as exactly that model.
+        let beta = 2.5;
+        let alpha = sigma * 2.3548 / (2.0 * (2.0_f64.powf(1.0 / beta) - 1.0).sqrt());
+        let start = [0.0, 1.0, 0.0, 0.0, alpha, alpha, 0.0, beta];
+        let mut pixels: Vec<PixelSample> = (-10..=10)
+            .flat_map(|y| (-10..=10).map(move |x| PixelSample { x: x as f64, y: y as f64, value: 0.0 }))
+            .collect();
+        let (mut power, mut resid) = (vec![0.0; pixels.len()], vec![0.0; pixels.len()]);
+        residual_cost_moffat_into(&pixels, &start, BetaParam::Fixed(beta), Sampling::Point, &mut power, &mut resid);
+        for (p, r) in pixels.iter_mut().zip(&resid) {
+            p.value = -r;
+        }
+        let r = fit_moffat_2d_fixed_beta_conditioned(&pixels, 0.0, 1.0, 0.0, 0.0, sigma, sigma, 0.0, beta, 100, 1e-5, 5)
+            .expect("a start that is the fit is a fit");
+        assert!(r.converged && r.a == 1.0 && r.alpha_x == alpha && r.x0 == 0.0, "{}", show(&r));
     }
 }
 
