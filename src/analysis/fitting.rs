@@ -460,7 +460,7 @@ pub fn fit_moffat_2d(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::FreeLinear, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::FreeLinear, LEGACY_MAX_BETA, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
 }
 
 /// Fit 2D elliptical Moffat with fixed beta (7 free parameters).
@@ -482,7 +482,7 @@ pub fn fit_moffat_2d_fixed_beta(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), LEGACY_MAX_BETA, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
 }
 
 /// Fit 2D elliptical Moffat with fixed beta (7 free parameters), the θ column of the Jacobian carrying its correct
@@ -496,6 +496,10 @@ pub fn fit_moffat_2d_fixed_beta(
 ///
 /// Named for the conditioned stamps its first caller hands it (centred on the stamp, amplitude-normalised, so every
 /// parameter is O(1)); it is correct on any input.
+///
+/// Its β has no ceiling: any fixed β ≥ 1 is fitted, where the two older entry points refuse β > 20 — its caller's
+/// β is the median of [`fit_moffat_2d_bounded`] fits, which reach the Gaussian limit at large β. Below 20 its output
+/// is what it always was.
 pub fn fit_moffat_2d_fixed_beta_conditioned(
     pixels: &[PixelSample],
     init_b: f64,
@@ -510,7 +514,7 @@ pub fn fit_moffat_2d_fixed_beta_conditioned(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), max_iter, conv_tol, max_rejects, ThetaColumn::Corrected)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), f64::INFINITY, max_iter, conv_tol, max_rejects, ThetaColumn::Corrected)
 }
 
 /// Result of [`fit_moffat_2d_bounded`]: the parameters of [`Moffat2DResult`] plus the solver's iteration count.
@@ -790,9 +794,14 @@ fn solve_moffat_2d(
     Some(MoffatSolve { params, lm })
 }
 
+/// The β ceiling [`fit_moffat_2d`] and [`fit_moffat_2d_fixed_beta`] have always applied: a fit whose β is above it is
+/// refused.
+const LEGACY_MAX_BETA: f64 = 20.0;
+
 /// [`fit_moffat_2d`], [`fit_moffat_2d_fixed_beta`] and [`fit_moffat_2d_fixed_beta_conditioned`]: `beta_param` is
 /// `Fixed` or `FreeLinear` (start β 3.0), and the acceptance is the one they always applied — `α < 0.3`, `A ≤ 0`
-/// or β outside [1, 20] refuses the fit.
+/// or β outside [1, `max_beta`] refuses the fit (`max_beta` is [`LEGACY_MAX_BETA`] for the two 1.3.0 entry points,
+/// none for the conditioned one).
 #[allow(clippy::too_many_arguments)]
 fn fit_moffat_2d_impl(
     pixels: &[PixelSample],
@@ -804,6 +813,7 @@ fn fit_moffat_2d_impl(
     init_sigma_y: f64,
     init_theta: f64,
     beta_param: BetaParam,
+    max_beta: f64,
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
@@ -847,7 +857,7 @@ fn fit_moffat_2d_impl(
 
     // Reject non-physical results
     if alpha_x < 0.3 || alpha_y < 0.3 || params[1] <= 0.0
-        || beta < 1.0 || beta > 20.0
+        || beta < 1.0 || beta > max_beta
     {
         return None;
     }
@@ -2548,5 +2558,21 @@ mod tests {
             ThetaColumn::Legacy,
         );
         assert_eq!((lm.iters, lm.converged), (10, false));
+    }
+
+    /// The conditioned fixed-β entry point fits β above 20 (its caller's frame β reaches the Gaussian limit at 100);
+    /// the 1.3.0 fixed-β entry point keeps refusing it. At β 100 a σ 2 Gaussian reads within 0.4 % of its FWHM.
+    #[test]
+    fn the_conditioned_fixed_beta_fit_has_no_beta_ceiling() {
+        let pixels = gauss_stamp(41, 20.0, 20.0, 2.0);
+        for beta in [25.0, 100.0] {
+            let r = fit_moffat_2d_fixed_beta_conditioned(&pixels, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, beta, 100, 1e-5, 5)
+                .unwrap_or_else(|| panic!("beta {beta} is refused"));
+            assert_eq!(r.beta, beta);
+            if beta == 100.0 {
+                assert!((r.fwhm_x() / (2.0 * 2.354_820_045) - 1.0).abs() < 0.004, "fwhm {}", r.fwhm_x());
+            }
+            assert!(fit_moffat_2d_fixed_beta(&pixels, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, beta, 100, 1e-5, 5).is_none());
+        }
     }
 }
