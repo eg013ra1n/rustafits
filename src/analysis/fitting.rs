@@ -556,6 +556,14 @@ impl Moffat2DBoundedResult {
 /// sets the start α from the Gaussian σ as [`fit_moffat_2d`] does from its fixed 3.0. The θ column carries its
 /// correct sign, as in [`fit_moffat_2d_fixed_beta_conditioned`].
 ///
+/// Until the solve has accepted a step, a step the solver's guard refuses (α under 0.5, or the centroid moved more
+/// than 2 px) is too long, not worse: it raises the damping like any refused step but does not count toward
+/// `max_rejects` ([`GuardedStep::UncountedBeforeFirstStep`]; `max_iter` still bounds the solve). A solve that accepted
+/// no step returns its start, which is not a fit: it is refused (`None`) unless the start itself passed the
+/// convergence test. A star whose top is censored, started under it (`A` = the clipped maximum, far below the truth),
+/// overshoots the guard on its first steps; counted, those refusals ended the solve on its start and returned it as a
+/// fit.
+///
 /// `subsample` (k) sets how the model meets a pixel. k = 1: the model at the pixel's centre (point-sampled). k ≥ 2:
 /// the model and its Jacobian at each pixel are the mean over k × k midpoint sub-samples at offsets
 /// `(i + 0.5)/k − 0.5` px in x and in y — the pixel-integrated Moffat. A point model fitted to an undersampled star
@@ -592,7 +600,7 @@ pub fn fit_moffat_2d_bounded(
         Sampling::Integrated(&offsets)
     };
     let (ln_min, ln_max) = (lo.ln(), hi.ln());
-    let MoffatSolve { params, lm } = solve_moffat_2d(
+    let MoffatSolve { params, lm, moved } = solve_moffat_2d(
         pixels,
         init_b,
         init_a,
@@ -608,8 +616,13 @@ pub fn fit_moffat_2d_bounded(
         max_rejects,
         ThetaColumn::Corrected,
         sampling,
+        GuardedStep::UncountedBeforeFirstStep,
     )?;
     if !(params.iter().all(|p| p.is_finite()) && lm.final_cost.is_finite()) {
+        return None;
+    }
+    // The solve never left its start and the start did not converge: the fitter could not move.
+    if !moved && !lm.converged {
         return None;
     }
     let alpha_x = params[4].abs();
@@ -767,6 +780,22 @@ impl ThetaColumn {
     }
 }
 
+/// What a step the Moffat solver's guard refuses (α under 0.5, or the centroid moved more than 2 px) does to the
+/// reject budget — the one private difference [`fit_moffat_2d_bounded`]'s solve makes beside [`BetaParam`] and
+/// [`Sampling`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardedStep {
+    /// Counted like a step whose cost did not improve: `max_rejects` refused steps in a row end the solve. What
+    /// [`fit_moffat_2d`], [`fit_moffat_2d_fixed_beta`] and [`fit_moffat_2d_fixed_beta_conditioned`] have always done,
+    /// kept so their output does not move.
+    Counted,
+    /// Not counted until the solve has accepted a step: from a start far from the data the linearised step overshoots
+    /// the guard, and it is too long, not worse, so it raises λ — the next step is shorter — without spending the
+    /// budget. Each raise doubles the next one, so a few of them bring any step inside the guard. Once a step has
+    /// been accepted, refusals count as they always have (a fit that keeps proposing to leave is stopped there).
+    UncountedBeforeFirstStep,
+}
+
 /// Evaluate the 2D Moffat model at a single point.
 ///
 /// `params`: [B, A, x0, y0, alpha_x, alpha_y, theta, beta]
@@ -785,10 +814,13 @@ pub fn evaluate_moffat_2d(params: &[f64], x: f64, y: f64) -> f64 {
 }
 
 /// One Moffat solve before acceptance: the parameters the LM run ended at (`params[7]` in `beta_param`'s own
-/// parametrisation) and the run's outcome.
+/// parametrisation), the run's outcome, and whether the run accepted a step: `moved` is false exactly when `params`
+/// are the start's, bit for bit (a refused step never writes them, and an accepted one lowered the cost, so it changed
+/// them).
 struct MoffatSolve {
     params: [f64; 8],
     lm: LmResult,
+    moved: bool,
 }
 
 /// The start vector every Moffat entry point builds — α from the Gaussian σ at `beta_init`,
@@ -810,6 +842,7 @@ fn solve_moffat_2d(
     max_rejects: usize,
     theta_column: ThetaColumn,
     sampling: Sampling<'_>,
+    guarded_step: GuardedStep,
 ) -> Option<MoffatSolve> {
     if pixels.len() < 12 {
         return None;
@@ -824,7 +857,8 @@ fn solve_moffat_2d(
         BetaParam::Fixed(_) | BetaParam::FreeLinear => beta_init,
     };
 
-    let mut params = [init_b, init_a, init_x0, init_y0, alpha_x, alpha_y, init_theta, p7];
+    let start = [init_b, init_a, init_x0, init_y0, alpha_x, alpha_y, init_theta, p7];
+    let mut params = start;
     let lm = lm_solve_moffat_impl(
         pixels,
         &mut params,
@@ -834,8 +868,10 @@ fn solve_moffat_2d(
         max_rejects,
         theta_column,
         sampling,
+        guarded_step,
     );
-    Some(MoffatSolve { params, lm })
+    let moved = params.iter().zip(&start).any(|(p, s)| p.to_bits() != s.to_bits());
+    Some(MoffatSolve { params, lm, moved })
 }
 
 /// The β ceiling [`fit_moffat_2d`] and [`fit_moffat_2d_fixed_beta`] have always applied: a fit whose β is above it is
@@ -878,6 +914,7 @@ fn fit_moffat_2d_impl(
             final_cost,
             ..
         },
+        ..
     } = solve_moffat_2d(
         pixels,
         init_b,
@@ -894,6 +931,7 @@ fn fit_moffat_2d_impl(
         max_rejects,
         theta_column,
         Sampling::Point,
+        GuardedStep::Counted,
     )?;
 
     let alpha_x = params[4].abs();
@@ -1066,6 +1104,7 @@ fn lm_solve_moffat_impl(
     max_rejects: usize,
     theta_column: ThetaColumn,
     sampling: Sampling<'_>,
+    guarded_step: GuardedStep,
 ) -> LmResult {
     // The solver never re-enters itself, so the borrow always succeeds; the
     // fallback keeps a future caller from panicking rather than degrading.
@@ -1079,6 +1118,7 @@ fn lm_solve_moffat_impl(
             max_rejects,
             theta_column,
             sampling,
+            guarded_step,
             &mut scratch,
         ),
         Err(_) => lm_solve_moffat_with(
@@ -1090,6 +1130,7 @@ fn lm_solve_moffat_impl(
             max_rejects,
             theta_column,
             sampling,
+            guarded_step,
             &mut MoffatScratch::default(),
         ),
     })
@@ -1105,6 +1146,7 @@ fn lm_solve_moffat_with(
     max_rejects: usize,
     theta_column: ThetaColumn,
     sampling: Sampling<'_>,
+    guarded_step: GuardedStep,
     scratch: &mut MoffatScratch,
 ) -> LmResult {
     // The reuse seam's contract: `residual_cost_moffat_into` resolves its
@@ -1145,6 +1187,8 @@ fn lm_solve_moffat_with(
     let mut prev_cost: f64;
     let mut converged = false;
     let mut consecutive_rejects: usize = 0;
+    // Whether the solve has accepted a step (`GuardedStep::UncountedBeforeFirstStep`).
+    let mut moved = false;
 
     let mut jtj = vec![0.0_f64; np * np];
     let mut jtr = vec![0.0_f64; np];
@@ -1314,9 +1358,12 @@ fn lm_solve_moffat_with(
         {
             lambda *= nu;
             nu *= 2.0;
-            consecutive_rejects += 1;
-            if consecutive_rejects >= max_rejects {
-                break;
+            // Before the first accepted step a refusal only shortens the next step (`GuardedStep`).
+            if guarded_step == GuardedStep::Counted || moved {
+                consecutive_rejects += 1;
+                if consecutive_rejects >= max_rejects {
+                    break;
+                }
             }
             // `params` did not move, so `cur_*` still describe it.
             continue;
@@ -1351,6 +1398,7 @@ fn lm_solve_moffat_with(
                 lambda *= (1.0_f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3));
                 nu = 2.0;
                 step_accepted = true;
+                moved = true;
                 consecutive_rejects = 0;
             } else {
                 lambda *= nu;
@@ -2216,6 +2264,7 @@ mod tests {
                     CALIBRATION_MAX_REJECTS,
                     ThetaColumn::Legacy,
                     Sampling::Point,
+                    GuardedStep::Counted,
                 );
                 let mut was = init;
                 let r_was = reference::lm_solve_moffat(
@@ -2557,6 +2606,7 @@ mod tests {
                     CALIBRATION_MAX_REJECTS,
                     ThetaColumn::Corrected,
                     Sampling::Point,
+                    GuardedStep::Counted,
                 );
                 let mut was = init;
                 let r_was = reference::lm_solve_moffat(
@@ -2735,6 +2785,7 @@ mod tests {
             CALIBRATION_MAX_REJECTS,
             ThetaColumn::Legacy,
             Sampling::Point,
+            GuardedStep::Counted,
         );
         assert_eq!((lm.iters, lm.converged), (10, false));
     }
@@ -2950,4 +3001,78 @@ mod tests {
             assert!(fit_moffat_2d_fixed_beta(&pixels, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, beta, 100, 1e-5, 5).is_none());
         }
     }
+
+    /// A saturated star as the saturation test hands it to the bounded fit: a round Moffat β 2.5, FWHM 2.2 px, 50 above
+    /// a 0.04 sky (centre (0.3, −0.2), 41 × 41 px about (0, 0), each pixel integrated over 15 × 15 sub-samples),
+    /// clipped at 1.0, its pixels at or above 0.9 left out (51 of them) and the rest conditioned `(v − b0)/a0` with
+    /// `b0` the sky and `a0` the clipped maximum − `b0`. Returns the kept pixels and `a0`.
+    fn censored_star() -> (Vec<PixelSample>, f64) {
+        let (amp, beta, fwhm, sky, clip, level) = (50.0, 2.5, 2.2, 0.04, 1.0, 0.9);
+        let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+        let params = [0.0, amp, 0.3, -0.2, alpha, alpha, 0.0, beta];
+        let offsets = subsample_offsets(15);
+        let mut region = Vec::new();
+        for y in -20..=20 {
+            for x in -20..=20 {
+                let (x, y) = (x as f64, y as f64);
+                region.push(PixelSample { x, y, value: (sky + integrated_value(&params, x, y, &offsets)).min(clip) });
+            }
+        }
+        let a0 = region.iter().map(|p| p.value).fold(f64::NEG_INFINITY, f64::max) - sky;
+        let kept: Vec<PixelSample> = region
+            .iter()
+            .filter(|p| p.value < level)
+            .map(|p| PixelSample { x: p.x, y: p.y, value: (p.value - sky) / a0 })
+            .collect();
+        assert_eq!(region.len() - kept.len(), 51, "the censored top");
+        (kept, a0)
+    }
+
+    /// A3 (Task 9 fix round): the bounded fit of a censored star leaves its start and recovers the star. Started where
+    /// the saturation test starts it — B = 0, A = 1 (the clipped maximum, 50× under the truth), round at the star's own
+    /// width (σ from F 2.5), β 3 — every early step overshoots the 2 px centroid guard. A refused step there is too long,
+    /// not worse, so it raises λ without spending the reject budget; before, five such refusals ended the solve on its
+    /// start and returned it as a fit (β exactly 3, A 1). The integrated fit (k = 4) reads β 2.5 within 1 % and the
+    /// amplitude within 2 %, as on an uncensored star.
+    #[test]
+    fn a_censored_star_leaves_its_start_and_recovers_its_beta() {
+        let (kept, a0) = censored_star();
+        let sigma = 2.5 / 2.354_820_045;
+        let r = fit_moffat_2d_bounded(&kept, 0.0, 1.0, 0.0, 0.0, sigma, sigma, 0.0, 3.0, (1.5, 100.0), 300, 1e-5, 5, 4)
+            .expect("the censored star is fitted");
+        println!("censored k 4: beta {} amplitude {} ({} iters, converged {})", r.beta, r.a * a0, r.iters, r.converged);
+        assert!(r.beta != 3.0_f64.ln().exp() && r.a != 1.0, "the fit never left its start: {r:?}");
+        assert!((r.beta / 2.5 - 1.0).abs() < 0.01, "beta {}", r.beta);
+        assert!((r.a * a0 / 50.0 - 1.0).abs() < 0.02, "amplitude {}", r.a * a0);
+    }
+
+    /// A3: a solve that accepted no step is not a fit. The censored star with an iteration limit its guard-refused
+    /// first steps use up returned its start before (β exactly 3, A 1, the start α); it is refused now. A start that
+    /// already satisfies the convergence test is a fit: a noiseless star rendered at the start itself is returned
+    /// as is, converged.
+    #[test]
+    fn a_solve_that_accepted_no_step_is_refused_unless_its_start_converged() {
+        let (kept, _) = censored_star();
+        let sigma = 2.5 / 2.354_820_045;
+        for k in [1, 4] {
+            let r = fit_moffat_2d_bounded(&kept, 0.0, 1.0, 0.0, 0.0, sigma, sigma, 0.0, 3.0, (1.5, 100.0), 3, 1e-5, 5, k);
+            assert!(r.is_none(), "k {k}: a solve that never moved is returned: {r:?}");
+        }
+        // The start the solver builds (`solve_moffat_2d`), and pixels its own cost pass reads as exactly that model.
+        let alpha = sigma * 2.3548 / (2.0 * (2.0_f64.powf(1.0 / 3.0) - 1.0).sqrt());
+        let start = [0.0, 1.0, 0.0, 0.0, alpha, alpha, 0.0, 3.0_f64.ln()];
+        let mut pixels: Vec<PixelSample> = (-10..=10)
+            .flat_map(|y| (-10..=10).map(move |x| PixelSample { x: x as f64, y: y as f64, value: 0.0 }))
+            .collect();
+        let (mut power, mut resid) = (vec![0.0; pixels.len()], vec![0.0; pixels.len()]);
+        let ln = BetaParam::FreeLn { ln_min: 1.5_f64.ln(), ln_max: 100.0_f64.ln() };
+        residual_cost_moffat_into(&pixels, &start, ln, Sampling::Point, &mut power, &mut resid);
+        for (p, r) in pixels.iter_mut().zip(&resid) {
+            p.value = -r;
+        }
+        let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 0.0, 0.0, sigma, sigma, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5, 1)
+            .expect("a start that is the fit is a fit");
+        assert!(r.iters == 1 && r.converged && r.a == 1.0 && r.alpha_x == alpha && r.beta == start[7].exp(), "{r:?}");
+    }
 }
+
