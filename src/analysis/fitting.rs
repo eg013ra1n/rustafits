@@ -560,7 +560,8 @@ impl Moffat2DBoundedResult {
 /// The solver carries ln β rather than β: as β grows the profile approaches a Gaussian and β trades against α along
 /// a flat ridge, which a step in ln β crosses in a few iterations where a step in β stalls. Each step's ln β is
 /// clamped to `[ln lo, ln hi]`. A fit that ends at a bound is returned with `beta` exactly that bound — the caller
-/// decides what a bound means; only a non-finite parameter or residual, `α < 0.3` or `A ≤ 0` refuses it (`None`), as
+/// decides what a bound means; only a non-finite parameter or residual, `α < 0.3`, `A ≤ 0` or a solve that never left its
+/// start refuses it (`None`), as
 /// does fewer than 12 pixels or bounds that are not `0 < lo ≤ hi < ∞`. `init_beta` is clamped into the bounds and
 /// sets the start α from the Gaussian σ as [`fit_moffat_2d`] does from its fixed 3.0. The θ column carries its
 /// correct sign, as in [`fit_moffat_2d_fixed_beta_conditioned`].
