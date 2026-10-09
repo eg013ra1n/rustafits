@@ -460,7 +460,7 @@ pub fn fit_moffat_2d(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, None, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::FreeLinear, max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
 }
 
 /// Fit 2D elliptical Moffat with fixed beta (7 free parameters).
@@ -482,7 +482,7 @@ pub fn fit_moffat_2d_fixed_beta(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, Some(beta), max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), max_iter, conv_tol, max_rejects, ThetaColumn::Legacy)
 }
 
 /// Fit 2D elliptical Moffat with fixed beta (7 free parameters), the θ column of the Jacobian carrying its correct
@@ -510,7 +510,192 @@ pub fn fit_moffat_2d_fixed_beta_conditioned(
     conv_tol: f64,
     max_rejects: usize,
 ) -> Option<Moffat2DResult> {
-    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, Some(beta), max_iter, conv_tol, max_rejects, ThetaColumn::Corrected)
+    fit_moffat_2d_impl(pixels, init_b, init_a, init_x0, init_y0, init_sigma_x, init_sigma_y, init_theta, BetaParam::Fixed(beta), max_iter, conv_tol, max_rejects, ThetaColumn::Corrected)
+}
+
+/// Result of [`fit_moffat_2d_bounded`]: the parameters of [`Moffat2DResult`] plus the solver's iteration count.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Moffat2DBoundedResult {
+    pub b: f64,
+    pub a: f64,
+    pub x0: f64,
+    pub y0: f64,
+    pub alpha_x: f64,
+    pub alpha_y: f64,
+    pub theta: f64,
+    /// Inside the caller's bounds; exactly a bound when the fit ended there.
+    pub beta: f64,
+    pub converged: bool,
+    /// Normalized fit residual: sqrt(cost / n_pixels) / amplitude.
+    pub fit_residual: f64,
+    /// LM iterations the solve ran.
+    pub iters: usize,
+}
+
+impl Moffat2DBoundedResult {
+    /// FWHM = 2α√(2^(1/β) - 1) along each axis.
+    pub fn fwhm_x(&self) -> f64 {
+        2.0 * self.alpha_x * (2.0_f64.powf(1.0 / self.beta) - 1.0).sqrt()
+    }
+    pub fn fwhm_y(&self) -> f64 {
+        2.0 * self.alpha_y * (2.0_f64.powf(1.0 / self.beta) - 1.0).sqrt()
+    }
+}
+
+/// Fit 2D elliptical Moffat with 8 parameters, β free inside the caller's `beta_bounds` `(lo, hi)`, `0 < lo ≤ hi`.
+///
+/// The solver carries ln β rather than β: as β grows the profile approaches a Gaussian and β trades against α along
+/// a flat ridge, which a step in ln β crosses in a few iterations where a step in β stalls. Each step's ln β is
+/// clamped to `[ln lo, ln hi]`. A fit that ends at a bound is returned with `beta` exactly that bound — the caller
+/// decides what a bound means; only a non-finite parameter or residual, `α < 0.3` or `A ≤ 0` refuses it (`None`), as
+/// does fewer than 12 pixels or bounds that are not `0 < lo ≤ hi < ∞`. `init_beta` is clamped into the bounds and
+/// sets the start α from the Gaussian σ as [`fit_moffat_2d`] does from its fixed 3.0. The θ column carries its
+/// correct sign, as in [`fit_moffat_2d_fixed_beta_conditioned`].
+///
+/// [`fit_moffat_2d`] (β linear, bounds [1, 20], the legacy θ column) is unchanged: this is a separate entry point
+/// on the same solver.
+pub fn fit_moffat_2d_bounded(
+    pixels: &[PixelSample],
+    init_b: f64,
+    init_a: f64,
+    init_x0: f64,
+    init_y0: f64,
+    init_sigma_x: f64,
+    init_sigma_y: f64,
+    init_theta: f64,
+    init_beta: f64,
+    beta_bounds: (f64, f64),
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
+) -> Option<Moffat2DBoundedResult> {
+    let (lo, hi) = beta_bounds;
+    if !(lo > 0.0 && lo <= hi && hi.is_finite() && init_beta.is_finite()) {
+        return None;
+    }
+    let (ln_min, ln_max) = (lo.ln(), hi.ln());
+    let MoffatSolve { params, lm } = solve_moffat_2d(
+        pixels,
+        init_b,
+        init_a,
+        init_x0,
+        init_y0,
+        init_sigma_x,
+        init_sigma_y,
+        init_theta,
+        BetaParam::FreeLn { ln_min, ln_max },
+        init_beta.clamp(lo, hi),
+        max_iter,
+        conv_tol,
+        max_rejects,
+        ThetaColumn::Corrected,
+    )?;
+    if !(params.iter().all(|p| p.is_finite()) && lm.final_cost.is_finite()) {
+        return None;
+    }
+    let alpha_x = params[4].abs();
+    let alpha_y = params[5].abs();
+    if alpha_x < 0.3 || alpha_y < 0.3 || params[1] <= 0.0 {
+        return None;
+    }
+    // At a bound the step clamp left ln β exactly there; report the bound itself, not `exp(ln hi)`'s last bits.
+    let beta = if params[7] >= ln_max {
+        hi
+    } else if params[7] <= ln_min {
+        lo
+    } else {
+        params[7].exp().clamp(lo, hi)
+    };
+    Some(Moffat2DBoundedResult {
+        b: params[0],
+        a: params[1],
+        x0: params[2],
+        y0: params[3],
+        alpha_x,
+        alpha_y,
+        theta: normalize_theta(params[6]),
+        beta,
+        converged: lm.converged,
+        fit_residual: (lm.final_cost / pixels.len() as f64).sqrt() / params[1].max(1e-10),
+        iters: lm.iters,
+    })
+}
+
+/// How the Moffat solver carries β: what `params[7]` holds, how many parameters are free, the β column of the
+/// Jacobian and the step's clamp. The one private difference between [`fit_moffat_2d_bounded`] and the entry points
+/// that shipped before it, beside [`ThetaColumn`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BetaParam {
+    /// β held at this value, carried in `params[7]` (7 free parameters): [`fit_moffat_2d_fixed_beta`] and
+    /// [`fit_moffat_2d_fixed_beta_conditioned`].
+    Fixed(f64),
+    /// β free, `params[7] = β`: the column `∂M/∂β = A·(1+Q)^(−β)·(−ln(1+Q))`, each step's β clamped to [1.5, 20] and
+    /// the result refused outside [1, 20]. [`fit_moffat_2d`]'s arm, operation for operation what it always ran, so its
+    /// output is bit-identical.
+    FreeLinear,
+    /// β free, `params[7] = ln β`: the column `∂M/∂(ln β) = A·(1+Q)^(−β)·(−ln(1+Q))·β` (the chain rule), each step's
+    /// ln β clamped to `[ln_min, ln_max]`. [`fit_moffat_2d_bounded`]'s arm.
+    FreeLn { ln_min: f64, ln_max: f64 },
+}
+
+impl BetaParam {
+    /// The legacy solver's `Option`: `Some(b)` fixed, `None` the linear free arm.
+    #[cfg(test)]
+    fn fixed_or_linear(fixed_beta: Option<f64>) -> Self {
+        fixed_beta.map_or(BetaParam::FreeLinear, BetaParam::Fixed)
+    }
+
+    fn is_free(self) -> bool {
+        !matches!(self, BetaParam::Fixed(_))
+    }
+
+    /// β at the parameter vector's `params[7]`: the value itself, except in ln β.
+    #[inline(always)]
+    fn beta(self, p7: f64) -> f64 {
+        match self {
+            BetaParam::Fixed(_) | BetaParam::FreeLinear => p7,
+            BetaParam::FreeLn { .. } => p7.exp(),
+        }
+    }
+
+    /// The β column of one Jacobian row from `a_power = A·(1+Q)^(−β)`, `base = 1 + Q` and β. `FreeLinear` is the
+    /// expression the solver always evaluated, operand for operand (`A·power` first, then `·(−ln base)`).
+    #[inline(always)]
+    fn column(self, a_power: f64, base: f64, beta: f64) -> f64 {
+        match self {
+            BetaParam::Fixed(_) => 0.0,
+            BetaParam::FreeLinear => a_power * (-base.ln()),
+            BetaParam::FreeLn { .. } => a_power * (-base.ln()) * beta,
+        }
+    }
+
+    /// Keep a step's β (`new_p7`) in range: [1.5, 20] in β for `FreeLinear` (as always), `[ln_min, ln_max]` in ln β for
+    /// `FreeLn`; a fixed β is never stepped.
+    #[inline(always)]
+    fn clamp_step(self, new_p7: &mut f64) {
+        match self {
+            BetaParam::Fixed(_) => {}
+            BetaParam::FreeLinear => {
+                if *new_p7 < 1.5 { *new_p7 = 1.5; }
+                if *new_p7 > 20.0 { *new_p7 = 20.0; }
+            }
+            BetaParam::FreeLn { ln_min, ln_max } => {
+                if *new_p7 < ln_min { *new_p7 = ln_min; }
+                if *new_p7 > ln_max { *new_p7 = ln_max; }
+            }
+        }
+    }
+}
+
+/// θ normalised to [-π/2, π/2].
+fn normalize_theta(t: f64) -> f64 {
+    let mut theta = t % std::f64::consts::PI;
+    if theta > std::f64::consts::FRAC_PI_2 {
+        theta -= std::f64::consts::PI;
+    } else if theta < -std::f64::consts::FRAC_PI_2 {
+        theta += std::f64::consts::PI;
+    }
+    theta
 }
 
 /// Which sign the Moffat solver's θ column carries — the one private difference between
@@ -553,6 +738,62 @@ pub fn evaluate_moffat_2d(params: &[f64], x: f64, y: f64) -> f64 {
     params[0] + params[1] * (1.0 + q).powf(-params[7])
 }
 
+/// One Moffat solve before acceptance: the parameters the LM run ended at (`params[7]` in `beta_param`'s own
+/// parametrisation) and the run's outcome.
+struct MoffatSolve {
+    params: [f64; 8],
+    lm: LmResult,
+}
+
+/// The start vector every Moffat entry point builds — α from the Gaussian σ at `beta_init`,
+/// α = σ × 2.3548 / (2√(2^(1/β₀) − 1)) — then the LM solve. `None` under 12 pixels.
+#[allow(clippy::too_many_arguments)]
+fn solve_moffat_2d(
+    pixels: &[PixelSample],
+    init_b: f64,
+    init_a: f64,
+    init_x0: f64,
+    init_y0: f64,
+    init_sigma_x: f64,
+    init_sigma_y: f64,
+    init_theta: f64,
+    beta_param: BetaParam,
+    beta_init: f64,
+    max_iter: usize,
+    conv_tol: f64,
+    max_rejects: usize,
+    theta_column: ThetaColumn,
+) -> Option<MoffatSolve> {
+    if pixels.len() < 12 {
+        return None;
+    }
+
+    // Convert Gaussian sigma to Moffat alpha
+    let moffat_scale = (2.0_f64.powf(1.0 / beta_init) - 1.0).sqrt();
+    let alpha_x = init_sigma_x * 2.3548 / (2.0 * moffat_scale);
+    let alpha_y = init_sigma_y * 2.3548 / (2.0 * moffat_scale);
+    let p7 = match beta_param {
+        BetaParam::FreeLn { .. } => beta_init.ln(),
+        BetaParam::Fixed(_) | BetaParam::FreeLinear => beta_init,
+    };
+
+    let mut params = [init_b, init_a, init_x0, init_y0, alpha_x, alpha_y, init_theta, p7];
+    let lm = lm_solve_moffat_impl(
+        pixels,
+        &mut params,
+        beta_param,
+        max_iter,
+        conv_tol,
+        max_rejects,
+        theta_column,
+    );
+    Some(MoffatSolve { params, lm })
+}
+
+/// [`fit_moffat_2d`], [`fit_moffat_2d_fixed_beta`] and [`fit_moffat_2d_fixed_beta_conditioned`]: `beta_param` is
+/// `Fixed` or `FreeLinear` (start β 3.0), and the acceptance is the one they always applied — `α < 0.3`, `A ≤ 0`
+/// or β outside [1, 20] refuses the fit.
+#[allow(clippy::too_many_arguments)]
 fn fit_moffat_2d_impl(
     pixels: &[PixelSample],
     init_b: f64,
@@ -562,40 +803,47 @@ fn fit_moffat_2d_impl(
     init_sigma_x: f64,
     init_sigma_y: f64,
     init_theta: f64,
-    fixed_beta: Option<f64>,
+    beta_param: BetaParam,
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
     theta_column: ThetaColumn,
 ) -> Option<Moffat2DResult> {
-    if pixels.len() < 12 {
-        return None;
-    }
-
-    // Convert Gaussian sigma to Moffat alpha
-    let beta_init = fixed_beta.unwrap_or(3.0);
-    let moffat_scale = (2.0_f64.powf(1.0 / beta_init) - 1.0).sqrt();
-    let alpha_x = init_sigma_x * 2.3548 / (2.0 * moffat_scale);
-    let alpha_y = init_sigma_y * 2.3548 / (2.0 * moffat_scale);
-
-    let mut params = [init_b, init_a, init_x0, init_y0, alpha_x, alpha_y, init_theta, beta_init];
-    let LmResult {
-        converged,
-        final_cost,
-        ..
-    } = lm_solve_moffat_impl(
+    debug_assert!(
+        !matches!(beta_param, BetaParam::FreeLn { .. }),
+        "the ln-beta arm is fit_moffat_2d_bounded's"
+    );
+    let beta_init = match beta_param {
+        BetaParam::Fixed(b) => b,
+        _ => 3.0,
+    };
+    let MoffatSolve {
+        params,
+        lm: LmResult {
+            converged,
+            final_cost,
+            ..
+        },
+    } = solve_moffat_2d(
         pixels,
-        &mut params,
-        fixed_beta,
+        init_b,
+        init_a,
+        init_x0,
+        init_y0,
+        init_sigma_x,
+        init_sigma_y,
+        init_theta,
+        beta_param,
+        beta_init,
         max_iter,
         conv_tol,
         max_rejects,
         theta_column,
-    );
+    )?;
 
     let alpha_x = params[4].abs();
     let alpha_y = params[5].abs();
-    let beta = if fixed_beta.is_some() { beta_init } else { params[7] };
+    let beta = if beta_param.is_free() { params[7] } else { beta_init };
 
     // Reject non-physical results
     if alpha_x < 0.3 || alpha_y < 0.3 || params[1] <= 0.0
@@ -607,14 +855,6 @@ fn fit_moffat_2d_impl(
     // Normalized residual: RMS per pixel / amplitude (dimensionless)
     let fit_residual = (final_cost / pixels.len() as f64).sqrt() / params[1].max(1e-10);
 
-    // Normalize theta to [-π/2, π/2]
-    let mut theta = params[6] % std::f64::consts::PI;
-    if theta > std::f64::consts::FRAC_PI_2 {
-        theta -= std::f64::consts::PI;
-    } else if theta < -std::f64::consts::FRAC_PI_2 {
-        theta += std::f64::consts::PI;
-    }
-
     Some(Moffat2DResult {
         b: params[0],
         a: params[1],
@@ -622,7 +862,7 @@ fn fit_moffat_2d_impl(
         y0: params[3],
         alpha_x,
         alpha_y,
-        theta,
+        theta: normalize_theta(params[6]),
         beta,
         converged,
         fit_residual,
@@ -701,12 +941,12 @@ thread_local! {
         std::cell::RefCell::new(MoffatScratch::default());
 }
 
-/// LM solver for 2D Moffat. When `fixed_beta` is `Some(b)`, beta is held constant
-/// and only 7 parameters are optimized. When `None`, all 8 parameters are free.
+/// LM solver for 2D Moffat. `BetaParam::Fixed(b)` holds β at `b` and optimizes the other 7 parameters; the free
+/// arms optimize all 8, with β (`FreeLinear`) or ln β (`FreeLn`) in `params[7]`.
 fn lm_solve_moffat_impl(
     pixels: &[PixelSample],
     params: &mut [f64],
-    fixed_beta: Option<f64>,
+    beta_param: BetaParam,
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
@@ -718,7 +958,7 @@ fn lm_solve_moffat_impl(
         Ok(mut scratch) => lm_solve_moffat_with(
             pixels,
             params,
-            fixed_beta,
+            beta_param,
             max_iter,
             conv_tol,
             max_rejects,
@@ -728,7 +968,7 @@ fn lm_solve_moffat_impl(
         Err(_) => lm_solve_moffat_with(
             pixels,
             params,
-            fixed_beta,
+            beta_param,
             max_iter,
             conv_tol,
             max_rejects,
@@ -738,10 +978,11 @@ fn lm_solve_moffat_impl(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lm_solve_moffat_with(
     pixels: &[PixelSample],
     params: &mut [f64],
-    fixed_beta: Option<f64>,
+    beta_param: BetaParam,
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
@@ -749,18 +990,21 @@ fn lm_solve_moffat_with(
     scratch: &mut MoffatScratch,
 ) -> LmResult {
     // The reuse seam's contract: `residual_cost_moffat_into` resolves its
-    // exponent from `params[7]`, while the Jacobian pass below takes
-    // `fixed_beta.unwrap_or(params[7])` — a cached `power` is the value the
-    // Jacobian wants only while those two agree. They do by construction
-    // (`fit_moffat_2d_impl` seeds `params[7] = beta_init = fixed_beta`, and
+    // exponent from `beta_param.beta(params[7])`, while the Jacobian pass
+    // below takes the fixed β itself for `Fixed(b)` — a cached `power` is the
+    // value the Jacobian wants only while those two agree. They do by
+    // construction (`solve_moffat_2d` seeds `params[7] = beta_init = b`, and
     // `np = 7` keeps `delta` from ever reaching index 7), but that is a
     // cross-function rule, so state it rather than leave it unwritten.
     debug_assert!(
-        fixed_beta.is_none_or(|b| params[7] == b),
-        "a fixed-beta solve must carry its beta in params[7]: {} != {fixed_beta:?}",
+        match beta_param {
+            BetaParam::Fixed(b) => params[7] == b,
+            BetaParam::FreeLinear | BetaParam::FreeLn { .. } => true,
+        },
+        "a fixed-beta solve must carry its beta in params[7]: {} != {beta_param:?}",
         params[7]
     );
-    let np = if fixed_beta.is_some() { 7 } else { 8 };
+    let np = if beta_param.is_free() { 8 } else { 7 };
     let n = pixels.len();
     scratch.reserve_exact_len(n);
     let MoffatScratch {
@@ -775,7 +1019,7 @@ fn lm_solve_moffat_with(
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
     // Seeds the cache: `cur_*` describe `params` from here on.
-    let mut best_cost = residual_cost_moffat_into(pixels, params, cur_power, cur_resid);
+    let mut best_cost = residual_cost_moffat_into(pixels, params, beta_param, cur_power, cur_resid);
     let mut prev_cost: f64;
     let mut converged = false;
     let mut consecutive_rejects: usize = 0;
@@ -799,7 +1043,10 @@ fn lm_solve_moffat_with(
         let (cos_t, sin_t) = (theta.cos(), theta.sin());
         let ax = params[4];
         let ay = params[5];
-        let beta = fixed_beta.unwrap_or(params[7]);
+        let beta = match beta_param {
+            BetaParam::Fixed(b) => b,
+            BetaParam::FreeLinear | BetaParam::FreeLn { .. } => beta_param.beta(params[7]),
+        };
         let inv_ax2 = 1.0 / (ax * ax);
         let inv_ay2 = 1.0 / (ay * ay);
 
@@ -838,10 +1085,10 @@ fn lm_solve_moffat_with(
             let dq_dtheta = theta_column.dq_dtheta(u, v, inv_ax2, inv_ay2);
             j[6] = a_dpq * dq_dtheta;
 
-            // Only include dM/dbeta when beta is free — the one `ln` in the
+            // Only include the β column when β is free — the one `ln` in the
             // solver, and the reason the normal system is 8×8 instead of 7×7.
-            if fixed_beta.is_none() {
-                j[7] = params[1] * power * (-base.ln());
+            if beta_param.is_free() {
+                j[7] = beta_param.column(params[1] * power, base, beta);
             }
 
             for p in 0..np {
@@ -907,11 +1154,8 @@ fn lm_solve_moffat_with(
         // Keep alphas positive
         if new_params[4] <= 0.0 { new_params[4] = params[4] * 0.5; }
         if new_params[5] <= 0.0 { new_params[5] = params[5] * 0.5; }
-        // Keep beta in reasonable range (only when free)
-        if fixed_beta.is_none() {
-            if new_params[7] < 1.5 { new_params[7] = 1.5; }
-            if new_params[7] > 20.0 { new_params[7] = 20.0; }
-        }
+        // Keep beta in range (only when free)
+        beta_param.clamp_step(&mut new_params[7]);
 
         // Reject step if alpha too small or centroid drifts too far
         if new_params[4] < 0.5 || new_params[5] < 0.5
@@ -931,7 +1175,8 @@ fn lm_solve_moffat_with(
             continue;
         }
 
-        let new_cost = residual_cost_moffat_into(pixels, &new_params, cand_power, cand_resid);
+        let new_cost =
+            residual_cost_moffat_into(pixels, &new_params, beta_param, cand_power, cand_resid);
 
         let predicted: f64 = delta
             .iter()
@@ -995,10 +1240,11 @@ fn lm_solve_moffat_with(
 
 /// Sum of squared residuals at `params`, recording each sample's
 /// `(1+Q)^(-β)` and residual so the next Jacobian pass can read them instead
-/// of evaluating the power again.
+/// of evaluating the power again. β is `beta_param.beta(params[7])`.
 fn residual_cost_moffat_into(
     pixels: &[PixelSample],
     params: &[f64],
+    beta_param: BetaParam,
     power_out: &mut [f64],
     resid_out: &mut [f64],
 ) -> f64 {
@@ -1006,7 +1252,7 @@ fn residual_cost_moffat_into(
     let (cos_t, sin_t) = (theta.cos(), theta.sin());
     let inv_ax2 = 1.0 / (params[4] * params[4]);
     let inv_ay2 = 1.0 / (params[5] * params[5]);
-    let exponent = MoffatExponent::new(params[7]);
+    let exponent = MoffatExponent::new(beta_param.beta(params[7]));
 
     let mut cost = 0.0_f64;
     for (i, px) in pixels.iter().enumerate() {
@@ -1742,6 +1988,19 @@ mod tests {
         p[1] * std::f64::consts::PI * p[4].abs() * p[5].abs() / (p[7] - 1.0)
     }
 
+    /// The C3 grid's stamp the golden free-β pin reads: [`fixture_stars`]' `r14/a3/amp900` stamp (noisy, elliptical,
+    /// on a 250 background), its pixel coordinates shifted by +15 so the stamp centre sits at (15, 15).
+    fn c3_fixture_stamp() -> Vec<PixelSample> {
+        let f = fixture_stars()
+            .into_iter()
+            .find(|f| f.label.starts_with("r14/a3/amp900/"))
+            .expect("the C3 grid holds an r14/a3/amp900 stamp");
+        f.pixels
+            .iter()
+            .map(|p| PixelSample { x: p.x + 15.0, y: p.y + 15.0, value: p.value })
+            .collect()
+    }
+
     #[test]
     fn c3_moffat_arithmetic_delta_against_the_pre_c3_solver() {
         let fixtures = fixture_stars();
@@ -1765,7 +2024,7 @@ mod tests {
                 let r_now = lm_solve_moffat_impl(
                     &f.pixels,
                     &mut now,
-                    fixed_beta,
+                    BetaParam::fixed_or_linear(fixed_beta),
                     CALIBRATION_MAX_ITER,
                     CALIBRATION_CONV_TOL,
                     CALIBRATION_MAX_REJECTS,
@@ -2105,7 +2364,7 @@ mod tests {
                 let r_now = lm_solve_moffat_impl(
                     &f.pixels,
                     &mut now,
-                    fixed_beta,
+                    BetaParam::fixed_or_linear(fixed_beta),
                     CALIBRATION_MAX_ITER,
                     CALIBRATION_CONV_TOL,
                     CALIBRATION_MAX_REJECTS,
@@ -2134,5 +2393,160 @@ mod tests {
             }
         }
         assert_eq!(cases, 180, "fixture x mode grid");
+    }
+    // ── The bounded free-β fit (ln β, caller bounds; Athenaeum's per-frame β) ──
+
+    /// A noiseless round Gaussian (`B = 0`, `A = 1`) of width `sigma` on an `n × n` stamp centred on `(cx, cy)`,
+    /// point-sampled like [`moffat_stamp`].
+    fn gauss_stamp(n: usize, cx: f64, cy: f64, sigma: f64) -> Vec<PixelSample> {
+        let s2 = 2.0 * sigma * sigma;
+        let mut px = Vec::with_capacity(n * n);
+        for y in 0..n {
+            for x in 0..n {
+                let (x, y) = (x as f64, y as f64);
+                let d2 = (x - cx).powi(2) + (y - cy).powi(2);
+                px.push(PixelSample { x, y, value: (-d2 / s2).exp() });
+            }
+        }
+        px
+    }
+
+    #[test]
+    fn bounded_free_beta_reaches_a_gaussian_star_at_the_cap() {
+        let pixels = gauss_stamp(41, 20.0, 20.0, 2.0);
+        let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (1.5, 100.0), 100, 1e-5, 5).unwrap();
+        assert!(r.beta >= 95.0, "beta {}", r.beta);
+        let fwhm = 2.0 * r.alpha_x * (2f64.powf(1.0 / r.beta) - 1.0).sqrt();
+        assert!((fwhm / (2.0 * 2.354_820_045) - 1.0).abs() < 0.004, "fwhm {fwhm}");
+        // the old entry point on the same stamp: None or β at its own 20 cap — the two arms stay distinct
+        let old = fit_moffat_2d(&pixels, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 100, 1e-5, 5);
+        assert!(old.as_ref().map_or(true, |o| o.beta >= 19.9), "{:?}", old.as_ref().map(|o| o.beta));
+    }
+
+    #[test]
+    fn bounded_fit_recovers_beta_4_and_2_5_inside_the_bounds() {
+        for (beta, tol) in [(4.0, 0.05), (2.5, 0.03)] {
+            let pixels = moffat_stamp(41, 20.0, 20.0, 3.0, 3.0, 0.0, beta);
+            let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 20.0, 20.0, 1.5, 1.5, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5).unwrap();
+            assert!((r.beta - beta).abs() < tol, "beta {} vs {beta}", r.beta);
+            assert!(r.iters > 0);
+        }
+    }
+
+    #[test]
+    fn ln_beta_jacobian_matches_central_differences() {
+        for beta in [2.0f64, 10.0, 60.0] {
+            let (base, a) = (1.7f64, 0.8f64);             // 1 + Q at one pixel, the amplitude
+            let analytic = a * base.powf(-beta) * (-base.ln()) * beta;            // ∂M/∂(ln β)
+            let h = 1e-6_f64;
+            let numeric = (a * base.powf(-beta * (h).exp()) - a * base.powf(-beta * (-h).exp())) / (2.0 * h);
+            assert!(((analytic - numeric) / numeric).abs() < 1e-6, "beta {beta}: {analytic} vs {numeric}");
+        }
+    }
+
+    /// The β column the solver builds (`BetaParam::column` exactly as `lm_solve_moffat_with` calls it) against a
+    /// central difference of the module's own model in its `params[7]`, pixel by pixel on an elliptical stamp: in ln β
+    /// for `FreeLn`, in β for `FreeLinear`.
+    #[test]
+    fn the_solvers_beta_columns_are_the_central_differences_of_the_model() {
+        let h = 1e-6;
+        let ln = BetaParam::FreeLn { ln_min: 1.5f64.ln(), ln_max: 100f64.ln() };
+        let mut checked = 0_usize;
+        for &beta in &[1.8_f64, 4.0, 37.0] {
+            let params = [0.02, 0.9, 4.3, 3.8, 2.6, 3.4, 0.5, beta];
+            let (cos_t, sin_t) = (params[6].cos(), params[6].sin());
+            for y in 0..9 {
+                for x in 0..9 {
+                    let (x, y) = (x as f64, y as f64);
+                    let (dx, dy) = (x - params[2], y - params[3]);
+                    let u = dx * cos_t + dy * sin_t;
+                    let v = -dx * sin_t + dy * cos_t;
+                    let base = 1.0 + (u / params[4]).powi(2) + (v / params[5]).powi(2);
+                    let a_power = params[1] * base.powf(-beta);
+                    let (mut up, mut down) = (params, params);
+                    up[7] = (beta.ln() + h).exp();
+                    down[7] = (beta.ln() - h).exp();
+                    let fd_ln = (evaluate_moffat_2d(&up, x, y) - evaluate_moffat_2d(&down, x, y)) / (2.0 * h);
+                    let col = ln.column(a_power, base, beta);
+                    assert!((col - fd_ln).abs() <= 1e-7 * fd_ln.abs().max(1e-3), "ln column {col:e} vs {fd_ln:e}");
+                    let (mut up, mut down) = (params, params);
+                    up[7] += h;
+                    down[7] -= h;
+                    let fd = (evaluate_moffat_2d(&up, x, y) - evaluate_moffat_2d(&down, x, y)) / (2.0 * h);
+                    let col = BetaParam::FreeLinear.column(a_power, base, beta);
+                    assert!((col - fd).abs() <= 1e-7 * fd.abs().max(1e-3), "linear column {col:e} vs {fd:e}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 243);
+    }
+
+    /// A β at a bound is returned, exactly the bound: a star steeper than the lower bound allows (true β 1.2) ends at
+    /// 1.5, a Gaussian under a cap of 30 at 30; the bounds are the caller's.
+    #[test]
+    fn a_fit_at_a_bound_returns_the_bound_itself() {
+        let steep = moffat_stamp(41, 20.0, 20.0, 2.0, 2.0, 0.0, 1.2);
+        let r = fit_moffat_2d_bounded(&steep, 0.0, 1.0, 20.0, 20.0, 1.0, 1.0, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5).unwrap();
+        assert_eq!(r.beta, 1.5);
+        let gauss = gauss_stamp(41, 20.0, 20.0, 2.0);
+        let r = fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (1.5, 30.0), 100, 1e-5, 5).unwrap();
+        assert_eq!(r.beta, 30.0);
+        assert!(fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (0.0, 30.0), 100, 1e-5, 5).is_none());
+        assert!(fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (40.0, 30.0), 100, 1e-5, 5).is_none());
+    }
+
+    /// The bounded fit carries the corrected θ column: the elliptical stamp the legacy free fit stalls on
+    /// (`the_legacy_entry_points_are_output_identical_to_1_3_0`: θ 48.4°, β 1.87) is recovered at θ 30°, β 4.
+    #[test]
+    fn the_bounded_fit_recovers_the_elliptical_stamp_the_legacy_free_fit_stalls_on() {
+        let pixels = moffat_stamp(31, 15.0, 15.0, 2.5, 4.0, 30f64.to_radians(), 4.0);
+        let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 15.0, 15.0, 2.5 * 0.6, 4.0 * 0.6, 35f64.to_radians(), 3.0, (1.5, 100.0), 100, 1e-5, 5).unwrap();
+        assert!((r.theta.to_degrees() - 30.0).abs() < 1.0, "theta {}", r.theta.to_degrees());
+        assert!((r.beta - 4.0).abs() < 0.05, "beta {}", r.beta);
+    }
+
+    /// `fit_moffat_2d`'s free-β output on the C3 stamp, recorded at 197fd93 (= 1.3.0 for this entry point,
+    /// `the_legacy_entry_points_are_output_identical_to_1_3_0`) before `BetaParam` replaced the solver's `Option<f64>`.
+    const C3_GOLDEN_FREE_BETA: (f64, f64, f64, f64, f64) =
+        (2.9776194062739187, 2.9823068067601484, 0.5346392752190088, 2.156163990752592, 0.013907919637681579);
+
+    /// A pin, not RED (ruling F28): `fit_moffat_2d` through `BetaParam::FreeLinear` returns the C3 stamp's exact
+    /// parameters and iteration count recorded before this task (the golden values are read from
+    /// `c3_moffat_arithmetic_delta_against_the_pre_c3_solver`'s fixture at 8321412 and pasted here).
+    #[test]
+    fn fit_moffat_2d_is_byte_identical_to_before() {
+        let pixels = c3_fixture_stamp();
+        let r = fit_moffat_2d(&pixels, 100.0, 5000.0, 15.0, 15.0, 2.0, 2.0, 0.0, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS).unwrap();
+        assert_eq!((r.alpha_x, r.alpha_y, r.theta, r.beta, r.fit_residual), C3_GOLDEN_FREE_BETA);
+        // every field, bit for bit, and the solve's control flow (10 iterations, not converged), recorded alongside
+        assert_eq!(
+            result_bits(&r),
+            [
+                0x406f49199cadc6bf,
+                0x408bc0276d58fd3a,
+                0x402df790873d9301,
+                0x402e368c97d9fe56,
+                0x4007d22a1f8f0d25,
+                0x4007dbc3abcd625d,
+                0x3fe11bc3d3472110,
+                0x40013fd2e808c307,
+                0x3f8c7bc15ffe70c8,
+            ]
+        );
+        assert!(!r.converged);
+        let scale = (2.0_f64.powf(1.0 / 3.0) - 1.0).sqrt();
+        let alpha0 = 2.0 * 2.3548 / (2.0 * scale);
+        let mut p = [100.0, 5000.0, 15.0, 15.0, alpha0, alpha0, 0.0, 3.0];
+        let lm = lm_solve_moffat_impl(
+            &pixels,
+            &mut p,
+            BetaParam::FreeLinear,
+            CALIBRATION_MAX_ITER,
+            CALIBRATION_CONV_TOL,
+            CALIBRATION_MAX_REJECTS,
+            ThetaColumn::Legacy,
+        );
+        assert_eq!((lm.iters, lm.converged), (10, false));
     }
 }
