@@ -556,8 +556,15 @@ impl Moffat2DBoundedResult {
 /// sets the start α from the Gaussian σ as [`fit_moffat_2d`] does from its fixed 3.0. The θ column carries its
 /// correct sign, as in [`fit_moffat_2d_fixed_beta_conditioned`].
 ///
+/// `subsample` (k) sets how the model meets a pixel. k = 1: the model at the pixel's centre (point-sampled). k ≥ 2:
+/// the model and its Jacobian at each pixel are the mean over k × k midpoint sub-samples at offsets
+/// `(i + 0.5)/k − 0.5` px in x and in y — the pixel-integrated Moffat. A point model fitted to an undersampled star
+/// (a few pixels across its FWHM) whose pixels integrate the light reads β high, because the integrated core is
+/// flatter; the integrated model does not. k = 0 refuses the fit (`None`).
+///
 /// [`fit_moffat_2d`] (β linear, bounds [1, 20], the legacy θ column) is unchanged: this is a separate entry point
 /// on the same solver.
+#[allow(clippy::too_many_arguments)]
 pub fn fit_moffat_2d_bounded(
     pixels: &[PixelSample],
     init_b: f64,
@@ -572,11 +579,18 @@ pub fn fit_moffat_2d_bounded(
     max_iter: usize,
     conv_tol: f64,
     max_rejects: usize,
+    subsample: usize,
 ) -> Option<Moffat2DBoundedResult> {
     let (lo, hi) = beta_bounds;
-    if !(lo > 0.0 && lo <= hi && hi.is_finite() && init_beta.is_finite()) {
+    if !(lo > 0.0 && lo <= hi && hi.is_finite() && init_beta.is_finite()) || subsample == 0 {
         return None;
     }
+    let offsets = subsample_offsets(subsample);
+    let sampling = if subsample == 1 {
+        Sampling::Point
+    } else {
+        Sampling::Integrated(&offsets)
+    };
     let (ln_min, ln_max) = (lo.ln(), hi.ln());
     let MoffatSolve { params, lm } = solve_moffat_2d(
         pixels,
@@ -593,6 +607,7 @@ pub fn fit_moffat_2d_bounded(
         conv_tol,
         max_rejects,
         ThetaColumn::Corrected,
+        sampling,
     )?;
     if !(params.iter().all(|p| p.is_finite()) && lm.final_cost.is_finite()) {
         return None;
@@ -691,6 +706,33 @@ impl BetaParam {
     }
 }
 
+/// How the Moffat solver's model meets a pixel: the one private difference [`fit_moffat_2d_bounded`]'s `subsample`
+/// makes. Every other entry point is `Point`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sampling<'a> {
+    /// The model at the pixel's centre: the solver's arithmetic as it always ran, operand for operand.
+    Point,
+    /// The pixel-integrated model: the mean of the model (and of each Jacobian column) over the `k × k` midpoint
+    /// sub-samples at these `k` offsets (px, the same in x and in y; [`subsample_offsets`]).
+    Integrated(&'a [f64]),
+}
+
+impl Sampling<'_> {
+    /// Model evaluations per pixel: 1, or `k²`.
+    fn per_pixel(self) -> usize {
+        match self {
+            Sampling::Point => 1,
+            Sampling::Integrated(offsets) => offsets.len() * offsets.len(),
+        }
+    }
+}
+
+/// The `k` midpoint sub-sample offsets of a pixel, `(i + 0.5)/k − 0.5` px for `i` in `0..k`: symmetric about the
+/// pixel's centre, `[0.0]` at `k = 1`.
+fn subsample_offsets(k: usize) -> Vec<f64> {
+    (0..k).map(|i| (i as f64 + 0.5) / k as f64 - 0.5).collect()
+}
+
 /// θ normalised to [-π/2, π/2].
 fn normalize_theta(t: f64) -> f64 {
     let mut theta = t % std::f64::consts::PI;
@@ -767,6 +809,7 @@ fn solve_moffat_2d(
     conv_tol: f64,
     max_rejects: usize,
     theta_column: ThetaColumn,
+    sampling: Sampling<'_>,
 ) -> Option<MoffatSolve> {
     if pixels.len() < 12 {
         return None;
@@ -790,6 +833,7 @@ fn solve_moffat_2d(
         conv_tol,
         max_rejects,
         theta_column,
+        sampling,
     );
     Some(MoffatSolve { params, lm })
 }
@@ -849,6 +893,7 @@ fn fit_moffat_2d_impl(
         conv_tol,
         max_rejects,
         theta_column,
+        Sampling::Point,
     )?;
 
     let alpha_x = params[4].abs();
@@ -881,12 +926,14 @@ fn fit_moffat_2d_impl(
 
 /// `(1 + Q)^(-β)`, with the integral-β case on `powi`.
 ///
-/// The stacking pipeline fits at a fixed β that is always one of
-/// `AUTO_BETAS`-style candidates, three of which (4, 6, 10) are integers, and
 /// `powi` is a short chain of multiplies and one reciprocal where `powf` is a
-/// full `log`/`exp` pair. Resolved once per Jacobian/cost pass, never per
-/// sample. The two arms differ in the last bits; the C3 pins record by how
-/// much on real star stamps.
+/// full `log`/`exp` pair. A caller's fixed β that is an integer in [1, 20]
+/// (Moffat-4, and the stacking pipeline's former discrete β candidates 4, 6
+/// and 10) takes the `powi` arm; a free β, and a fixed β that is not an
+/// integer — every per-frame β Athenaeum fits at since its β became a
+/// continuous number — run on `powf`. Resolved once per Jacobian/cost pass,
+/// never per sample. The two arms differ in the last bits; the C3 pins record
+/// by how much on real star stamps.
 #[derive(Clone, Copy)]
 enum MoffatExponent {
     Integral(i32),
@@ -930,14 +977,17 @@ struct MoffatScratch {
 }
 
 impl MoffatScratch {
-    /// Grow every buffer to `n` without clearing: every element is written
-    /// before it is read, so retained capacity is invisible to the numbers.
-    fn reserve_exact_len(&mut self, n: usize) {
-        for v in [
-            &mut self.cur_power,
-            &mut self.cur_resid,
-            &mut self.cand_power,
-            &mut self.cand_resid,
+    /// Grow the power buffers to `n_power` (one per model evaluation: per
+    /// pixel, or per sub-sample of an integrated model) and the residual
+    /// buffers to `n_resid` (one per pixel) without clearing: every element is
+    /// written before it is read, so retained capacity is invisible to the
+    /// numbers.
+    fn reserve_exact_len(&mut self, n_power: usize, n_resid: usize) {
+        for (v, n) in [
+            (&mut self.cur_power, n_power),
+            (&mut self.cur_resid, n_resid),
+            (&mut self.cand_power, n_power),
+            (&mut self.cand_resid, n_resid),
         ] {
             if v.len() < n {
                 v.resize(n, 0.0);
@@ -951,8 +1001,62 @@ thread_local! {
         std::cell::RefCell::new(MoffatScratch::default());
 }
 
+/// One LM iteration's parameter-derived constants, for the pixel-integrated Jacobian row
+/// ([`MoffatRow::integrated`]).
+struct MoffatRow {
+    x0: f64,
+    y0: f64,
+    a: f64,
+    ax: f64,
+    ay: f64,
+    cos_t: f64,
+    sin_t: f64,
+    inv_ax2: f64,
+    inv_ay2: f64,
+    beta: f64,
+    beta_param: BetaParam,
+    theta_column: ThetaColumn,
+}
+
+impl MoffatRow {
+    /// The Jacobian row of the pixel-integrated model at pixel `px`: each column the mean over the `k × k` sub-samples
+    /// (`offsets`, y outer and x inner) of the point model's column at the sub-sample, from the sub-samples' cached
+    /// `powers` (`(1+Q)^(-β)`, the cost evaluation's, in the same order). `j[0]` = 1 (∂M/∂B); `j` holds as many
+    /// columns as the solve has free parameters (7 at a fixed β).
+    fn integrated(&self, px: &PixelSample, offsets: &[f64], powers: &[f64], j: &mut [f64]) {
+        let mut acc = [0.0_f64; 8];
+        let mut s = 0;
+        for &oy in offsets {
+            for &ox in offsets {
+                let dx = px.x + ox - self.x0;
+                let dy = px.y + oy - self.y0;
+                let u = dx * self.cos_t + dy * self.sin_t;
+                let v = -dx * self.sin_t + dy * self.cos_t;
+                let q = u * u * self.inv_ax2 + v * v * self.inv_ay2;
+                let base = 1.0 + q;
+                let power = powers[s];
+                s += 1;
+                let a_dpq = self.a * (-self.beta * (power / base));
+                acc[1] += power;
+                acc[2] += a_dpq * (-2.0 * (self.cos_t * u * self.inv_ax2 - self.sin_t * v * self.inv_ay2));
+                acc[3] += a_dpq * (-2.0 * (self.sin_t * u * self.inv_ax2 + self.cos_t * v * self.inv_ay2));
+                acc[4] += a_dpq * (-2.0 * u * u / (self.ax * self.ax * self.ax));
+                acc[5] += a_dpq * (-2.0 * v * v / (self.ay * self.ay * self.ay));
+                acc[6] += a_dpq * self.theta_column.dq_dtheta(u, v, self.inv_ax2, self.inv_ay2);
+                acc[7] += self.beta_param.column(self.a * power, base, self.beta);
+            }
+        }
+        let inv_kk = 1.0 / powers.len() as f64;
+        j[0] = 1.0;
+        for (p, jp) in j.iter_mut().enumerate().skip(1) {
+            *jp = acc[p] * inv_kk;
+        }
+    }
+}
+
 /// LM solver for 2D Moffat. `BetaParam::Fixed(b)` holds β at `b` and optimizes the other 7 parameters; the free
 /// arms optimize all 8, with β (`FreeLinear`) or ln β (`FreeLn`) in `params[7]`.
+#[allow(clippy::too_many_arguments)]
 fn lm_solve_moffat_impl(
     pixels: &[PixelSample],
     params: &mut [f64],
@@ -961,6 +1065,7 @@ fn lm_solve_moffat_impl(
     conv_tol: f64,
     max_rejects: usize,
     theta_column: ThetaColumn,
+    sampling: Sampling<'_>,
 ) -> LmResult {
     // The solver never re-enters itself, so the borrow always succeeds; the
     // fallback keeps a future caller from panicking rather than degrading.
@@ -973,6 +1078,7 @@ fn lm_solve_moffat_impl(
             conv_tol,
             max_rejects,
             theta_column,
+            sampling,
             &mut scratch,
         ),
         Err(_) => lm_solve_moffat_with(
@@ -983,6 +1089,7 @@ fn lm_solve_moffat_impl(
             conv_tol,
             max_rejects,
             theta_column,
+            sampling,
             &mut MoffatScratch::default(),
         ),
     })
@@ -997,6 +1104,7 @@ fn lm_solve_moffat_with(
     conv_tol: f64,
     max_rejects: usize,
     theta_column: ThetaColumn,
+    sampling: Sampling<'_>,
     scratch: &mut MoffatScratch,
 ) -> LmResult {
     // The reuse seam's contract: `residual_cost_moffat_into` resolves its
@@ -1016,20 +1124,24 @@ fn lm_solve_moffat_with(
     );
     let np = if beta_param.is_free() { 8 } else { 7 };
     let n = pixels.len();
-    scratch.reserve_exact_len(n);
+    // One cached power per model evaluation: per pixel, or per sub-sample.
+    let kk = sampling.per_pixel();
+    let n_power = n * kk;
+    scratch.reserve_exact_len(n_power, n);
     let MoffatScratch {
         cur_power,
         cur_resid,
         cand_power,
         cand_resid,
     } = scratch;
-    let (mut cur_power, mut cur_resid) = (&mut cur_power[..n], &mut cur_resid[..n]);
-    let (mut cand_power, mut cand_resid) = (&mut cand_power[..n], &mut cand_resid[..n]);
+    let (mut cur_power, mut cur_resid) = (&mut cur_power[..n_power], &mut cur_resid[..n]);
+    let (mut cand_power, mut cand_resid) = (&mut cand_power[..n_power], &mut cand_resid[..n]);
 
     let mut lambda = 1e-3_f64;
     let mut nu = 2.0_f64;
     // Seeds the cache: `cur_*` describe `params` from here on.
-    let mut best_cost = residual_cost_moffat_into(pixels, params, beta_param, cur_power, cur_resid);
+    let mut best_cost =
+        residual_cost_moffat_into(pixels, params, beta_param, sampling, cur_power, cur_resid);
     let mut prev_cost: f64;
     let mut converged = false;
     let mut consecutive_rejects: usize = 0;
@@ -1059,8 +1171,33 @@ fn lm_solve_moffat_with(
         };
         let inv_ax2 = 1.0 / (ax * ax);
         let inv_ay2 = 1.0 / (ay * ay);
+        let row = MoffatRow {
+            x0: params[2],
+            y0: params[3],
+            a: params[1],
+            ax,
+            ay,
+            cos_t,
+            sin_t,
+            inv_ax2,
+            inv_ay2,
+            beta,
+            beta_param,
+            theta_column,
+        };
 
         for (i, px) in pixels.iter().enumerate() {
+            if let Sampling::Integrated(offsets) = sampling {
+                let r = cur_resid[i];
+                row.integrated(px, offsets, &cur_power[i * kk..(i + 1) * kk], &mut j);
+                for p in 0..np {
+                    jtr[p] += j[p] * r;
+                    for q in p..np {
+                        jtj[p * np + q] += j[p] * j[q];
+                    }
+                }
+                continue;
+            }
             let dx = px.x - params[2];
             let dy = px.y - params[3];
             let u = dx * cos_t + dy * sin_t;
@@ -1185,8 +1322,14 @@ fn lm_solve_moffat_with(
             continue;
         }
 
-        let new_cost =
-            residual_cost_moffat_into(pixels, &new_params, beta_param, cand_power, cand_resid);
+        let new_cost = residual_cost_moffat_into(
+            pixels,
+            &new_params,
+            beta_param,
+            sampling,
+            cand_power,
+            cand_resid,
+        );
 
         let predicted: f64 = delta
             .iter()
@@ -1251,10 +1394,14 @@ fn lm_solve_moffat_with(
 /// Sum of squared residuals at `params`, recording each sample's
 /// `(1+Q)^(-β)` and residual so the next Jacobian pass can read them instead
 /// of evaluating the power again. β is `beta_param.beta(params[7])`.
+/// `Sampling::Integrated` records the power of every sub-sample (`k²` per
+/// pixel, `power_out[i·k² + s]`, y outer and x inner) and the residual against
+/// their mean.
 fn residual_cost_moffat_into(
     pixels: &[PixelSample],
     params: &[f64],
     beta_param: BetaParam,
+    sampling: Sampling<'_>,
     power_out: &mut [f64],
     resid_out: &mut [f64],
 ) -> f64 {
@@ -1263,6 +1410,35 @@ fn residual_cost_moffat_into(
     let inv_ax2 = 1.0 / (params[4] * params[4]);
     let inv_ay2 = 1.0 / (params[5] * params[5]);
     let exponent = MoffatExponent::new(beta_param.beta(params[7]));
+
+    if let Sampling::Integrated(offsets) = sampling {
+        let kk = sampling.per_pixel();
+        let inv_kk = 1.0 / kk as f64;
+        let mut cost = 0.0_f64;
+        for (i, px) in pixels.iter().enumerate() {
+            let powers = &mut power_out[i * kk..(i + 1) * kk];
+            let mut sum = 0.0_f64;
+            let mut s = 0;
+            for &oy in offsets {
+                for &ox in offsets {
+                    let dx = px.x + ox - params[2];
+                    let dy = px.y + oy - params[3];
+                    let u = dx * cos_t + dy * sin_t;
+                    let v = -dx * sin_t + dy * cos_t;
+                    let q = u * u * inv_ax2 + v * v * inv_ay2;
+                    let power = exponent.eval(1.0 + q);
+                    powers[s] = power;
+                    sum += power;
+                    s += 1;
+                }
+            }
+            let model = params[0] + params[1] * (sum * inv_kk);
+            let r = px.value - model;
+            resid_out[i] = r;
+            cost += r * r;
+        }
+        return cost;
+    }
 
     let mut cost = 0.0_f64;
     for (i, px) in pixels.iter().enumerate() {
@@ -2039,6 +2215,7 @@ mod tests {
                     CALIBRATION_CONV_TOL,
                     CALIBRATION_MAX_REJECTS,
                     ThetaColumn::Legacy,
+                    Sampling::Point,
                 );
                 let mut was = init;
                 let r_was = reference::lm_solve_moffat(
@@ -2379,6 +2556,7 @@ mod tests {
                     CALIBRATION_CONV_TOL,
                     CALIBRATION_MAX_REJECTS,
                     ThetaColumn::Corrected,
+                    Sampling::Point,
                 );
                 let mut was = init;
                 let r_was = reference::lm_solve_moffat(
@@ -2424,7 +2602,7 @@ mod tests {
     #[test]
     fn bounded_free_beta_reaches_a_gaussian_star_at_the_cap() {
         let pixels = gauss_stamp(41, 20.0, 20.0, 2.0);
-        let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (1.5, 100.0), 100, 1e-5, 5).unwrap();
+        let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (1.5, 100.0), 100, 1e-5, 5, 1).unwrap();
         assert!(r.beta >= 95.0, "beta {}", r.beta);
         let fwhm = 2.0 * r.alpha_x * (2f64.powf(1.0 / r.beta) - 1.0).sqrt();
         assert!((fwhm / (2.0 * 2.354_820_045) - 1.0).abs() < 0.004, "fwhm {fwhm}");
@@ -2437,7 +2615,7 @@ mod tests {
     fn bounded_fit_recovers_beta_4_and_2_5_inside_the_bounds() {
         for (beta, tol) in [(4.0, 0.05), (2.5, 0.03)] {
             let pixels = moffat_stamp(41, 20.0, 20.0, 3.0, 3.0, 0.0, beta);
-            let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 20.0, 20.0, 1.5, 1.5, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5).unwrap();
+            let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 20.0, 20.0, 1.5, 1.5, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5, 1).unwrap();
             assert!((r.beta - beta).abs() < tol, "beta {} vs {beta}", r.beta);
             assert!(r.iters > 0);
         }
@@ -2497,13 +2675,13 @@ mod tests {
     #[test]
     fn a_fit_at_a_bound_returns_the_bound_itself() {
         let steep = moffat_stamp(41, 20.0, 20.0, 2.0, 2.0, 0.0, 1.2);
-        let r = fit_moffat_2d_bounded(&steep, 0.0, 1.0, 20.0, 20.0, 1.0, 1.0, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5).unwrap();
+        let r = fit_moffat_2d_bounded(&steep, 0.0, 1.0, 20.0, 20.0, 1.0, 1.0, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5, 1).unwrap();
         assert_eq!(r.beta, 1.5);
         let gauss = gauss_stamp(41, 20.0, 20.0, 2.0);
-        let r = fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (1.5, 30.0), 100, 1e-5, 5).unwrap();
+        let r = fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (1.5, 30.0), 100, 1e-5, 5, 1).unwrap();
         assert_eq!(r.beta, 30.0);
-        assert!(fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (0.0, 30.0), 100, 1e-5, 5).is_none());
-        assert!(fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (40.0, 30.0), 100, 1e-5, 5).is_none());
+        assert!(fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (0.0, 30.0), 100, 1e-5, 5, 1).is_none());
+        assert!(fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (40.0, 30.0), 100, 1e-5, 5, 1).is_none());
     }
 
     /// The bounded fit carries the corrected θ column: the elliptical stamp the legacy free fit stalls on
@@ -2511,7 +2689,7 @@ mod tests {
     #[test]
     fn the_bounded_fit_recovers_the_elliptical_stamp_the_legacy_free_fit_stalls_on() {
         let pixels = moffat_stamp(31, 15.0, 15.0, 2.5, 4.0, 30f64.to_radians(), 4.0);
-        let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 15.0, 15.0, 2.5 * 0.6, 4.0 * 0.6, 35f64.to_radians(), 3.0, (1.5, 100.0), 100, 1e-5, 5).unwrap();
+        let r = fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 15.0, 15.0, 2.5 * 0.6, 4.0 * 0.6, 35f64.to_radians(), 3.0, (1.5, 100.0), 100, 1e-5, 5, 1).unwrap();
         assert!((r.theta.to_degrees() - 30.0).abs() < 1.0, "theta {}", r.theta.to_degrees());
         assert!((r.beta - 4.0).abs() < 0.05, "beta {}", r.beta);
     }
@@ -2523,7 +2701,7 @@ mod tests {
 
     /// A pin, not RED (ruling F28): `fit_moffat_2d` through `BetaParam::FreeLinear` returns the C3 stamp's exact
     /// parameters and iteration count recorded before this task (the golden values are read from
-    /// `c3_moffat_arithmetic_delta_against_the_pre_c3_solver`'s fixture at 8321412 and pasted here).
+    /// `c3_moffat_arithmetic_delta_against_the_pre_c3_solver`'s fixture at 197fd93 and pasted here).
     #[test]
     fn fit_moffat_2d_is_byte_identical_to_before() {
         let pixels = c3_fixture_stamp();
@@ -2556,8 +2734,205 @@ mod tests {
             CALIBRATION_CONV_TOL,
             CALIBRATION_MAX_REJECTS,
             ThetaColumn::Legacy,
+            Sampling::Point,
         );
         assert_eq!((lm.iters, lm.converged), (10, false));
+    }
+
+    /// Every field of a bounded fit as bits, its iteration count and its convergence flag.
+    fn bounded_bits(r: &Moffat2DBoundedResult) -> ([u64; 9], usize, bool) {
+        let bits = [r.b, r.a, r.x0, r.y0, r.alpha_x, r.alpha_y, r.theta, r.beta, r.fit_residual].map(f64::to_bits);
+        (bits, r.iters, r.converged)
+    }
+
+    /// A pin, not RED (ruling F28): `fit_moffat_2d_bounded` at `subsample = 1` returns, bit for bit, what it returned
+    /// before the sub-sample option existed — recorded at 0ebc618 (the entry point as cceab37 built it) and pasted
+    /// here before the solver changed: the C3 stamp (noisy, elliptical), a σ 2 Gaussian that ends at the cap (39
+    /// iterations) and an off-centre elliptical Moffat β 2.5.
+    #[test]
+    fn the_bounded_fit_at_one_sample_per_pixel_is_byte_identical_to_before() {
+        let c3 = c3_fixture_stamp();
+        let gauss = gauss_stamp(41, 20.0, 20.0, 2.0);
+        let ell = moffat_stamp(31, 15.3, 14.6, 2.5, 4.0, 30f64.to_radians(), 2.5);
+        let runs = [
+            fit_moffat_2d_bounded(&c3, 100.0, 5000.0, 15.0, 15.0, 2.0, 2.0, 0.0, 3.0, (1.5, 100.0), CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS, 1).unwrap(),
+            fit_moffat_2d_bounded(&gauss, 0.0, 1.0, 20.0, 20.0, 2.0, 2.0, 0.0, 4.0, (1.5, 100.0), 100, 1e-5, 5, 1).unwrap(),
+            fit_moffat_2d_bounded(&ell, 0.0, 1.0, 15.0, 15.0, 1.5, 2.4, 35f64.to_radians(), 3.0, (1.5, 100.0), 100, 1e-5, 5, 1).unwrap(),
+        ];
+        let golden: [([u64; 9], usize, bool); 3] = [
+            (
+                [
+                    0x406f494bc0035f3c,
+                    0x408bbf9443376c9e,
+                    0x402df78f8ba876d1,
+                    0x402e3689835e893c,
+                    0x4007b942943bb0a4,
+                    0x4007fbf347c29956,
+                    0x3fe4ccea80c461c8,
+                    0x400143161a21bd15,
+                    0x3f8c78bbe47d8a42,
+                ],
+                6,
+                true,
+            ),
+            (
+                [
+                    0xbf0512b63da7fb51,
+                    0x3ff00a490812bb01,
+                    0x4034000000000000,
+                    0x4034000000000000,
+                    0x403c252e4b38f4a6,
+                    0x403c252e4b38f4a7,
+                    0xbcf6913d62cac85e,
+                    0x4059000000000000,
+                    0x3f2bde1c1c741a98,
+                ],
+                39,
+                true,
+            ),
+            (
+                [
+                    0xbe0cb746900a2900,
+                    0x3ff0000004d0a228,
+                    0x402e9999999ac0ef,
+                    0x402d3333333238ed,
+                    0x4003ffffdda0a455,
+                    0x400fffffc8f3e26c,
+                    0x3fe0c152382e5895,
+                    0x4003ffffd1782131,
+                    0x3e1716541bbcde75,
+                ],
+                4,
+                true,
+            ),
+        ];
+        for (r, g) in runs.iter().zip(golden) {
+            assert_eq!(bounded_bits(r), g);
+        }
+        assert!(fit_moffat_2d_bounded(&ell, 0.0, 1.0, 15.0, 15.0, 1.5, 2.4, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5, 0).is_none(), "k = 0");
+    }
+
+    /// A round Moffat (`B = 0`, `A = 1`, FWHM `fwhm`, β `beta`) on an `n × n` stamp centred on `(cx, cy)`, each pixel
+    /// the mean of the model over `sub × sub` midpoint sub-samples — the light a pixel collects, to a precision the
+    /// fits below cannot see.
+    fn integrated_moffat_stamp(n: usize, cx: f64, cy: f64, fwhm: f64, beta: f64, sub: usize) -> Vec<PixelSample> {
+        let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+        let params = [0.0, 1.0, cx, cy, alpha, alpha, 0.0, beta];
+        let offsets = subsample_offsets(sub);
+        let mut px = Vec::with_capacity(n * n);
+        for y in 0..n {
+            for x in 0..n {
+                let (x, y) = (x as f64, y as f64);
+                let mut sum = 0.0;
+                for &oy in &offsets {
+                    for &ox in &offsets {
+                        sum += evaluate_moffat_2d(&params, x + ox, y + oy);
+                    }
+                }
+                px.push(PixelSample { x, y, value: sum / (sub * sub) as f64 });
+            }
+        }
+        px
+    }
+
+    #[test]
+    fn the_sub_sample_offsets_are_the_pixel_midpoints() {
+        assert_eq!(subsample_offsets(1), vec![0.0]);
+        assert_eq!(subsample_offsets(2), vec![-0.25, 0.25]);
+        let o = subsample_offsets(3);
+        assert!((o[0] + 1.0 / 3.0).abs() < 1e-15 && o[1] == 0.0 && (o[2] - 1.0 / 3.0).abs() < 1e-15, "{o:?}");
+    }
+
+    /// The pixel-integrated fit (E5): an undersampled Moffat β 2.5 whose pixels integrate the light (25 × 25
+    /// sub-samples each, off-grid centre) reads β 2.5 within 1 % at k = 7, where the point model (k = 1) reads it high
+    /// — the flatter integrated core read as a flatter profile, more so the smaller the star.
+    #[test]
+    fn the_integrated_fit_reads_an_undersampled_star_at_its_beta_where_the_point_fit_reads_high() {
+        for fwhm in [1.2_f64, 2.0] {
+            let pixels = integrated_moffat_stamp(17, 8.3, 7.6, fwhm, 2.5, 25);
+            let sigma = fwhm / 2.354_820_045;
+            let fit = |k: usize| {
+                fit_moffat_2d_bounded(&pixels, 0.0, 1.0, 8.0, 8.0, sigma, sigma, 0.0, 3.0, (1.5, 100.0), 150, 1e-6, 5, k)
+                    .unwrap_or_else(|| panic!("F {fwhm} k {k}: no fit"))
+            };
+            let (point, integrated) = (fit(1), fit(7));
+            println!("F {fwhm}: point beta {} ({} iters), k 7 beta {} ({} iters)", point.beta, point.iters, integrated.beta, integrated.iters);
+            assert!((integrated.beta / 2.5 - 1.0).abs() < 0.01, "F {fwhm}: k 7 beta {}", integrated.beta);
+            assert!(point.beta > 2.5 && point.beta > integrated.beta, "F {fwhm}: point beta {} not high", point.beta);
+        }
+    }
+
+    /// The integrated model's mean over the `k × k` sub-samples at `params` (β linear in `params[7]`).
+    fn integrated_value(params: &[f64; 8], x: f64, y: f64, offsets: &[f64]) -> f64 {
+        let mut sum = 0.0;
+        for &oy in offsets {
+            for &ox in offsets {
+                sum += evaluate_moffat_2d(params, x + ox, y + oy);
+            }
+        }
+        sum / (offsets.len() * offsets.len()) as f64
+    }
+
+    /// The pixel-integrated Jacobian row the solver builds ([`MoffatRow::integrated`] from the cost pass's cached
+    /// sub-sample powers, exactly as `lm_solve_moffat_with` calls it) against central differences of the integrated
+    /// model at k = 3, every column, pixel by pixel on an elliptical stamp: ln β for the β column, the corrected θ
+    /// column, and the residual the cost pass records is the pixel's value minus the integrated model.
+    #[test]
+    fn the_integrated_jacobian_is_the_central_difference_of_the_integrated_model() {
+        let h = 1e-6;
+        let offsets = subsample_offsets(3);
+        let ln = BetaParam::FreeLn { ln_min: 1.5f64.ln(), ln_max: 100f64.ln() };
+        let mut checked = 0_usize;
+        for &beta in &[1.8_f64, 4.0, 37.0] {
+            let params = [0.02, 0.9, 4.3, 3.8, 1.6, 2.4, 0.5, beta];
+            let solver = [params[0], params[1], params[2], params[3], params[4], params[5], params[6], beta.ln()];
+            let pixels: Vec<PixelSample> = (0..81)
+                .map(|i| PixelSample { x: (i % 9) as f64, y: (i / 9) as f64, value: 0.1 })
+                .collect();
+            let (mut powers, mut resid) = (vec![0.0; 81 * 9], vec![0.0; 81]);
+            residual_cost_moffat_into(&pixels, &solver, ln, Sampling::Integrated(&offsets), &mut powers, &mut resid);
+            let (cos_t, sin_t) = (params[6].cos(), params[6].sin());
+            let row = MoffatRow {
+                x0: params[2],
+                y0: params[3],
+                a: params[1],
+                ax: params[4],
+                ay: params[5],
+                cos_t,
+                sin_t,
+                inv_ax2: 1.0 / (params[4] * params[4]),
+                inv_ay2: 1.0 / (params[5] * params[5]),
+                beta: ln.beta(solver[7]),
+                beta_param: ln,
+                theta_column: ThetaColumn::Corrected,
+            };
+            for (i, px) in pixels.iter().enumerate() {
+                let mut j = [0.0_f64; 8];
+                row.integrated(px, &offsets, &powers[i * 9..(i + 1) * 9], &mut j);
+                let model = integrated_value(&params, px.x, px.y, &offsets);
+                assert!((resid[i] - (px.value - model)).abs() <= 1e-14, "residual {} vs {}", resid[i], px.value - model);
+                for col in 0..8 {
+                    let (mut up, mut down) = (params, params);
+                    if col == 7 {
+                        up[7] = (beta.ln() + h).exp();
+                        down[7] = (beta.ln() - h).exp();
+                    } else {
+                        up[col] += h;
+                        down[col] -= h;
+                    }
+                    let fd = (integrated_value(&up, px.x, px.y, &offsets) - integrated_value(&down, px.x, px.y, &offsets)) / (2.0 * h);
+                    assert!(
+                        (j[col] - fd).abs() <= 1e-7 * fd.abs().max(1e-3),
+                        "beta {beta} pixel ({}, {}) column {col}: {:e} vs {fd:e}",
+                        px.x,
+                        px.y,
+                        j[col]
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 243);
     }
 
     /// The conditioned fixed-β entry point fits β above 20 (its caller's frame β reaches the Gaussian limit at 100);
