@@ -509,6 +509,7 @@ pub fn fit_moffat_2d_fixed_beta(
 /// (`A` = the clipped maximum), overshoots the guard on its first steps; counted, five such refusals ended the solve
 /// on its start, which this entry point returned. Every other solve runs step for step as before: the two rules part
 /// only in a solve the counted rule ended before its first accepted step, and that solve had returned its start.
+#[allow(dead_code)]
 pub fn fit_moffat_2d_fixed_beta_conditioned(
     pixels: &[PixelSample],
     init_b: f64,
@@ -527,6 +528,7 @@ pub fn fit_moffat_2d_fixed_beta_conditioned(
 }
 
 /// Result of [`fit_moffat_2d_bounded`]: the parameters of [`Moffat2DResult`] plus the solver's iteration count.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Moffat2DBoundedResult {
     pub b: f64,
@@ -545,6 +547,7 @@ pub struct Moffat2DBoundedResult {
     pub iters: usize,
 }
 
+#[allow(dead_code)]
 impl Moffat2DBoundedResult {
     /// FWHM = 2α√(2^(1/β) - 1) along each axis.
     pub fn fwhm_x(&self) -> f64 {
@@ -582,6 +585,7 @@ impl Moffat2DBoundedResult {
 ///
 /// [`fit_moffat_2d`] (β linear, bounds [1, 20], the legacy θ column) is unchanged: this is a separate entry point
 /// on the same solver.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn fit_moffat_2d_bounded(
     pixels: &[PixelSample],
@@ -677,6 +681,7 @@ enum BetaParam {
     FreeLinear,
     /// β free, `params[7] = ln β`: the column `∂M/∂(ln β) = A·(1+Q)^(−β)·(−ln(1+Q))·β` (the chain rule), each step's
     /// ln β clamped to `[ln_min, ln_max]`. [`fit_moffat_2d_bounded`]'s arm.
+    #[allow(dead_code)]
     FreeLn { ln_min: f64, ln_max: f64 },
 }
 
@@ -737,6 +742,7 @@ enum Sampling<'a> {
     Point,
     /// The pixel-integrated model: the mean of the model (and of each Jacobian column) over the `k × k` midpoint
     /// sub-samples at these `k` offsets (px, the same in x and in y; [`subsample_offsets`]).
+    #[allow(dead_code)]
     Integrated(&'a [f64]),
 }
 
@@ -752,6 +758,7 @@ impl Sampling<'_> {
 
 /// The `k` midpoint sub-sample offsets of a pixel, `(i + 0.5)/k − 0.5` px for `i` in `0..k`: symmetric about the
 /// pixel's centre, `[0.0]` at `k = 1`.
+#[allow(dead_code)]
 fn subsample_offsets(k: usize) -> Vec<f64> {
     (0..k).map(|i| (i as f64 + 0.5) / k as f64 - 0.5).collect()
 }
@@ -775,6 +782,7 @@ enum ThetaColumn {
     /// have always built, kept so their output does not move.
     Legacy,
     /// `∂Q/∂θ = 2uv·(1/α_x² − 1/α_y²)`, from `∂u/∂θ = v`, `∂v/∂θ = −u`.
+    #[allow(dead_code)]
     Corrected,
 }
 

@@ -5,6 +5,42 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — 2026-10-12
+
+Seven commits since 1.3.0, all in the analysis Moffat fitter
+(`src/analysis/fitting.rs`), from the star-measurement work in the host
+application. Minor, not patch: the crate gains public API under
+`debug-pipeline`. The 1.3.0 entry points (`fit_moffat_2d`,
+`fit_moffat_2d_fixed_beta`) return the same output as before, pinned by golden
+tests recorded before each change.
+
+### Added
+
+- **`fit_moffat_2d_bounded` and `Moffat2DBoundedResult`** (under
+  `debug-pipeline`): a free-β elliptical Moffat fit that carries ln β with
+  caller-supplied bounds, so β never leaves the caller's range and the step is
+  even across it. A `subsample` factor k ≥ 2 fits the pixel-integrated Moffat
+  (model and Jacobian are the mean over k × k midpoint sub-samples of each
+  pixel), so the β of an undersampled star is no longer read high; k = 1 is the
+  point model.
+- **`fit_moffat_2d_fixed_beta_conditioned`** (under `debug-pipeline`): a
+  fixed-β fit on a conditioned problem, with the θ column of the Jacobian at its
+  correct sign. It accepts a fixed β above 20 (up to the Gaussian limit at 100)
+  for a caller whose per-frame β reaches it; at β ≤ 20 its output equals the
+  previous fixed-β arm.
+
+### Changed
+
+- The solver's β switch is now an internal `BetaParam` (fixed, free linear,
+  free in ln β); the free linear arm that `fit_moffat_2d` runs is unchanged
+  operation for operation.
+
+### Fixed
+
+- Both new fitters refuse a solve that never left its start (they return
+  `None` instead of the starting parameters), and a step refused by a guard
+  before the first accepted step no longer spends the reject budget.
+
 ## [1.3.0] — 2026-09-20
 
 Fifteen commits since 1.2.0, from three cycles of the stacking work in the
