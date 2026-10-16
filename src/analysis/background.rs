@@ -245,10 +245,8 @@ pub fn estimate_noise_mrs(
     // Layer 1: mark significant pixels in w1
     let sigma1 = simple_mad_noise(&w1, width, height);
     let thresh1 = 3.0 * sigma1;
-    for i in 0..total {
-        if w1[i].abs() > thresh1 {
-            sig_mask[i] = true;
-        }
+    for (m, &w) in sig_mask.iter_mut().zip(w1.iter()) {
+        *m = w.abs() > thresh1;
     }
 
     // Layers 2..N: compute dilated wavelet coefficients, mark significant pixels
@@ -305,13 +303,10 @@ pub fn estimate_noise_mrs(
             let thresh_j = 3.0 * sigma_j;
 
             // Mark significant pixels at this scale
-            for idx in 0..total {
-                if !sig_mask[idx] {
-                    let coeff = prev_smooth[idx] - next_smooth[idx];
-                    if coeff.abs() > thresh_j {
-                        sig_mask[idx] = true;
-                    }
-                }
+            // `mask |= |c| > t` is the old "unmasked and over the threshold -> mask" without the
+            // branch (a masked pixel stays masked, NaN compares false), so it vectorizes.
+            for ((m, &p), &n) in sig_mask.iter_mut().zip(prev_smooth.iter()).zip(next_smooth.iter()) {
+                *m |= (p - n).abs() > thresh_j;
             }
         }
 
@@ -393,13 +388,29 @@ fn simple_mad_noise(w1: &[f32], width: usize, height: usize) -> f32 {
     (1.4826 * mad).max(0.001)
 }
 
+/// The median of `|x - median|` over `samples`: the same element `find_median` returns on the
+/// deviation vector (the `len/2`-th smallest; a deviation is a non-negative f32, whose bit pattern
+/// orders like its value, and equal values are the same bits), found by an integer selection on
+/// reusable scratch. `samples` is only read, so its permutation (which the caller's final mean
+/// sum depends on) is untouched.
+fn median_abs_dev(samples: &[f32], median: f32, scratch: &mut Vec<u32>) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    scratch.clear();
+    scratch.extend(samples.iter().map(|&x| (x - median).abs().to_bits()));
+    let k = scratch.len() / 2;
+    let (_, v, _) = scratch.select_nth_unstable(k);
+    f32::from_bits(*v)
+}
+
 /// Iterative sigma-clipped statistics. Returns (mode, sigma_MAD).
 /// Mode = 2.5*median - 1.5*mean (SExtractor formula).
 /// Modifies the slice in-place (quickselect requirement).
 fn sigma_clipped_stats(samples: &mut Vec<f32>, rounds: usize, kappa: f32) -> (f32, f32) {
     let mut median = 0.0_f32;
     let mut sigma = 0.0_f32;
-    let mut abs_devs = Vec::with_capacity(samples.len());
+    let mut abs_devs: Vec<u32> = Vec::with_capacity(samples.len());
 
     for _ in 0..rounds {
         if samples.len() < 10 {
@@ -409,9 +420,7 @@ fn sigma_clipped_stats(samples: &mut Vec<f32>, rounds: usize, kappa: f32) -> (f3
         median = find_median(samples);
 
         // MAD = median(|xi - median|)
-        abs_devs.clear();
-        abs_devs.extend(samples.iter().map(|&x| (x - median).abs()));
-        let mad = find_median(&mut abs_devs);
+        let mad = median_abs_dev(samples, median, &mut abs_devs);
         sigma = 1.4826 * mad;
 
         if sigma < 1e-6 {
@@ -430,9 +439,7 @@ fn sigma_clipped_stats(samples: &mut Vec<f32>, rounds: usize, kappa: f32) -> (f3
 
     // Final statistics on clipped data
     median = find_median(samples);
-    abs_devs.clear();
-    abs_devs.extend(samples.iter().map(|&x| (x - median).abs()));
-    let mad = find_median(&mut abs_devs);
+    let mad = median_abs_dev(samples, median, &mut abs_devs);
     sigma = 1.4826 * mad;
 
     let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
@@ -485,6 +492,22 @@ fn interpolate_grid_to_map(
     let nx_i = nx as i32;
     let ny_i = ny as i32;
 
+    // Per-column tables: the x floor / clamp / weights / clamped grid columns depend on x only,
+    // so they are computed once per column instead of once per pixel (the same expressions on
+    // the same values, hence the same bits).
+    let cols: Vec<([usize; 4], [f32; 4])> = (0..width)
+        .map(|x| {
+            let fx = (x as f32 - half_cell) * inv_cell;
+            let ix = fx.floor() as i32;
+            let tx = (fx - ix as f32).clamp(0.0, 1.0);
+            let mut jx = [0usize; 4];
+            for (i, slot) in jx.iter_mut().enumerate() {
+                *slot = (ix + i as i32 - 1).clamp(0, nx_i - 1) as usize;
+            }
+            (jx, cubic_weights(tx))
+        })
+        .collect();
+
     use rayon::prelude::*;
     map.par_chunks_mut(width)
         .enumerate()
@@ -493,19 +516,18 @@ fn interpolate_grid_to_map(
             let iy = fy.floor() as i32;
             let ty = (fy - iy as f32).clamp(0.0, 1.0);
             let wy = cubic_weights(ty);
+            let mut grows: [&[f32]; 4] = [&[]; 4];
+            for (j, slot) in grows.iter_mut().enumerate() {
+                let jy = (iy + j as i32 - 1).clamp(0, ny_i - 1) as usize;
+                *slot = &grid[jy * nx..jy * nx + nx];
+            }
 
-            for (x, dst) in row.iter_mut().enumerate() {
-                let fx = (x as f32 - half_cell) * inv_cell;
-                let ix = fx.floor() as i32;
-                let tx = (fx - ix as f32).clamp(0.0, 1.0);
-                let wx = cubic_weights(tx);
-
+            for (dst, (jx, wx)) in row.iter_mut().zip(cols.iter()) {
                 let mut val = 0.0_f32;
-                for j in 0..4_i32 {
-                    let jy = (iy + j - 1).clamp(0, ny_i - 1) as usize;
-                    for i in 0..4_i32 {
-                        let jx = (ix + i - 1).clamp(0, nx_i - 1) as usize;
-                        val += wy[j as usize] * wx[i as usize] * grid[jy * nx + jx];
+                for j in 0..4 {
+                    let g = grows[j];
+                    for i in 0..4 {
+                        val += wy[j] * wx[i] * g[jx[i]];
                     }
                 }
                 *dst = val;
@@ -790,5 +812,584 @@ mod tests {
         assert_eq!(n2, 12.710779_f32, "noise_layers=2");
         assert_eq!(n4, 12.720099_f32, "noise_layers=4");
         assert_eq!(n6, 12.748694_f32, "noise_layers=6");
+    }
+
+    // ---- bit-for-bit oracles: the pre-optimization bodies, kept verbatim ----
+
+    fn sigma_clipped_stats_ref(samples: &mut Vec<f32>, rounds: usize, kappa: f32) -> (f32, f32) {
+        let mut median = 0.0_f32;
+        let mut sigma = 0.0_f32;
+        let mut abs_devs = Vec::with_capacity(samples.len());
+
+        for _ in 0..rounds {
+            if samples.len() < 10 {
+                break;
+            }
+
+            median = find_median(samples);
+
+            // MAD = median(|xi - median|)
+            abs_devs.clear();
+            abs_devs.extend(samples.iter().map(|&x| (x - median).abs()));
+            let mad = find_median(&mut abs_devs);
+            sigma = 1.4826 * mad;
+
+            if sigma < 1e-6 {
+                break;
+            }
+
+            // Clip
+            let lo = median - kappa * sigma;
+            let hi = median + kappa * sigma;
+            samples.retain(|&x| x >= lo && x <= hi);
+        }
+
+        if samples.len() < 10 {
+            return (median, sigma.max(0.001));
+        }
+
+        // Final statistics on clipped data
+        median = find_median(samples);
+        abs_devs.clear();
+        abs_devs.extend(samples.iter().map(|&x| (x - median).abs()));
+        let mad = find_median(&mut abs_devs);
+        sigma = 1.4826 * mad;
+
+        let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
+
+        // Mode approximation (SExtractor formula) with asymmetry fallback.
+        // When |mean - median| >= 0.3 * sigma, the distribution is too skewed
+        // (bright nebulosity, galaxy core) for the mode formula to be reliable.
+        let mode = if (mean - median).abs() < 0.3 * sigma {
+            2.5 * median - 1.5 * mean
+        } else {
+            median
+        };
+
+        (mode, sigma.max(0.001))
+    }
+
+
+    fn interpolate_ref(
+        grid: &[f32],
+        nx: usize,
+        ny: usize,
+        width: usize,
+        height: usize,
+        cell_size: usize,
+    ) -> Vec<f32> {
+        let mut map = vec![0.0_f32; width * height];
+
+        if nx < 2 || ny < 2 {
+            map.fill(grid[0]);
+            return map;
+        }
+
+        let half_cell = cell_size as f32 * 0.5;
+        let inv_cell = 1.0 / cell_size as f32;
+        let nx_i = nx as i32;
+        let ny_i = ny as i32;
+
+        use rayon::prelude::*;
+        map.par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let fy = (y as f32 - half_cell) * inv_cell;
+                let iy = fy.floor() as i32;
+                let ty = (fy - iy as f32).clamp(0.0, 1.0);
+                let wy = cubic_weights(ty);
+
+                for (x, dst) in row.iter_mut().enumerate() {
+                    let fx = (x as f32 - half_cell) * inv_cell;
+                    let ix = fx.floor() as i32;
+                    let tx = (fx - ix as f32).clamp(0.0, 1.0);
+                    let wx = cubic_weights(tx);
+
+                    let mut val = 0.0_f32;
+                    for j in 0..4_i32 {
+                        let jy = (iy + j - 1).clamp(0, ny_i - 1) as usize;
+                        for i in 0..4_i32 {
+                            let jx = (ix + i - 1).clamp(0, nx_i - 1) as usize;
+                            val += wy[j as usize] * wx[i as usize] * grid[jy * nx + jx];
+                        }
+                    }
+                    *dst = val;
+                }
+            });
+
+        map
+    }
+
+
+    fn mesh_ref(
+        data: &[f32],
+        width: usize,
+        height: usize,
+        cell_size: usize,
+        want_noise_map: bool,
+    ) -> BackgroundResult {
+        let cell_size = cell_size.max(16);
+        let nx = (width + cell_size - 1) / cell_size;
+        let ny = (height + cell_size - 1) / cell_size;
+
+        // Per-cell statistics (parallelized — each cell is independent)
+        use rayon::prelude::*;
+        let cells: Vec<(f32, f32, bool)> = (0..ny * nx)
+            .into_par_iter()
+            .map(|cell_idx| {
+                let cy = cell_idx / nx;
+                let cx = cell_idx % nx;
+                let y0 = cy * cell_size;
+                let y1 = (y0 + cell_size).min(height);
+                let x0 = cx * cell_size;
+                let x1 = (x0 + cell_size).min(width);
+
+                let mut samples = Vec::with_capacity((y1 - y0) * (x1 - x0));
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let val = data[y * width + x];
+                        if val.is_finite() {
+                            samples.push(val);
+                        }
+                    }
+                }
+
+                if samples.len() < 10 {
+                    return (0.0, 0.0, false);
+                }
+
+                let original_len = samples.len();
+                let (mode, sigma) = sigma_clipped_stats_ref(&mut samples, 3, 3.0);
+
+                // Reject star-contaminated cells (>30% clipped)
+                let valid = samples.len() >= (original_len * 7 / 10);
+                (mode, sigma, valid)
+            })
+            .collect();
+
+        let mut cell_bg = vec![0.0_f32; nx * ny];
+        let mut cell_sigma = vec![0.0_f32; nx * ny];
+        let mut cell_valid = vec![true; nx * ny];
+        for (i, &(bg, sigma, valid)) in cells.iter().enumerate() {
+            cell_bg[i] = bg;
+            cell_sigma[i] = sigma;
+            cell_valid[i] = valid;
+        }
+
+        // Fill invalid cells with nearest valid neighbor
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let idx = cy * nx + cx;
+                if cell_valid[idx] {
+                    continue;
+                }
+                // Search expanding ring
+                let mut best_dist = usize::MAX;
+                let mut best_val = 0.0_f32;
+                let mut best_sig = 1.0_f32;
+                let max_r = nx.max(ny);
+                for r in 1..=max_r {
+                    let mut found = false;
+                    let y_lo = cy.saturating_sub(r);
+                    let y_hi = (cy + r + 1).min(ny);
+                    let x_lo = cx.saturating_sub(r);
+                    let x_hi = (cx + r + 1).min(nx);
+                    for sy in y_lo..y_hi {
+                        for sx in x_lo..x_hi {
+                            let sidx = sy * nx + sx;
+                            if cell_valid[sidx] {
+                                let d = cx.abs_diff(sx) + cy.abs_diff(sy);
+                                if d < best_dist {
+                                    best_dist = d;
+                                    best_val = cell_bg[sidx];
+                                    best_sig = cell_sigma[sidx];
+                                    found = true;
+                                }
+                            }
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                cell_bg[idx] = best_val;
+                cell_sigma[idx] = best_sig;
+            }
+        }
+
+        // 3×3 median filter on grid to suppress remaining star contamination
+        let mut filtered_bg = cell_bg.clone();
+        let mut neighbors = [0.0_f32; 9];
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let mut count = 0;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let sy = cy as i32 + dy;
+                        let sx = cx as i32 + dx;
+                        if sy >= 0 && sy < ny as i32 && sx >= 0 && sx < nx as i32 {
+                            neighbors[count] = cell_bg[sy as usize * nx + sx as usize];
+                            count += 1;
+                        }
+                    }
+                }
+                filtered_bg[cy * nx + cx] = find_median(&mut neighbors[..count]);
+            }
+        }
+
+        // Bicubic spline interpolation to full resolution (parallelized)
+        let bg_map = interpolate_ref(&filtered_bg, nx, ny, width, height, cell_size);
+
+        // Global noise = median of cell sigmas
+        let mut valid_sigmas: Vec<f32> = cell_sigma
+            .iter()
+            .zip(cell_valid.iter())
+            .filter(|(_, &v)| v)
+            .map(|(&s, _)| s)
+            .collect();
+
+        let noise = if valid_sigmas.is_empty() {
+            1.0
+        } else {
+            find_median(&mut valid_sigmas)
+        };
+
+        // Global background = median of filtered cell backgrounds
+        let mut valid_bgs: Vec<f32> = (0..nx * ny).map(|i| filtered_bg[i]).collect();
+        let background = find_median(&mut valid_bgs);
+
+        // Bicubic interpolation of per-cell noise to full resolution — skipped
+        // when the caller never reads it (see `want_noise_map` doc comment
+        // above); this is a pure leaf call with no effect on `background`,
+        // `noise` or `background_map`, all already finalized above.
+        let noise_map = if want_noise_map {
+            Some(interpolate_ref(
+                &cell_sigma,
+                nx,
+                ny,
+                width,
+                height,
+                cell_size,
+            ))
+        } else {
+            None
+        };
+
+        BackgroundResult {
+            background,
+            noise: noise.max(0.001),
+            background_map: Some(bg_map),
+            noise_map,
+        }
+    }
+
+
+    fn simple_mad_noise_ref(w1: &[f32], width: usize, height: usize) -> f32 {
+        let total = width * height;
+        let target_samples = 500_000usize;
+        let stride = ((total as f64 / target_samples as f64).sqrt() as usize).max(1);
+        let border = 2usize;
+
+        let mut samples = Vec::with_capacity(target_samples);
+        let mut y = border;
+        while y < height.saturating_sub(border) {
+            let mut x = border;
+            while x < width.saturating_sub(border) {
+                let idx = y * width + x;
+                let coeff = w1[idx];
+                if coeff.is_finite() {
+                    samples.push(coeff);
+                }
+                x += stride;
+            }
+            y += stride;
+        }
+
+        if samples.len() < 100 {
+            return 0.001;
+        }
+
+        let median = find_median(&mut samples);
+        let mut abs_devs: Vec<f32> = samples.iter().map(|&v| (v - median).abs()).collect();
+        let mad = find_median(&mut abs_devs);
+        (1.4826 * mad).max(0.001)
+    }
+
+
+    fn mrs_ref(
+        data: &[f32],
+        width: usize,
+        height: usize,
+        noise_layers: usize,
+    ) -> f32 {
+        use super::super::convolution::{b3_spline_smooth_ref as b3_spline_smooth, b3_spline_smooth_dilated_ref as b3_spline_smooth_dilated};
+
+        if data.is_empty() {
+            return 0.001;
+        }
+
+        let total = width * height;
+        let noise_layers = noise_layers.clamp(1, 6);
+
+        // ── Layer 1: compute wavelet coefficients w1 = data - smooth(data) ──
+        let mut smoothed = vec![0.0_f32; total];
+        b3_spline_smooth(data, width, height, &mut smoothed);
+
+        let mut w1 = vec![0.0_f32; total];
+        for i in 0..total {
+            w1[i] = data[i] - smoothed[i];
+        }
+
+        // If only 1 layer requested, use simple MAD on w1 (original behavior)
+        if noise_layers == 1 {
+            return simple_mad_noise_ref(&w1, width, height);
+        }
+
+        // ── Build significance mask across all wavelet layers ──
+        // true = significant (contains structure), excluded from noise estimate
+        let mut sig_mask = vec![false; total];
+
+        // Layer 1: mark significant pixels in w1
+        let sigma1 = simple_mad_noise_ref(&w1, width, height);
+        let thresh1 = 3.0 * sigma1;
+        for i in 0..total {
+            if w1[i].abs() > thresh1 {
+                sig_mask[i] = true;
+            }
+        }
+
+        // Layers 2..N: compute dilated wavelet coefficients, mark significant pixels
+        // Each layer operates on the smoothed output of the previous layer.
+        //
+        // Tier A task-3b, item 1: `next_smooth` used to be a fresh `vec![0.0;
+        // total]` allocated inside the loop on every layer (up to 5 more
+        // full-plane allocations at `noise_layers = 6`), each one immediately
+        // superseding the previous `prev_smooth` once `prev_smooth =
+        // next_smooth` ran. Two named buffers now ping-pong via `mem::swap`
+        // instead: `prev_smooth` starts as the layer-1 `smoothed` plane (moved
+        // in, no copy), `next_smooth` is the ONE extra buffer this loop ever
+        // allocates, and every iteration writes into whichever buffer currently
+        // holds the STALE (already-consumed) values before swapping the names.
+        // `b3_spline_smooth_dilated` writes every element of its `output`
+        // parameter (`par_chunks_mut(width)` covers every row, every `row[x] =
+        // sum`) — the same total-overwrite guarantee `vec![0.0; total]` gave,
+        // so reusing a buffer that still holds a prior layer's numbers is safe:
+        // nothing is ever read from it before this call fills it.
+        let mut prev_smooth = smoothed;
+        let mut next_smooth = vec![0.0_f32; total];
+
+        for layer in 2..=noise_layers {
+            b3_spline_smooth_dilated(&prev_smooth, width, height, &mut next_smooth, layer);
+
+            // Wavelet coefficients at this layer: w_j = c_{j-1} - c_j
+            // Subsample for sigma estimation
+            let target_samples = 500_000usize;
+            let stride = ((total as f64 / target_samples as f64).sqrt() as usize).max(1);
+            let border = (2_usize << (layer - 1)).min(width / 4);
+
+            let mut wj_samples = Vec::with_capacity(target_samples);
+            let mut y = border;
+            while y < height.saturating_sub(border) {
+                let mut x = border;
+                while x < width.saturating_sub(border) {
+                    let idx = y * width + x;
+                    if !sig_mask[idx] {
+                        let coeff = prev_smooth[idx] - next_smooth[idx];
+                        if coeff.is_finite() {
+                            wj_samples.push(coeff);
+                        }
+                    }
+                    x += stride;
+                }
+                y += stride;
+            }
+
+            if wj_samples.len() >= 100 {
+                let med = find_median(&mut wj_samples);
+                let mut abs_devs: Vec<f32> = wj_samples.iter().map(|&v| (v - med).abs()).collect();
+                let mad = find_median(&mut abs_devs);
+                let sigma_j = 1.4826 * mad;
+                let thresh_j = 3.0 * sigma_j;
+
+                // Mark significant pixels at this scale
+                for idx in 0..total {
+                    if !sig_mask[idx] {
+                        let coeff = prev_smooth[idx] - next_smooth[idx];
+                        if coeff.abs() > thresh_j {
+                            sig_mask[idx] = true;
+                        }
+                    }
+                }
+            }
+
+            std::mem::swap(&mut prev_smooth, &mut next_smooth);
+        }
+
+        // ── Re-estimate noise from layer-1 coefficients, excluding masked pixels ──
+        // Iterate until convergence
+        let target_samples = 500_000usize;
+        let stride = ((total as f64 / target_samples as f64).sqrt() as usize).max(1);
+        let border = 2usize;
+
+        let mut sigma = sigma1;
+        for _iteration in 0..4 {
+            let thresh = 3.0 * sigma;
+
+            let mut samples = Vec::with_capacity(target_samples);
+            let mut y = border;
+            while y < height.saturating_sub(border) {
+                let mut x = border;
+                while x < width.saturating_sub(border) {
+                    let idx = y * width + x;
+                    if !sig_mask[idx] && w1[idx].abs() <= thresh {
+                        samples.push(w1[idx]);
+                    }
+                    x += stride;
+                }
+                y += stride;
+            }
+
+            if samples.len() < 100 {
+                break;
+            }
+
+            let med = find_median(&mut samples);
+            let mut abs_devs: Vec<f32> = samples.iter().map(|&v| (v - med).abs()).collect();
+            let mad = find_median(&mut abs_devs);
+            let new_sigma = 1.4826 * mad;
+
+            if new_sigma <= 0.0 || (new_sigma - sigma).abs() / sigma < 0.001 {
+                sigma = new_sigma;
+                break;
+            }
+            sigma = new_sigma;
+        }
+
+        sigma.max(0.001)
+    }
+
+
+    fn lcg(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 40) as f32) / 16_777_216.0
+    }
+
+    /// Star-and-gradient plane with NaN holes, ADU-scale values.
+    fn scene(w: usize, h: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        let mut d = vec![0.0_f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let n = (lcg(&mut s) + lcg(&mut s) + lcg(&mut s) - 1.5) * 40.0;
+                d[y * w + x] = 500.0 + 0.02 * x as f32 + 0.01 * y as f32 + n;
+            }
+        }
+        for _ in 0..(w * h / 900).max(3) {
+            let cx = (lcg(&mut s) * w as f32) as isize;
+            let cy = (lcg(&mut s) * h as f32) as isize;
+            let amp = 200.0 + lcg(&mut s) * 30000.0;
+            for dy in -6..=6isize {
+                for dx in -6..=6isize {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+                        d[y as usize * w + x as usize] += amp * (-((dx * dx + dy * dy) as f32) / 6.0).exp();
+                    }
+                }
+            }
+        }
+        for _ in 0..(w * h / 500) {
+            let i = (lcg(&mut s) * (w * h) as f32) as usize % (w * h);
+            d[i] = f32::NAN;
+        }
+        d
+    }
+
+    fn assert_bits_eq(a: &[f32], b: &[f32], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what} length");
+        for i in 0..a.len() {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "{what} at {i}");
+        }
+    }
+
+    fn check_plane(d: &[f32], w: usize, h: usize, cell: usize, tag: &str) {
+        for &want_noise in &[false, true] {
+            let a = estimate_background_mesh(d, w, h, cell, want_noise);
+            let b = mesh_ref(d, w, h, cell, want_noise);
+            assert_eq!(a.background.to_bits(), b.background.to_bits(), "{tag} background");
+            assert_eq!(a.noise.to_bits(), b.noise.to_bits(), "{tag} noise");
+            assert_bits_eq(a.background_map.as_ref().unwrap(), b.background_map.as_ref().unwrap(), &format!("{tag} bg map"));
+            match (&a.noise_map, &b.noise_map) {
+                (Some(x), Some(y)) => assert_bits_eq(x, y, &format!("{tag} noise map")),
+                (None, None) => {}
+                _ => panic!("{tag} noise map presence"),
+            }
+        }
+        for layers in [1usize, 2, 4, 6] {
+            let a = estimate_noise_mrs(d, w, h, layers);
+            let b = mrs_ref(d, w, h, layers);
+            assert_eq!(a.to_bits(), b.to_bits(), "{tag} mrs layers {layers}");
+        }
+    }
+
+    #[test]
+    fn mesh_and_mrs_are_bit_equal_to_the_pre_optimization_bodies() {
+        for &(w, h, cell, seed) in &[
+            (96usize, 80usize, 16usize, 1u64),
+            (301, 211, 32, 2),
+            (640, 480, 64, 3),
+            (777, 333, 128, 4),
+            (1024, 700, 128, 5),
+            (50, 40, 16, 6),
+        ] {
+            let d = scene(w, h, seed);
+            check_plane(&d, w, h, cell, &format!("{w}x{h} c{cell}"));
+        }
+        let d = scene(20, 20, 9);
+        check_plane(&d, 20, 20, 16, "tiny");
+        check_plane(&vec![f32::NAN; 64 * 64], 64, 64, 16, "all-nan");
+    }
+
+    #[test]
+    fn sigma_clipped_stats_is_bit_equal_on_random_vectors() {
+        let mut s = 77u64;
+        for n in [0usize, 5, 10, 11, 64, 1000, 16384, 20000] {
+            for shape in 0..4 {
+                let mut v: Vec<f32> = (0..n)
+                    .map(|i| match shape {
+                        0 => 500.0 + (lcg(&mut s) - 0.5) * 100.0,
+                        1 => if i % 17 == 0 { 40000.0 } else { 300.0 + lcg(&mut s) * 20.0 },
+                        2 => 1.0,
+                        _ => (lcg(&mut s) * 8.0).floor(),
+                    })
+                    .collect();
+                let mut w = v.clone();
+                let a = sigma_clipped_stats(&mut v, 3, 3.0);
+                let b = sigma_clipped_stats_ref(&mut w, 3, 3.0);
+                assert_eq!(a.0.to_bits(), b.0.to_bits(), "mode n={n} shape={shape}");
+                assert_eq!(a.1.to_bits(), b.1.to_bits(), "sigma n={n} shape={shape}");
+            }
+        }
+    }
+
+    /// ATH_BG_REAL=<float32 FITS> pins both functions on a real calibrated plane (x65535).
+    #[test]
+    fn real_plane_is_bit_equal_when_given() {
+        let Ok(path) = std::env::var("ATH_BG_REAL") else { return };
+        let b = std::fs::read(&path).unwrap();
+        let (mut w, mut h, mut off) = (0usize, 0usize, 0usize);
+        'o: loop {
+            for c in 0..36 {
+                let card = std::str::from_utf8(&b[off + c * 80..off + c * 80 + 80]).unwrap();
+                let num = |k: &str| card.starts_with(k).then(|| card[10..].split('/').next().unwrap().trim().parse::<usize>().unwrap());
+                if let Some(x) = num("NAXIS1  ") { w = x; }
+                if let Some(x) = num("NAXIS2  ") { h = x; }
+                if card.starts_with("END ") { off += 2880; break 'o; }
+            }
+            off += 2880;
+        }
+        let d: Vec<f32> = (0..w * h)
+            .map(|i| f32::from_be_bytes(b[off + i * 4..off + i * 4 + 4].try_into().unwrap()) * 65535.0)
+            .collect();
+        check_plane(&d, w, h, 128, "real");
     }
 }

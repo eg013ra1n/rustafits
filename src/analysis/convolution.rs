@@ -305,55 +305,7 @@ pub fn b3_spline_smooth(
     height: usize,
     output: &mut [f32],
 ) {
-    const K: [f32; 5] = [1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0];
-
-    let mut hpass = vec![0.0_f32; width * height];
-
-    // Horizontal pass with reflected boundary
-    hpass
-        .par_chunks_mut(width)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let src = &data[y * width..(y + 1) * width];
-            for x in 0..width {
-                let mut sum = 0.0_f32;
-                for (ki, &kv) in K.iter().enumerate() {
-                    let sx = x as i32 + ki as i32 - 2;
-                    // Reflect at boundaries
-                    let sx = if sx < 0 {
-                        -sx
-                    } else if sx >= width as i32 {
-                        2 * width as i32 - 2 - sx
-                    } else {
-                        sx
-                    } as usize;
-                    sum += src[sx] * kv;
-                }
-                row[x] = sum;
-            }
-        });
-
-    // Vertical pass with reflected boundary
-    output
-        .par_chunks_mut(width)
-        .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..width {
-                let mut sum = 0.0_f32;
-                for (ki, &kv) in K.iter().enumerate() {
-                    let sy = y as i32 + ki as i32 - 2;
-                    let sy = if sy < 0 {
-                        -sy
-                    } else if sy >= height as i32 {
-                        2 * height as i32 - 2 - sy
-                    } else {
-                        sy
-                    } as usize;
-                    sum += hpass[sy * width + x] * kv;
-                }
-                row[x] = sum;
-            }
-        });
+    b3_smooth_impl(data, width, height, output, 1, false);
 }
 
 /// Dilated B3-spline smoothing for à trous wavelet layers 2+.
@@ -372,57 +324,167 @@ pub fn b3_spline_smooth_dilated(
     output: &mut [f32],
     layer: usize,
 ) {
-    use rayon::prelude::*;
+    b3_smooth_impl(data, width, height, output, 1_i32 << (layer - 1), true);
+}
 
-    const K: [f32; 5] = [1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0];
-    let spacing = 1_i32 << (layer - 1); // 2^(layer-1)
+const B3_K: [f32; 5] = [1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0];
+
+/// Reflected tap index, exactly the arithmetic of the original per-tap code (a still-out-of-range
+/// reflection wraps through `as usize` and is caught by the caller's bounds check or `min`).
+#[inline(always)]
+fn b3_reflect(s: i32, n: usize) -> usize {
+    (if s < 0 {
+        -s
+    } else if s >= n as i32 {
+        2 * n as i32 - 2 - s
+    } else {
+        s
+    }) as usize
+}
+
+/// Shared body of the two public smoothers: the five taps are accumulated in the original order
+/// (`0.0 + t0*k0 + t1*k1 + ...`, one f32 add per tap), so every output is bit-identical to the
+/// per-tap reflected loop. Pixels at least `2*spacing` away from both edges (where no tap is
+/// reflected and the dilated variant's `min` is a no-op) run as contiguous slice passes the
+/// compiler vectorizes lane by lane (same operations per lane, no re-association); the border
+/// keeps the original per-tap code.
+fn b3_smooth_impl(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    output: &mut [f32],
+    spacing: i32,
+    clamp: bool,
+) {
+    use rayon::prelude::*;
+    let sp = spacing as usize;
+    let margin = 2 * sp;
 
     let mut hpass = vec![0.0_f32; width * height];
 
-    // Horizontal pass with reflected boundary
+    // Horizontal pass
     hpass
         .par_chunks_mut(width)
         .enumerate()
         .for_each(|(y, row)| {
             let src = &data[y * width..(y + 1) * width];
-            for x in 0..width {
+            let edge = |x: usize| -> f32 {
                 let mut sum = 0.0_f32;
-                for (ki, &kv) in K.iter().enumerate() {
-                    let sx = x as i32 + (ki as i32 - 2) * spacing;
-                    let sx = if sx < 0 {
-                        -sx
-                    } else if sx >= width as i32 {
-                        2 * width as i32 - 2 - sx
-                    } else {
-                        sx
-                    } as usize;
-                    sum += src[sx.min(width - 1)] * kv;
+                for (ki, &kv) in B3_K.iter().enumerate() {
+                    let sx = b3_reflect(x as i32 + (ki as i32 - 2) * spacing, width);
+                    let sx = if clamp { sx.min(width - 1) } else { sx };
+                    sum += src[sx] * kv;
                 }
-                row[x] = sum;
+                sum
+            };
+            let (lo, hi) = if width > 2 * margin {
+                (margin, width - margin)
+            } else {
+                (width, width)
+            };
+            for x in 0..lo {
+                row[x] = edge(x);
+            }
+            if lo < hi {
+                let n = hi - lo;
+                let t0 = &src[lo - 2 * sp..][..n];
+                let t1 = &src[lo - sp..][..n];
+                let t2 = &src[lo..][..n];
+                let t3 = &src[lo + sp..][..n];
+                let t4 = &src[lo + 2 * sp..][..n];
+                let dst = &mut row[lo..hi];
+                for i in 0..n {
+                    let mut sum = 0.0_f32;
+                    sum += t0[i] * B3_K[0];
+                    sum += t1[i] * B3_K[1];
+                    sum += t2[i] * B3_K[2];
+                    sum += t3[i] * B3_K[3];
+                    sum += t4[i] * B3_K[4];
+                    dst[i] = sum;
+                }
+            }
+            for x in hi..width {
+                row[x] = edge(x);
             }
         });
 
-    // Vertical pass with reflected boundary
+    // Vertical pass
+    let hp = &hpass;
     output
         .par_chunks_mut(width)
         .enumerate()
         .for_each(|(y, row)| {
-            for x in 0..width {
-                let mut sum = 0.0_f32;
-                for (ki, &kv) in K.iter().enumerate() {
-                    let sy = y as i32 + (ki as i32 - 2) * spacing;
-                    let sy = if sy < 0 {
-                        -sy
-                    } else if sy >= height as i32 {
-                        2 * height as i32 - 2 - sy
-                    } else {
-                        sy
-                    } as usize;
-                    sum += hpass[sy.min(height - 1) * width + x] * kv;
+            if y >= margin && y + margin < height {
+                let r0 = &hp[(y - 2 * sp) * width..][..width];
+                let r1 = &hp[(y - sp) * width..][..width];
+                let r2 = &hp[y * width..][..width];
+                let r3 = &hp[(y + sp) * width..][..width];
+                let r4 = &hp[(y + 2 * sp) * width..][..width];
+                for x in 0..width {
+                    let mut sum = 0.0_f32;
+                    sum += r0[x] * B3_K[0];
+                    sum += r1[x] * B3_K[1];
+                    sum += r2[x] * B3_K[2];
+                    sum += r3[x] * B3_K[3];
+                    sum += r4[x] * B3_K[4];
+                    row[x] = sum;
                 }
-                row[x] = sum;
+            } else {
+                for x in 0..width {
+                    let mut sum = 0.0_f32;
+                    for (ki, &kv) in B3_K.iter().enumerate() {
+                        let sy = b3_reflect(y as i32 + (ki as i32 - 2) * spacing, height);
+                        let sy = if clamp { sy.min(height - 1) } else { sy };
+                        sum += hp[sy * width + x] * kv;
+                    }
+                    row[x] = sum;
+                }
             }
         });
+}
+
+#[cfg(test)]
+pub(crate) fn b3_spline_smooth_ref(data: &[f32], width: usize, height: usize, output: &mut [f32]) {
+    b3_smooth_reference(data, width, height, output, 1, false);
+}
+
+#[cfg(test)]
+pub(crate) fn b3_spline_smooth_dilated_ref(data: &[f32], width: usize, height: usize, output: &mut [f32], layer: usize) {
+    b3_smooth_reference(data, width, height, output, 1_i32 << (layer - 1), true);
+}
+
+#[cfg(test)]
+pub(crate) fn b3_smooth_reference(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    output: &mut [f32],
+    spacing: i32,
+    clamp: bool,
+) {
+    let mut hpass = vec![0.0_f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0_f32;
+            for (ki, &kv) in B3_K.iter().enumerate() {
+                let sx = b3_reflect(x as i32 + (ki as i32 - 2) * spacing, width);
+                let sx = if clamp { sx.min(width - 1) } else { sx };
+                sum += data[y * width + sx] * kv;
+            }
+            hpass[y * width + x] = sum;
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0_f32;
+            for (ki, &kv) in B3_K.iter().enumerate() {
+                let sy = b3_reflect(y as i32 + (ki as i32 - 2) * spacing, height);
+                let sy = if clamp { sy.min(height - 1) } else { sy };
+                sum += hpass[sy * width + x] * kv;
+            }
+            output[y * width + x] = sum;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -597,6 +659,49 @@ mod tests {
                 "Flat image should be preserved, got {}",
                 v
             );
+        }
+    }
+
+    #[test]
+    fn b3_smooth_is_bit_equal_to_the_per_tap_reference() {
+        // Deterministic xorshift data with non-finite values, several shapes (including ones
+        // narrower than the dilated margin) and every layer the noise estimator uses.
+        let mut st = 0x9E3779B97F4A7C15u64;
+        let mut rnd = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 40) as f32 / 16_777_216.0
+        };
+        for &(w, h) in &[(2usize, 2usize), (5, 7), (33, 20), (64, 65), (131, 97), (257, 140)] {
+            let mut data: Vec<f32> = (0..w * h).map(|_| rnd() * 60000.0 - 100.0).collect();
+            if w * h > 40 {
+                data[w * h / 3] = f32::NAN;
+                data[w * h / 2] = f32::INFINITY;
+                data[7] = -0.0;
+            }
+            for layer in 1..=6usize {
+                let spacing = 1_i32 << (layer - 1);
+                // the reflection of the largest dilations needs a plane wider than the tap reach
+                if layer > 1 && (spacing as usize * 2 >= w.min(h)) {
+                    continue;
+                }
+                let mut fast = vec![0.0_f32; w * h];
+                let mut slow = vec![0.0_f32; w * h];
+                if layer == 1 {
+                    if w < 3 || h < 3 {
+                        continue;
+                    }
+                    b3_spline_smooth(&data, w, h, &mut fast);
+                    b3_smooth_reference(&data, w, h, &mut slow, 1, false);
+                } else {
+                    b3_spline_smooth_dilated(&data, w, h, &mut fast, layer);
+                    b3_smooth_reference(&data, w, h, &mut slow, spacing, true);
+                }
+                for i in 0..w * h {
+                    assert_eq!(fast[i].to_bits(), slow[i].to_bits(), "{w}x{h} layer {layer} px {i}");
+                }
+            }
         }
     }
 }

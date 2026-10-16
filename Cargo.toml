@@ -60,3 +60,7 @@ jpeg-decoder = { version = "0.3", default-features = false }
 lto = true
 codegen-units = 1
 strip = true
+
+[[example]]
+name = "bg_bench"
+required-features = ["debug-pipeline"]
