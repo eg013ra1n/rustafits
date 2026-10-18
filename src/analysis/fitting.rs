@@ -1255,6 +1255,27 @@ impl<const NP: usize> NormalNeon<NP> {
         }
     }
 
+    /// Add one pixel from its four column pairs (`cols[k]` = `(j[2k], j[2k + 1])`): the lane arithmetic of [`Self::add`]
+    /// exactly, the broadcasts taken from the pairs themselves (`trn1` / `trn2` duplicate a lane) instead of from memory.
+    #[inline(always)]
+    fn add_cols(&mut self, cols: [std::arch::aarch64::float64x2_t; 4], r: f64) {
+        use std::arch::aarch64::{vaddq_f64, vdupq_n_f64, vmulq_f64, vtrn1q_f64, vtrn2q_f64};
+        // SAFETY: NEON is part of the aarch64 baseline; the intrinsics have no preconditions.
+        unsafe {
+            let rr = vdupq_n_f64(r);
+            for k in 0..4 {
+                self.jtr[k] = vaddq_f64(self.jtr[k], vmulq_f64(cols[k], rr));
+            }
+            for p in 0..NP {
+                let c = cols[p / 2];
+                let bp = if p % 2 == 0 { vtrn1q_f64(c, c) } else { vtrn2q_f64(c, c) };
+                for k in (p / 2)..4 {
+                    self.jtj[p][k] = vaddq_f64(self.jtj[p][k], vmulq_f64(bp, cols[k]));
+                }
+            }
+        }
+    }
+
     /// Write the upper triangle of `JᵀJ` (row-major, stride `NP`) and `Jᵀr`.
     fn write(&self, jtj: &mut [f64], jtr: &mut [f64]) {
         use std::arch::aarch64::vst1q_f64;
@@ -1289,6 +1310,138 @@ type NormalEq<const NP: usize> = NormalScalar<NP>;
 thread_local! {
     /// Jacobian passes the current thread's solver actually computed (the L2 reuse skips some).
     static JACOBIAN_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl ThetaColumn {
+    /// The factor `dq_dtheta` multiplies `2·u·v` by: `2.0 * u * v * factor` is `dq_dtheta(u, v, ..)` bit for bit (the value
+    /// the scalar expression computes inline on every call).
+    #[inline(always)]
+    fn factor(self, inv_ax2: f64, inv_ay2: f64) -> f64 {
+        match self {
+            ThetaColumn::Legacy => inv_ay2 - inv_ax2,
+            ThetaColumn::Corrected => inv_ax2 - inv_ay2,
+        }
+    }
+}
+
+/// The loop-invariant inputs of the point-model Jacobian columns at one parameter vector.
+#[derive(Clone, Copy)]
+struct PointColumns {
+    x0: f64,
+    y0: f64,
+    a: f64,
+    beta: f64,
+    cos_t: f64,
+    sin_t: f64,
+    inv_ax2: f64,
+    inv_ay2: f64,
+    ax3: f64,
+    ay3: f64,
+    theta_factor: f64,
+    beta_param: BetaParam,
+    theta_column: ThetaColumn,
+}
+
+impl PointColumns {
+    /// One pixel's Jacobian row `j[..NP]` (`j[7]` stays 0 at `NP = 7`) from the cached `power`: the expressions the solver
+    /// always evaluated, operand for operand.
+    #[inline(always)]
+    fn row<const NP: usize>(&self, px: &PixelSample, power: f64, j: &mut [f64; 8]) {
+        let dx = px.x - self.x0;
+        let dy = px.y - self.y0;
+        let u = dx * self.cos_t + dy * self.sin_t;
+        let v = -dx * self.sin_t + dy * self.cos_t;
+        let q = u * u * self.inv_ax2 + v * v * self.inv_ay2;
+        let base = 1.0 + q;
+
+        // Jacobian of M(x,y) = B + A × (1+Q)^(-β); `power` comes from the cost evaluation that accepted this parameter
+        // vector (or from the seeding call), the same expression at the same `params`.
+        j[0] = 1.0; // dM/dB
+        j[1] = power; // dM/dA
+
+        // (1+Q)^(-β-1) is (1+Q)^(-β) / (1+Q): one division in place of a second `powf`.
+        let dpower_dq = -self.beta * (power / base);
+        let a_dpq = self.a * dpower_dq;
+
+        let dq_dx0 = -2.0 * (self.cos_t * u * self.inv_ax2 - self.sin_t * v * self.inv_ay2);
+        j[2] = a_dpq * dq_dx0;
+
+        let dq_dy0 = -2.0 * (self.sin_t * u * self.inv_ax2 + self.cos_t * v * self.inv_ay2);
+        j[3] = a_dpq * dq_dy0;
+
+        j[4] = a_dpq * (-2.0 * u * u / self.ax3);
+        j[5] = a_dpq * (-2.0 * v * v / self.ay3);
+
+        let dq_dtheta = self.theta_column.dq_dtheta(u, v, self.inv_ax2, self.inv_ay2);
+        j[6] = a_dpq * dq_dtheta;
+
+        // The β column exists only when β is free — the one `ln` in the solver, and the reason the normal system is 8×8
+        // instead of 7×7.
+        if NP == 8 {
+            j[7] = self.beta_param.column(self.a * power, base, self.beta);
+        }
+    }
+
+    /// The Jacobian rows of TWO pixels at once, one NEON lane each: `cols[c]` = `(column c of px0, column c of px1)`. Every
+    /// lane runs the expression [`Self::row`] runs for its pixel, in the same operand order, with the same single
+    /// multiply / add / divide per step (`vdivq_f64` is the correctly rounded IEEE division like the scalar one); the one
+    /// libm call, the β column's `ln`, stays a scalar call per lane on exactly the arguments the scalar code gives it.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn row_pair<const NP: usize>(&self, px0: &PixelSample, px1: &PixelSample, power: [f64; 2]) -> [std::arch::aarch64::float64x2_t; 8] {
+        use std::arch::aarch64::{
+            float64x2_t, vaddq_f64, vdivq_f64, vdupq_n_f64, vgetq_lane_f64, vld1q_f64, vmulq_f64, vnegq_f64, vsubq_f64,
+        };
+        // SAFETY: NEON is part of the aarch64 baseline; every load reads a 2-element local array.
+        unsafe {
+            let xs = [px0.x, px1.x];
+            let ys = [px0.y, px1.y];
+            let pw = vld1q_f64(power.as_ptr());
+            let dx = vsubq_f64(vld1q_f64(xs.as_ptr()), vdupq_n_f64(self.x0));
+            let dy = vsubq_f64(vld1q_f64(ys.as_ptr()), vdupq_n_f64(self.y0));
+            let (cos_t, sin_t) = (vdupq_n_f64(self.cos_t), vdupq_n_f64(self.sin_t));
+            let (inv_ax2, inv_ay2) = (vdupq_n_f64(self.inv_ax2), vdupq_n_f64(self.inv_ay2));
+            let u = vaddq_f64(vmulq_f64(dx, cos_t), vmulq_f64(dy, sin_t));
+            let v = vaddq_f64(vmulq_f64(vnegq_f64(dx), sin_t), vmulq_f64(dy, cos_t));
+            let q = vaddq_f64(vmulq_f64(vmulq_f64(u, u), inv_ax2), vmulq_f64(vmulq_f64(v, v), inv_ay2));
+            let base = vaddq_f64(vdupq_n_f64(1.0), q);
+
+            let dpower_dq = vmulq_f64(vdupq_n_f64(-self.beta), vdivq_f64(pw, base));
+            let a_dpq = vmulq_f64(vdupq_n_f64(self.a), dpower_dq);
+
+            let m2 = vdupq_n_f64(-2.0);
+            let dq_dx0 = vmulq_f64(
+                m2,
+                vsubq_f64(vmulq_f64(vmulq_f64(cos_t, u), inv_ax2), vmulq_f64(vmulq_f64(sin_t, v), inv_ay2)),
+            );
+            let dq_dy0 = vmulq_f64(
+                m2,
+                vaddq_f64(vmulq_f64(vmulq_f64(sin_t, u), inv_ax2), vmulq_f64(vmulq_f64(cos_t, v), inv_ay2)),
+            );
+            let c4 = vmulq_f64(a_dpq, vdivq_f64(vmulq_f64(vmulq_f64(m2, u), u), vdupq_n_f64(self.ax3)));
+            let c5 = vmulq_f64(a_dpq, vdivq_f64(vmulq_f64(vmulq_f64(m2, v), v), vdupq_n_f64(self.ay3)));
+            let dq_dtheta = vmulq_f64(vmulq_f64(vmulq_f64(vdupq_n_f64(2.0), u), v), vdupq_n_f64(self.theta_factor));
+            let c7: float64x2_t = if NP == 8 {
+                let ap = vmulq_f64(vdupq_n_f64(self.a), pw);
+                let c0 = self.beta_param.column(vgetq_lane_f64::<0>(ap), vgetq_lane_f64::<0>(base), self.beta);
+                let c1 = self.beta_param.column(vgetq_lane_f64::<1>(ap), vgetq_lane_f64::<1>(base), self.beta);
+                let pair = [c0, c1];
+                vld1q_f64(pair.as_ptr())
+            } else {
+                vdupq_n_f64(0.0)
+            };
+            [
+                vdupq_n_f64(1.0),
+                pw,
+                vmulq_f64(a_dpq, dq_dx0),
+                vmulq_f64(a_dpq, dq_dy0),
+                c4,
+                c5,
+                vmulq_f64(a_dpq, dq_dtheta),
+                c7,
+            ]
+        }
+    }
 }
 
 /// One Jacobian / normal-equation pass at `params` over `pixels`, for `NP` free parameters (`NP = 7` at a fixed β,
@@ -1348,43 +1501,44 @@ fn jacobian_pass<const NP: usize>(
             acc.add(&j, r);
         }
     } else {
-        let ax3 = ax * ax * ax;
-        let ay3 = ay * ay * ay;
-        for ((px, &power), &r) in pixels.iter().zip(cur_power).zip(cur_resid) {
-            let dx = px.x - x0;
-            let dy = px.y - y0;
-            let u = dx * cos_t + dy * sin_t;
-            let v = -dx * sin_t + dy * cos_t;
-            let q = u * u * inv_ax2 + v * v * inv_ay2;
-            let base = 1.0 + q;
-
-            // Jacobian of M(x,y) = B + A × (1+Q)^(-β); `power` and `r` come from the cost evaluation that accepted
-            // this parameter vector (or from the seeding call), the same expressions at the same `params`.
-            j[0] = 1.0; // dM/dB
-            j[1] = power; // dM/dA
-
-            // (1+Q)^(-β-1) is (1+Q)^(-β) / (1+Q): one division in place of a second `powf`.
-            let dpower_dq = -beta * (power / base);
-            let a_dpq = a * dpower_dq;
-
-            let dq_dx0 = -2.0 * (cos_t * u * inv_ax2 - sin_t * v * inv_ay2);
-            j[2] = a_dpq * dq_dx0;
-
-            let dq_dy0 = -2.0 * (sin_t * u * inv_ax2 + cos_t * v * inv_ay2);
-            j[3] = a_dpq * dq_dy0;
-
-            j[4] = a_dpq * (-2.0 * u * u / ax3);
-            j[5] = a_dpq * (-2.0 * v * v / ay3);
-
-            let dq_dtheta = theta_column.dq_dtheta(u, v, inv_ax2, inv_ay2);
-            j[6] = a_dpq * dq_dtheta;
-
-            // The β column exists only when β is free — the one `ln` in the solver, and the reason the normal system
-            // is 8×8 instead of 7×7.
-            if NP == 8 {
-                j[7] = beta_param.column(a * power, base, beta);
+        let cols = PointColumns {
+            x0,
+            y0,
+            a,
+            beta,
+            cos_t,
+            sin_t,
+            inv_ax2,
+            inv_ay2,
+            ax3: ax * ax * ax,
+            ay3: ay * ay * ay,
+            theta_factor: theta_column.factor(inv_ax2, inv_ay2),
+            beta_param,
+            theta_column,
+        };
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::{vzip1q_f64, vzip2q_f64};
+            // Two pixels per step in NEON lanes, each pixel accumulated in its own order; an odd last pixel runs scalar.
+            let mut pxs = pixels.chunks_exact(2);
+            let mut pws = cur_power.chunks_exact(2);
+            let mut rs = cur_resid.chunks_exact(2);
+            for ((p2, w2), r2) in (&mut pxs).zip(&mut pws).zip(&mut rs) {
+                let c = cols.row_pair::<NP>(&p2[0], &p2[1], [w2[0], w2[1]]);
+                // SAFETY: NEON is part of the aarch64 baseline; the intrinsics have no preconditions.
+                unsafe {
+                    acc.add_cols([vzip1q_f64(c[0], c[1]), vzip1q_f64(c[2], c[3]), vzip1q_f64(c[4], c[5]), vzip1q_f64(c[6], c[7])], r2[0]);
+                    acc.add_cols([vzip2q_f64(c[0], c[1]), vzip2q_f64(c[2], c[3]), vzip2q_f64(c[4], c[5]), vzip2q_f64(c[6], c[7])], r2[1]);
+                }
             }
-
+            for ((px, &power), &r) in pxs.remainder().iter().zip(pws.remainder()).zip(rs.remainder()) {
+                cols.row::<NP>(px, power, &mut j);
+                acc.add(&j, r);
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        for ((px, &power), &r) in pixels.iter().zip(cur_power).zip(cur_resid) {
+            cols.row::<NP>(px, power, &mut j);
             acc.add(&j, r);
         }
     }
@@ -4025,5 +4179,119 @@ mod tests {
             assert_eq!(c[k].cost_passes, c[k].solves + c[k].accepted_steps + c[k].refused_cost);
             assert_eq!(c[k].pixel_histogram.iter().sum::<u64>(), c[k].solves);
         }
+    }
+
+    // ── S2b-2 (L3): the Jacobian column pass, two pixels per NEON step ────────────────────────────────────────────────
+
+    /// The two-lane column kernel against the scalar row, lane by lane, as bits: random parameters, stamps and cached
+    /// powers (and a few extremes: a zero and a subnormal power, a pixel on the centre), every β arm, both θ columns, both
+    /// parameter counts.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn s2b2_row_pair_matches_the_scalar_row_bit_for_bit() {
+        use std::arch::aarch64::vgetq_lane_f64;
+        fn check<const NP: usize>(k: &PointColumns, px: &[PixelSample], pw: &[f64]) -> usize {
+            let mut n = 0;
+            for i in (0..px.len() - 1).step_by(2) {
+                let c = k.row_pair::<NP>(&px[i], &px[i + 1], [pw[i], pw[i + 1]]);
+                for lane in 0..2 {
+                    let mut j = [0.0_f64; 8];
+                    k.row::<NP>(&px[i + lane], pw[i + lane], &mut j);
+                    for col in 0..8 {
+                        // SAFETY: NEON is part of the aarch64 baseline.
+                        let got = unsafe {
+                            if lane == 0 { vgetq_lane_f64::<0>(c[col]) } else { vgetq_lane_f64::<1>(c[col]) }
+                        };
+                        assert_eq!(got.to_bits(), j[col].to_bits(), "NP {NP} column {col} lane {lane} pixel {}", i + lane);
+                        n += 1;
+                    }
+                }
+            }
+            n
+        }
+        let mut st = 0xC0FF_EE12_3456_789A_u64;
+        let mut compared = 0_usize;
+        for round in 0..60 {
+            let theta = (s2b_rng(&mut st) - 0.5) * 6.4;
+            let (ax, ay) = (0.5 + 12.0 * s2b_rng(&mut st), 0.5 + 12.0 * s2b_rng(&mut st));
+            let (inv_ax2, inv_ay2) = (1.0 / (ax * ax), 1.0 / (ay * ay));
+            let px: Vec<PixelSample> = (0..64)
+                .map(|i| PixelSample {
+                    x: if i == 5 { 20.25 } else { 40.0 * s2b_rng(&mut st) },
+                    y: if i == 5 { 19.75 } else { 40.0 * s2b_rng(&mut st) },
+                    value: 0.0,
+                })
+                .collect();
+            let mut pw: Vec<f64> = (0..64).map(|_| 1e-6 + s2b_rng(&mut st)).collect();
+            pw[2] = 0.0;
+            pw[9] = 1e-310;
+            pw[10] = -0.0;
+            for beta_param in [BetaParam::Fixed(3.7), BetaParam::FreeLinear, BetaParam::FreeLn { ln_min: 1.5_f64.ln(), ln_max: 100.0_f64.ln() }] {
+                for theta_column in [ThetaColumn::Legacy, ThetaColumn::Corrected] {
+                    let beta = if round % 3 == 0 { 100.0 } else { 1.5 + 18.0 * s2b_rng(&mut st) };
+                    let k = PointColumns {
+                        x0: 20.25 + 0.1 * (s2b_rng(&mut st) - 0.5),
+                        y0: 19.75 + 0.1 * (s2b_rng(&mut st) - 0.5),
+                        a: 0.1 + 5000.0 * s2b_rng(&mut st),
+                        beta,
+                        cos_t: theta.cos(),
+                        sin_t: theta.sin(),
+                        inv_ax2,
+                        inv_ay2,
+                        ax3: ax * ax * ax,
+                        ay3: ay * ay * ay,
+                        theta_factor: theta_column.factor(inv_ax2, inv_ay2),
+                        beta_param,
+                        theta_column,
+                    };
+                    compared += check::<7>(&k, &px, &pw);
+                    compared += check::<8>(&k, &px, &pw);
+                }
+            }
+        }
+        assert!(compared > 100_000, "{compared} values compared");
+    }
+
+    /// `theta_factor` is the factor `dq_dtheta` multiplies by: `2.0 * u * v * factor` equals `dq_dtheta` as bits.
+    #[test]
+    fn s2b2_theta_factor_is_what_dq_dtheta_multiplies_by() {
+        let mut st = 0x1357_9BDF_2468_ACE0_u64;
+        for _ in 0..2000 {
+            let (u, v) = ((s2b_rng(&mut st) - 0.5) * 40.0, (s2b_rng(&mut st) - 0.5) * 40.0);
+            let (inv_ax2, inv_ay2) = (1.0 / (0.5 + 12.0 * s2b_rng(&mut st)).powi(2), 1.0 / (0.5 + 12.0 * s2b_rng(&mut st)).powi(2));
+            for t in [ThetaColumn::Legacy, ThetaColumn::Corrected] {
+                assert_eq!((2.0 * u * v * t.factor(inv_ax2, inv_ay2)).to_bits(), t.dq_dtheta(u, v, inv_ax2, inv_ay2).to_bits());
+            }
+        }
+    }
+
+    /// Every window size from 12 to 60 pixels (odd ones end on the scalar tail) through the whole solver, the saturation
+    /// verdict's free ln-beta arm and the fixed-beta one, against the pre-S2b solver: bits of params, flag, cost, iterations.
+    #[test]
+    fn s2b2_every_window_size_matches_the_pre_s2b_solver() {
+        let fixtures = fixture_stars();
+        let mut cases = 0_usize;
+        for f in fixtures.iter().take(12) {
+            for n in 12..=f.pixels.len().min(60) {
+                for (fixed_beta, ln) in [(Some(4.0), false), (None, true), (None, false)] {
+                    let init = moffat_init(f, fixed_beta);
+                    let beta_param = if ln {
+                        BetaParam::FreeLn { ln_min: 1.5_f64.ln(), ln_max: 100.0_f64.ln() }
+                    } else {
+                        BetaParam::fixed_or_linear(fixed_beta)
+                    };
+                    let mut start = init;
+                    if ln {
+                        start[7] = init[7].ln();
+                    }
+                    let (g, w) = (GuardedStep::UncountedBeforeFirstStep, ThetaColumn::Corrected);
+                    let want = s2b_run_pre(&f.pixels[..n], &start, beta_param, w, Sampling::Point, g);
+                    let got = s2b_run_new(&f.pixels[..n], &start, beta_param, w, Sampling::Point, g);
+                    assert_eq!(got, want, "{} n {n} ln {ln} {fixed_beta:?}", f.label);
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases >= 1000, "{cases} cases");
     }
 }
