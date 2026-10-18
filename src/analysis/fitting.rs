@@ -1337,6 +1337,7 @@ struct PointColumns {
     inv_ay2: f64,
     ax3: f64,
     ay3: f64,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     theta_factor: f64,
     beta_param: BetaParam,
     theta_column: ThetaColumn,
@@ -1521,8 +1522,9 @@ fn jacobian_pass<const NP: usize>(
             use std::arch::aarch64::{vzip1q_f64, vzip2q_f64};
             // Two pixels per step in NEON lanes, each pixel accumulated in its own order; an odd last pixel runs scalar.
             let mut pxs = pixels.chunks_exact(2);
-            let mut pws = cur_power.chunks_exact(2);
-            let mut rs = cur_resid.chunks_exact(2);
+            // Both caches are cut to `pixels.len()` so the three remainders always agree with the scalar path.
+            let mut pws = cur_power[..pixels.len()].chunks_exact(2);
+            let mut rs = cur_resid[..pixels.len()].chunks_exact(2);
             for ((p2, w2), r2) in (&mut pxs).zip(&mut pws).zip(&mut rs) {
                 let c = cols.row_pair::<NP>(&p2[0], &p2[1], [w2[0], w2[1]]);
                 // SAFETY: NEON is part of the aarch64 baseline; the intrinsics have no preconditions.
@@ -4244,12 +4246,64 @@ mod tests {
                         beta_param,
                         theta_column,
                     };
+                    // One pixel exactly on the centre: u = v = 0, base = 1, signed zeros in the columns.
+                    let px: Vec<PixelSample> = px
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| PixelSample { x: if i == 5 { k.x0 } else { p.x }, y: if i == 5 { k.y0 } else { p.y }, value: p.value })
+                        .collect();
                     compared += check::<7>(&k, &px, &pw);
                     compared += check::<8>(&k, &px, &pw);
                 }
             }
         }
         assert!(compared > 100_000, "{compared} values compared");
+    }
+
+    /// `add_cols` (the pair accumulator) against `add` (the memory-broadcast one): the same random rows through both,
+    /// every raw lane of `jtj` (the unread lower triangle included) and `jtr` compared as bits.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn s2b2_add_cols_matches_add_bit_for_bit() {
+        use std::arch::aarch64::{vgetq_lane_f64, vld1q_f64};
+        fn lanes(v: std::arch::aarch64::float64x2_t) -> [u64; 2] {
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe { [vgetq_lane_f64::<0>(v).to_bits(), vgetq_lane_f64::<1>(v).to_bits()] }
+        }
+        fn check<const NP: usize>(st: &mut u64) {
+            let mut a = NormalNeon::<NP>::new();
+            let mut b = NormalNeon::<NP>::new();
+            for i in 0..200 {
+                let mut j = [0.0_f64; 8];
+                for (c, v) in j.iter_mut().enumerate().take(NP) {
+                    *v = match (i + c) % 17 {
+                        0 => 0.0,
+                        1 => -0.0,
+                        2 => 1e-310,
+                        _ => (s2b_rng(st) - 0.5) * 50.0,
+                    };
+                }
+                let r = (s2b_rng(st) - 0.5) * 9.0;
+                // SAFETY: `j` holds 8 f64; NEON is baseline on aarch64.
+                let cols = unsafe {
+                    let p = j.as_ptr();
+                    [vld1q_f64(p), vld1q_f64(p.add(2)), vld1q_f64(p.add(4)), vld1q_f64(p.add(6))]
+                };
+                a.add(&j, r);
+                b.add_cols(cols, r);
+            }
+            for k in 0..4 {
+                assert_eq!(lanes(a.jtr[k]), lanes(b.jtr[k]), "NP {NP} jtr pair {k}");
+                for p in 0..8 {
+                    assert_eq!(lanes(a.jtj[p][k]), lanes(b.jtj[p][k]), "NP {NP} jtj row {p} pair {k}");
+                }
+            }
+        }
+        let mut st = 0x0DDB_A11C_AFE5_1234_u64;
+        for _ in 0..20 {
+            check::<7>(&mut st);
+            check::<8>(&mut st);
+        }
     }
 
     /// `theta_factor` is the factor `dq_dtheta` multiplies by: `2.0 * u * v * factor` equals `dq_dtheta` as bits.
