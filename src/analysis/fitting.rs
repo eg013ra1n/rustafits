@@ -1310,6 +1310,8 @@ fn jacobian_pass<const NP: usize>(
 ) {
     #[cfg(test)]
     JACOBIAN_PASSES.with(|c| c.set(c.get() + 1));
+    debug_assert_eq!(cur_resid.len(), pixels.len());
+    debug_assert_eq!(cur_power.len(), pixels.len() * sampling.per_pixel());
     debug_assert!(NP == if beta_param.is_free() { 8 } else { 7 });
     let theta = params[6];
     let (cos_t, sin_t) = (theta.cos(), theta.sin());
@@ -1433,7 +1435,9 @@ impl LmTally {
     }
 }
 
-/// Debug-only counters of the Moffat LM solves (feature `lm-counters`), process-wide, by parameter count: zero numeric
+/// Debug-only counters of the Moffat LM solves (feature `lm-counters`), process-wide, by parameter count only (np 7 =
+/// every fixed-beta solve, np 8 = every free-beta solve: the verdict fit, the integrated beta sample, point and
+/// integrated sampling and every OSC plane merge in one row; key by `(np, integrated)` if a later task sizes per stage): zero numeric
 /// effect, relaxed atomics added once per solve. They size the next lever: how many iterations a solve runs, how many
 /// steps are refused, how many Jacobian / cost passes and pixels it spends.
 #[cfg(feature = "lm-counters")]
@@ -1604,6 +1608,26 @@ fn lm_solve_moffat_with(
         iters += 1;
         if jacobian_valid {
             tally.jacobian(true);
+            // L2 check: the reused system is exactly what a fresh pass at these params would build (the pass counter
+            // is restored so the reuse tests still count real passes only).
+            #[cfg(test)]
+            {
+                let passes = JACOBIAN_PASSES.with(|c| c.get());
+                let mut fj = [0.0_f64; MAX_LM_PARAMS * MAX_LM_PARAMS];
+                let mut fr = [0.0_f64; MAX_LM_PARAMS];
+                if np == 8 {
+                    jacobian_pass::<8>(pixels, params, beta_param, theta_column, sampling, cur_power, cur_resid, &mut fj, &mut fr);
+                } else {
+                    jacobian_pass::<7>(pixels, params, beta_param, theta_column, sampling, cur_power, cur_resid, &mut fj, &mut fr);
+                }
+                JACOBIAN_PASSES.with(|c| c.set(passes));
+                for p in 0..np {
+                    assert_eq!(jtr[p].to_bits(), fr[p].to_bits(), "reused jtr[{p}]");
+                    for q in p..np {
+                        assert_eq!(jtj[p * np + q].to_bits(), fj[p * np + q].to_bits(), "reused jtj[{p}][{q}]");
+                    }
+                }
+            }
         } else {
             tally.jacobian(false);
             if np == 8 {
@@ -3912,7 +3936,25 @@ mod tests {
                 cases += 1;
             }
         }
-        assert!(cases >= 240, "{cases} cases");
+        // the censored saturation start (B = 0, A = 1, round at the star's own width, beta 3): the longest guard-refusal
+        // runs before the first step, so the heaviest Jacobian reuse
+        let (kept, _) = censored_star();
+        let sigma = 2.5 / 2.354_820_045;
+        let ln_arm = BetaParam::FreeLn { ln_min: 1.5_f64.ln(), ln_max: 100.0_f64.ln() };
+        for (beta_param, b0, integrated) in [
+            (BetaParam::Fixed(2.5), 2.5, false),
+            (ln_arm, 3.0_f64.ln(), false),
+            (ln_arm, 3.0_f64.ln(), true),
+        ] {
+            let start = [0.0, 1.0, 0.0, 0.0, sigma, sigma, 0.0, b0];
+            let sampling = if integrated { Sampling::Integrated(&offsets) } else { Sampling::Point };
+            let guard = GuardedStep::UncountedBeforeFirstStep;
+            let want = s2b_run_pre(&kept, &start, beta_param, ThetaColumn::Corrected, sampling, guard);
+            let got = s2b_run_new(&kept, &start, beta_param, ThetaColumn::Corrected, sampling, guard);
+            assert_eq!(got, want, "censored {beta_param:?} integrated {integrated}");
+            cases += 1;
+        }
+        assert!(cases >= 243, "{cases} cases");
     }
 
     /// A refused step leaves the parameters where they were, so the next iteration reuses the Jacobian pass instead of
@@ -3948,11 +3990,12 @@ mod tests {
     }
 
     /// The debug counters' invariants on real solves (feature `lm-counters`; the totals are process-wide, so run it alone:
-    /// `cargo test --lib --features lm-counters s2b_counters -- --test-threads=1`): every iteration is a Jacobian pass computed
+    /// `cargo test --lib --features lm-counters s2b_counters -- --ignored --test-threads=1`): every iteration is a Jacobian pass computed
     /// or reused, every cost pass beyond the seeding one belongs to a step the guard let through (accepted or refused on cost),
     /// and the counters change no bits.
     #[cfg(feature = "lm-counters")]
     #[test]
+    #[ignore = "process-wide totals: run alone with --ignored --test-threads=1"]
     fn s2b_counters_obey_their_invariants_and_change_nothing() {
         use lm_counters::{lm_counters, lm_counters_reset};
         let fixtures = fixture_stars();
