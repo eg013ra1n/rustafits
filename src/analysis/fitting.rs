@@ -1164,6 +1164,374 @@ fn lm_solve_moffat_impl(
     })
 }
 
+// ── The Jacobian / normal-equation pass (S2b-1) ─────────────────────────────────────────────────────────────────
+//
+// One pass per LM iteration builds `JᵀJ` (upper triangle) and `Jᵀr` over every pixel. It used to run on heap `Vec`s with
+// a runtime parameter count: each accumulation was a load, a multiply, a load, an add and a store plus index
+// arithmetic. It now runs per parameter count (7 at a fixed β, 8 at a free one — the only two the solvers build) on
+// fixed-size locals, the accumulators in registers.
+//
+// The contract is bit identity: every accumulator is the same left-to-right sum over the pixels in their order, each
+// term the same single multiply (`j[p] * j[q]`, `j[p] * r`) added to the running value — a separate multiply and add, never a
+// fused one — in `f64`. Widening the work across ACCUMULATORS (the NEON lanes below) changes none of that: a lane is one
+// accumulator's own multiply and add.
+
+/// Scalar accumulators for `NP` parameters: the loop the solver always ran, on fixed-size arrays. The portable path and
+/// the oracle the vector path is tested against.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+struct NormalScalar<const NP: usize> {
+    jtj: [[f64; 8]; 8],
+    jtr: [f64; 8],
+}
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+impl<const NP: usize> NormalScalar<NP> {
+    #[inline(always)]
+    fn new() -> Self {
+        Self { jtj: [[0.0; 8]; 8], jtr: [0.0; 8] }
+    }
+
+    /// Add one pixel's Jacobian row `j` and residual `r`.
+    #[inline(always)]
+    fn add(&mut self, j: &[f64; 8], r: f64) {
+        for p in 0..NP {
+            self.jtr[p] += j[p] * r;
+            for q in p..NP {
+                self.jtj[p][q] += j[p] * j[q];
+            }
+        }
+    }
+
+    /// Write the upper triangle of `JᵀJ` (row-major, stride `NP`) and `Jᵀr`.
+    fn write(&self, jtj: &mut [f64], jtr: &mut [f64]) {
+        for p in 0..NP {
+            jtr[p] = self.jtr[p];
+            for q in p..NP {
+                jtj[p * NP + q] = self.jtj[p][q];
+            }
+        }
+    }
+}
+
+/// NEON accumulators: the same sums with two independent accumulators per vector register. Row `p` of `JᵀJ` holds the
+/// column pairs `(2k, 2k + 1)` for `k ≥ p / 2`; for odd `p` the first pair also carries the below-diagonal column
+/// `p − 1`, a product nobody reads (the lower triangle is filled from the upper afterwards). Every lane is one
+/// accumulator's own `acc + (j[p] * j[q])` — `vmulq_f64` then `vaddq_f64`, which the compiler does not fuse.
+#[cfg(target_arch = "aarch64")]
+struct NormalNeon<const NP: usize> {
+    jtj: [[std::arch::aarch64::float64x2_t; 4]; 8],
+    jtr: [std::arch::aarch64::float64x2_t; 4],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl<const NP: usize> NormalNeon<NP> {
+    #[inline(always)]
+    fn new() -> Self {
+        use std::arch::aarch64::vdupq_n_f64;
+        // SAFETY: NEON is part of the aarch64 baseline; the intrinsic has no preconditions.
+        unsafe {
+            let z = vdupq_n_f64(0.0);
+            Self { jtj: [[z; 4]; 8], jtr: [z; 4] }
+        }
+    }
+
+    #[inline(always)]
+    fn add(&mut self, j: &[f64; 8], r: f64) {
+        use std::arch::aarch64::{vaddq_f64, vdupq_n_f64, vld1q_f64, vmulq_f64};
+        // SAFETY: `j` holds 8 f64, the four loads read its 2-element pairs; NEON is baseline on aarch64.
+        unsafe {
+            let jp = j.as_ptr();
+            let jv = [vld1q_f64(jp), vld1q_f64(jp.add(2)), vld1q_f64(jp.add(4)), vld1q_f64(jp.add(6))];
+            let rr = vdupq_n_f64(r);
+            for k in 0..4 {
+                self.jtr[k] = vaddq_f64(self.jtr[k], vmulq_f64(jv[k], rr));
+            }
+            for p in 0..NP {
+                let bp = vdupq_n_f64(j[p]);
+                for k in (p / 2)..4 {
+                    self.jtj[p][k] = vaddq_f64(self.jtj[p][k], vmulq_f64(bp, jv[k]));
+                }
+            }
+        }
+    }
+
+    /// Write the upper triangle of `JᵀJ` (row-major, stride `NP`) and `Jᵀr`.
+    fn write(&self, jtj: &mut [f64], jtr: &mut [f64]) {
+        use std::arch::aarch64::vst1q_f64;
+        let mut rows = [[0.0_f64; 8]; 8];
+        let mut tr = [0.0_f64; 8];
+        // SAFETY: each store writes two f64 inside the 8-element rows; NEON is baseline on aarch64.
+        unsafe {
+            for k in 0..4 {
+                vst1q_f64(tr.as_mut_ptr().add(2 * k), self.jtr[k]);
+                for (p, row) in rows.iter_mut().enumerate() {
+                    if k >= p / 2 {
+                        vst1q_f64(row.as_mut_ptr().add(2 * k), self.jtj[p][k]);
+                    }
+                }
+            }
+        }
+        for p in 0..NP {
+            jtr[p] = tr[p];
+            for q in p..NP {
+                jtj[p * NP + q] = rows[p][q];
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+type NormalEq<const NP: usize> = NormalNeon<NP>;
+#[cfg(not(target_arch = "aarch64"))]
+type NormalEq<const NP: usize> = NormalScalar<NP>;
+
+#[cfg(test)]
+thread_local! {
+    /// Jacobian passes the current thread's solver actually computed (the L2 reuse skips some).
+    static JACOBIAN_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One Jacobian / normal-equation pass at `params` over `pixels`, for `NP` free parameters (`NP = 7` at a fixed β,
+/// `8` at a free one): the upper triangle of `JᵀJ` into `jtj[p * NP + q]` (`q ≥ p`) and `Jᵀr` into `jtr`. `cur_power` /
+/// `cur_resid` are the cost evaluation's cache for exactly these `params`. The Jacobian columns are the expressions
+/// the solver always evaluated, operand for operand.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn jacobian_pass<const NP: usize>(
+    pixels: &[PixelSample],
+    params: &[f64],
+    beta_param: BetaParam,
+    theta_column: ThetaColumn,
+    sampling: Sampling<'_>,
+    cur_power: &[f64],
+    cur_resid: &[f64],
+    jtj: &mut [f64],
+    jtr: &mut [f64],
+) {
+    #[cfg(test)]
+    JACOBIAN_PASSES.with(|c| c.set(c.get() + 1));
+    debug_assert!(NP == if beta_param.is_free() { 8 } else { 7 });
+    let theta = params[6];
+    let (cos_t, sin_t) = (theta.cos(), theta.sin());
+    let ax = params[4];
+    let ay = params[5];
+    let beta = match beta_param {
+        BetaParam::Fixed(b) => b,
+        BetaParam::FreeLinear | BetaParam::FreeLn { .. } => beta_param.beta(params[7]),
+    };
+    let inv_ax2 = 1.0 / (ax * ax);
+    let inv_ay2 = 1.0 / (ay * ay);
+    let (x0, y0, a) = (params[2], params[3], params[1]);
+    let mut acc = NormalEq::<NP>::new();
+    let mut j = [0.0_f64; 8];
+
+    if let Sampling::Integrated(offsets) = sampling {
+        let kk = sampling.per_pixel();
+        let row = MoffatRow {
+            x0,
+            y0,
+            a,
+            ax,
+            ay,
+            cos_t,
+            sin_t,
+            inv_ax2,
+            inv_ay2,
+            beta,
+            beta_param,
+            theta_column,
+        };
+        for ((px, powers), &r) in pixels.iter().zip(cur_power.chunks_exact(kk)).zip(cur_resid) {
+            row.integrated(px, offsets, powers, &mut j[..NP]);
+            acc.add(&j, r);
+        }
+    } else {
+        let ax3 = ax * ax * ax;
+        let ay3 = ay * ay * ay;
+        for ((px, &power), &r) in pixels.iter().zip(cur_power).zip(cur_resid) {
+            let dx = px.x - x0;
+            let dy = px.y - y0;
+            let u = dx * cos_t + dy * sin_t;
+            let v = -dx * sin_t + dy * cos_t;
+            let q = u * u * inv_ax2 + v * v * inv_ay2;
+            let base = 1.0 + q;
+
+            // Jacobian of M(x,y) = B + A × (1+Q)^(-β); `power` and `r` come from the cost evaluation that accepted
+            // this parameter vector (or from the seeding call), the same expressions at the same `params`.
+            j[0] = 1.0; // dM/dB
+            j[1] = power; // dM/dA
+
+            // (1+Q)^(-β-1) is (1+Q)^(-β) / (1+Q): one division in place of a second `powf`.
+            let dpower_dq = -beta * (power / base);
+            let a_dpq = a * dpower_dq;
+
+            let dq_dx0 = -2.0 * (cos_t * u * inv_ax2 - sin_t * v * inv_ay2);
+            j[2] = a_dpq * dq_dx0;
+
+            let dq_dy0 = -2.0 * (sin_t * u * inv_ax2 + cos_t * v * inv_ay2);
+            j[3] = a_dpq * dq_dy0;
+
+            j[4] = a_dpq * (-2.0 * u * u / ax3);
+            j[5] = a_dpq * (-2.0 * v * v / ay3);
+
+            let dq_dtheta = theta_column.dq_dtheta(u, v, inv_ax2, inv_ay2);
+            j[6] = a_dpq * dq_dtheta;
+
+            // The β column exists only when β is free — the one `ln` in the solver, and the reason the normal system
+            // is 8×8 instead of 7×7.
+            if NP == 8 {
+                j[7] = beta_param.column(a * power, base, beta);
+            }
+
+            acc.add(&j, r);
+        }
+    }
+    acc.write(jtj, jtr);
+}
+
+/// What one LM solve did, tallied for the debug-only counters (feature `lm-counters`); a zero-sized no-op without it,
+/// so the release build runs exactly the code it ran before.
+#[derive(Default)]
+struct LmTally {
+    #[cfg(feature = "lm-counters")]
+    t: lm_counters::SolveTally,
+}
+
+impl LmTally {
+    /// One Jacobian pass: computed, or (`reused`) skipped because the parameters had not moved.
+    #[inline(always)]
+    fn jacobian(&mut self, _reused: bool) {
+        #[cfg(feature = "lm-counters")]
+        if _reused { self.t.jacobian_reused += 1 } else { self.t.jacobian_passes += 1 }
+    }
+
+    /// One cost pass (the seeding one, or a trial step's).
+    #[inline(always)]
+    fn cost_pass(&mut self) {
+        #[cfg(feature = "lm-counters")]
+        { self.t.cost_passes += 1 }
+    }
+
+    /// A refused step: by the step guard (`guard`), or because the cost did not improve.
+    #[inline(always)]
+    fn refused(&mut self, _guard: bool) {
+        #[cfg(feature = "lm-counters")]
+        if _guard { self.t.refused_guard += 1 } else { self.t.refused_cost += 1 }
+    }
+
+    #[inline(always)]
+    fn accepted(&mut self) {
+        #[cfg(feature = "lm-counters")]
+        { self.t.accepted += 1 }
+    }
+
+    /// The solve ended: add it to the process-wide totals (`np` free parameters, `n` pixels, `iters` iterations).
+    #[inline(always)]
+    fn finish(self, _np: usize, _n: usize, _iters: usize) {
+        #[cfg(feature = "lm-counters")]
+        lm_counters::record(_np, _n, _iters, &self.t);
+    }
+}
+
+/// Debug-only counters of the Moffat LM solves (feature `lm-counters`), process-wide, by parameter count: zero numeric
+/// effect, relaxed atomics added once per solve. They size the next lever: how many iterations a solve runs, how many
+/// steps are refused, how many Jacobian / cost passes and pixels it spends.
+#[cfg(feature = "lm-counters")]
+pub mod lm_counters {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Window-size buckets of the pixels-per-solve histogram: ≤ 32, ≤ 64, ≤ 128, ≤ 256, ≤ 512, ≤ 1024, ≤ 2048, more.
+    pub const PIXEL_BUCKETS: usize = 8;
+    const FIELDS: usize = 9 + PIXEL_BUCKETS;
+
+    /// One solve's tally (the solver fills it, `record` adds it to the totals).
+    #[derive(Default)]
+    pub struct SolveTally {
+        pub accepted: u64,
+        pub refused_guard: u64,
+        pub refused_cost: u64,
+        pub jacobian_passes: u64,
+        pub jacobian_reused: u64,
+        pub cost_passes: u64,
+    }
+
+    /// The totals of every solve with one parameter count (`np = 7` fixed β, `8` free β).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct LmSolveCounters {
+        pub solves: u64,
+        pub iterations: u64,
+        pub accepted_steps: u64,
+        pub refused_guard: u64,
+        pub refused_cost: u64,
+        /// Jacobian passes computed / skipped because the parameters had not moved.
+        pub jacobian_passes: u64,
+        pub jacobian_reused: u64,
+        pub cost_passes: u64,
+        /// Σ over solves of the window's pixel count.
+        pub pixels: u64,
+        /// Solves by window size, buckets as [`PIXEL_BUCKETS`].
+        pub pixel_histogram: [u64; PIXEL_BUCKETS],
+    }
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU64 = AtomicU64::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ROW: [AtomicU64; FIELDS] = [Z; FIELDS];
+    static TOTALS: [[AtomicU64; FIELDS]; 2] = [ROW; 2];
+
+    pub(super) fn record(np: usize, n: usize, iters: usize, t: &SolveTally) {
+        let row = &TOTALS[usize::from(np == 8)];
+        let bucket = [32, 64, 128, 256, 512, 1024, 2048].iter().position(|&b| n <= b).unwrap_or(PIXEL_BUCKETS - 1);
+        for (k, v) in [
+            1,
+            iters as u64,
+            t.accepted,
+            t.refused_guard,
+            t.refused_cost,
+            t.jacobian_passes,
+            t.jacobian_reused,
+            t.cost_passes,
+            n as u64,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            row[k].fetch_add(v, Relaxed);
+        }
+        row[9 + bucket].fetch_add(1, Relaxed);
+    }
+
+    /// The totals so far: `[fixed β (np 7), free β (np 8)]`.
+    pub fn lm_counters() -> [LmSolveCounters; 2] {
+        let mut out = [LmSolveCounters::default(); 2];
+        for (o, row) in out.iter_mut().zip(&TOTALS) {
+            let g = |k: usize| row[k].load(Relaxed);
+            *o = LmSolveCounters {
+                solves: g(0),
+                iterations: g(1),
+                accepted_steps: g(2),
+                refused_guard: g(3),
+                refused_cost: g(4),
+                jacobian_passes: g(5),
+                jacobian_reused: g(6),
+                cost_passes: g(7),
+                pixels: g(8),
+                pixel_histogram: std::array::from_fn(|b| g(9 + b)),
+            };
+        }
+        out
+    }
+
+    /// Zero the totals.
+    pub fn lm_counters_reset() {
+        for row in &TOTALS {
+            for c in row {
+                c.store(0, Relaxed);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lm_solve_moffat_with(
     pixels: &[PixelSample],
@@ -1218,115 +1586,42 @@ fn lm_solve_moffat_with(
     // Whether the solve has accepted a step (`GuardedStep::UncountedBeforeFirstStep`).
     let mut moved = false;
 
-    let mut jtj = vec![0.0_f64; np * np];
-    let mut jtr = vec![0.0_f64; np];
-    let mut j = vec![0.0_f64; np];
-    let mut mat = vec![0.0_f64; np * np];
+    let mut jtj = [0.0_f64; MAX_LM_PARAMS * MAX_LM_PARAMS];
+    let mut jtr = [0.0_f64; MAX_LM_PARAMS];
+    let mut mat = [0.0_f64; MAX_LM_PARAMS * MAX_LM_PARAMS];
     let mut new_params = [0.0_f64; 8];
     let mut chol_l = [0.0_f64; MAX_LM_PARAMS * MAX_LM_PARAMS];
     let mut chol_y = [0.0_f64; MAX_LM_PARAMS];
     let mut delta_buf = [0.0_f64; MAX_LM_PARAMS];
     let mut iters = 0_usize;
+    // Whether `jtj` / `jtr` describe the current `params` (L2). A refused step leaves `params`, and with them the
+    // cached per-sample power and residual, untouched, so the next iteration's pass would rebuild the same bits.
+    let mut jacobian_valid = false;
+    let mut tally = LmTally::default();
+    tally.cost_pass();
 
     for _ in 0..max_iter {
         iters += 1;
-        jtj.fill(0.0);
-        jtr.fill(0.0);
-
-        let theta = params[6];
-        let (cos_t, sin_t) = (theta.cos(), theta.sin());
-        let ax = params[4];
-        let ay = params[5];
-        let beta = match beta_param {
-            BetaParam::Fixed(b) => b,
-            BetaParam::FreeLinear | BetaParam::FreeLn { .. } => beta_param.beta(params[7]),
-        };
-        let inv_ax2 = 1.0 / (ax * ax);
-        let inv_ay2 = 1.0 / (ay * ay);
-        let row = MoffatRow {
-            x0: params[2],
-            y0: params[3],
-            a: params[1],
-            ax,
-            ay,
-            cos_t,
-            sin_t,
-            inv_ax2,
-            inv_ay2,
-            beta,
-            beta_param,
-            theta_column,
-        };
-
-        for (i, px) in pixels.iter().enumerate() {
-            if let Sampling::Integrated(offsets) = sampling {
-                let r = cur_resid[i];
-                row.integrated(px, offsets, &cur_power[i * kk..(i + 1) * kk], &mut j);
-                for p in 0..np {
-                    jtr[p] += j[p] * r;
-                    for q in p..np {
-                        jtj[p * np + q] += j[p] * j[q];
-                    }
-                }
-                continue;
+        if jacobian_valid {
+            tally.jacobian(true);
+        } else {
+            tally.jacobian(false);
+            if np == 8 {
+                jacobian_pass::<8>(pixels, params, beta_param, theta_column, sampling, cur_power, cur_resid, &mut jtj, &mut jtr);
+            } else {
+                jacobian_pass::<7>(pixels, params, beta_param, theta_column, sampling, cur_power, cur_resid, &mut jtj, &mut jtr);
             }
-            let dx = px.x - params[2];
-            let dy = px.y - params[3];
-            let u = dx * cos_t + dy * sin_t;
-            let v = -dx * sin_t + dy * cos_t;
-            let q = u * u * inv_ax2 + v * v * inv_ay2;
-            let base = 1.0 + q;
-            // Both come from the cost evaluation that accepted this parameter
-            // vector (or, on the first pass, from the seeding call above) —
-            // the same expressions, at the same `params`, so the value is the
-            // one this loop used to recompute.
-            let power = cur_power[i];
-            let r = cur_resid[i];
-
-            // Jacobian of M(x,y) = B + A × (1+Q)^(-β)
-            j[0] = 1.0; // dM/dB
-            j[1] = power; // dM/dA
-
-            // (1+Q)^(-β-1) is (1+Q)^(-β) / (1+Q): one division in place of a
-            // second `powf`.
-            let dpower_dq = -beta * (power / base);
-            let a_dpq = params[1] * dpower_dq;
-
-            let dq_dx0 = -2.0 * (cos_t * u * inv_ax2 - sin_t * v * inv_ay2);
-            j[2] = a_dpq * dq_dx0;
-
-            let dq_dy0 = -2.0 * (sin_t * u * inv_ax2 + cos_t * v * inv_ay2);
-            j[3] = a_dpq * dq_dy0;
-
-            j[4] = a_dpq * (-2.0 * u * u / (ax * ax * ax));
-            j[5] = a_dpq * (-2.0 * v * v / (ay * ay * ay));
-
-            let dq_dtheta = theta_column.dq_dtheta(u, v, inv_ax2, inv_ay2);
-            j[6] = a_dpq * dq_dtheta;
-
-            // Only include the β column when β is free — the one `ln` in the
-            // solver, and the reason the normal system is 8×8 instead of 7×7.
-            if beta_param.is_free() {
-                j[7] = beta_param.column(params[1] * power, base, beta);
-            }
-
+            // Fill symmetric lower triangle
             for p in 0..np {
-                jtr[p] += j[p] * r;
-                for q in p..np {
-                    jtj[p * np + q] += j[p] * j[q];
+                for q in 0..p {
+                    jtj[p * np + q] = jtj[q * np + p];
                 }
             }
-        }
-
-        // Fill symmetric lower triangle
-        for p in 0..np {
-            for q in 0..p {
-                jtj[p * np + q] = jtj[q * np + p];
-            }
+            jacobian_valid = true;
         }
 
         // Damped normal equations
-        mat[..np * np].copy_from_slice(&jtj);
+        mat[..np * np].copy_from_slice(&jtj[..np * np]);
         for p in 0..np {
             mat[p * np + p] += lambda * jtj[p * np + p].max(1e-12);
         }
@@ -1334,7 +1629,7 @@ fn lm_solve_moffat_with(
         let solved = {
             let mut ok = cholesky_solve_into(
                 &mat[..np * np],
-                &jtr,
+                &jtr[..np],
                 np,
                 &mut chol_l,
                 &mut chol_y,
@@ -1348,7 +1643,7 @@ fn lm_solve_moffat_with(
                     }
                     ok = cholesky_solve_into(
                         &mat[..np * np],
-                        &jtr,
+                        &jtr[..np],
                         np,
                         &mut chol_l,
                         &mut chol_y,
@@ -1386,6 +1681,7 @@ fn lm_solve_moffat_with(
         {
             lambda *= nu;
             nu *= 2.0;
+            tally.refused(true);
             // Before the first accepted step a refusal only shortens the next step (`GuardedStep`).
             if guarded_step == GuardedStep::Counted || moved {
                 consecutive_rejects += 1;
@@ -1405,6 +1701,7 @@ fn lm_solve_moffat_with(
             cand_power,
             cand_resid,
         );
+        tally.cost_pass();
 
         let predicted: f64 = delta
             .iter()
@@ -1418,6 +1715,8 @@ fn lm_solve_moffat_with(
             let rho = (best_cost - new_cost) / predicted;
             if rho > 0.0 {
                 params[..8].copy_from_slice(&new_params[..8]);
+                jacobian_valid = false;
+                tally.accepted();
                 best_cost = new_cost;
                 // The candidate became `params`, so its per-sample state
                 // becomes the cache the next Jacobian pass reads.
@@ -1429,6 +1728,7 @@ fn lm_solve_moffat_with(
                 moved = true;
                 consecutive_rejects = 0;
             } else {
+                tally.refused(false);
                 lambda *= nu;
                 nu *= 2.0;
                 consecutive_rejects += 1;
@@ -1437,6 +1737,7 @@ fn lm_solve_moffat_with(
                 }
             }
         } else {
+            tally.refused(false);
             lambda *= nu;
             nu *= 2.0;
             consecutive_rejects += 1;
@@ -1460,6 +1761,7 @@ fn lm_solve_moffat_with(
         }
     }
 
+    tally.finish(np, n, iters);
     LmResult {
         converged,
         final_cost: best_cost,
@@ -3163,5 +3465,518 @@ mod tests {
             .expect("a start that is the fit is a fit");
         assert!(r.converged && r.a == 1.0 && r.alpha_x == alpha && r.x0 == 0.0, "{}", show(&r));
     }
-}
 
+    // ── S2b-1: the Jacobian / normal-equation pass, bit for bit ─────────────────────────────────────────────────────
+
+    /// The solver as it ran before the normal-equation pass was monomorphized (heap `Vec` accumulators with a runtime
+    /// parameter count, a Jacobian pass every iteration): the oracle the new solver is compared with, `to_bits`.
+    #[allow(clippy::too_many_arguments)]
+    fn lm_solve_moffat_with_pre_s2b(
+        pixels: &[PixelSample],
+        params: &mut [f64],
+        beta_param: BetaParam,
+        max_iter: usize,
+        conv_tol: f64,
+        max_rejects: usize,
+        theta_column: ThetaColumn,
+        sampling: Sampling<'_>,
+        guarded_step: GuardedStep,
+        scratch: &mut MoffatScratch,
+    ) -> LmResult {
+        // The reuse seam's contract: `residual_cost_moffat_into` resolves its
+        // exponent from `beta_param.beta(params[7])`, while the Jacobian pass
+        // below takes the fixed β itself for `Fixed(b)` — a cached `power` is the
+        // value the Jacobian wants only while those two agree. They do by
+        // construction (`solve_moffat_2d` seeds `params[7] = beta_init = b`, and
+        // `np = 7` keeps `delta` from ever reaching index 7), but that is a
+        // cross-function rule, so state it rather than leave it unwritten.
+        debug_assert!(
+            match beta_param {
+                BetaParam::Fixed(b) => params[7] == b,
+                BetaParam::FreeLinear | BetaParam::FreeLn { .. } => true,
+            },
+            "a fixed-beta solve must carry its beta in params[7]: {} != {beta_param:?}",
+            params[7]
+        );
+        let np = if beta_param.is_free() { 8 } else { 7 };
+        let n = pixels.len();
+        // One cached power per model evaluation: per pixel, or per sub-sample.
+        let kk = sampling.per_pixel();
+        let n_power = n * kk;
+        scratch.reserve_exact_len(n_power, n);
+        let MoffatScratch {
+            cur_power,
+            cur_resid,
+            cand_power,
+            cand_resid,
+        } = scratch;
+        let (mut cur_power, mut cur_resid) = (&mut cur_power[..n_power], &mut cur_resid[..n]);
+        let (mut cand_power, mut cand_resid) = (&mut cand_power[..n_power], &mut cand_resid[..n]);
+    
+        let mut lambda = 1e-3_f64;
+        let mut nu = 2.0_f64;
+        // Seeds the cache: `cur_*` describe `params` from here on.
+        let mut best_cost =
+            residual_cost_moffat_into(pixels, params, beta_param, sampling, cur_power, cur_resid);
+        let mut prev_cost: f64;
+        let mut converged = false;
+        let mut consecutive_rejects: usize = 0;
+        // Whether the solve has accepted a step (`GuardedStep::UncountedBeforeFirstStep`).
+        let mut moved = false;
+    
+        let mut jtj = vec![0.0_f64; np * np];
+        let mut jtr = vec![0.0_f64; np];
+        let mut j = vec![0.0_f64; np];
+        let mut mat = vec![0.0_f64; np * np];
+        let mut new_params = [0.0_f64; 8];
+        let mut chol_l = [0.0_f64; MAX_LM_PARAMS * MAX_LM_PARAMS];
+        let mut chol_y = [0.0_f64; MAX_LM_PARAMS];
+        let mut delta_buf = [0.0_f64; MAX_LM_PARAMS];
+        let mut iters = 0_usize;
+    
+        for _ in 0..max_iter {
+            iters += 1;
+            jtj.fill(0.0);
+            jtr.fill(0.0);
+    
+            let theta = params[6];
+            let (cos_t, sin_t) = (theta.cos(), theta.sin());
+            let ax = params[4];
+            let ay = params[5];
+            let beta = match beta_param {
+                BetaParam::Fixed(b) => b,
+                BetaParam::FreeLinear | BetaParam::FreeLn { .. } => beta_param.beta(params[7]),
+            };
+            let inv_ax2 = 1.0 / (ax * ax);
+            let inv_ay2 = 1.0 / (ay * ay);
+            let row = MoffatRow {
+                x0: params[2],
+                y0: params[3],
+                a: params[1],
+                ax,
+                ay,
+                cos_t,
+                sin_t,
+                inv_ax2,
+                inv_ay2,
+                beta,
+                beta_param,
+                theta_column,
+            };
+    
+            for (i, px) in pixels.iter().enumerate() {
+                if let Sampling::Integrated(offsets) = sampling {
+                    let r = cur_resid[i];
+                    row.integrated(px, offsets, &cur_power[i * kk..(i + 1) * kk], &mut j);
+                    for p in 0..np {
+                        jtr[p] += j[p] * r;
+                        for q in p..np {
+                            jtj[p * np + q] += j[p] * j[q];
+                        }
+                    }
+                    continue;
+                }
+                let dx = px.x - params[2];
+                let dy = px.y - params[3];
+                let u = dx * cos_t + dy * sin_t;
+                let v = -dx * sin_t + dy * cos_t;
+                let q = u * u * inv_ax2 + v * v * inv_ay2;
+                let base = 1.0 + q;
+                // Both come from the cost evaluation that accepted this parameter
+                // vector (or, on the first pass, from the seeding call above) —
+                // the same expressions, at the same `params`, so the value is the
+                // one this loop used to recompute.
+                let power = cur_power[i];
+                let r = cur_resid[i];
+    
+                // Jacobian of M(x,y) = B + A × (1+Q)^(-β)
+                j[0] = 1.0; // dM/dB
+                j[1] = power; // dM/dA
+    
+                // (1+Q)^(-β-1) is (1+Q)^(-β) / (1+Q): one division in place of a
+                // second `powf`.
+                let dpower_dq = -beta * (power / base);
+                let a_dpq = params[1] * dpower_dq;
+    
+                let dq_dx0 = -2.0 * (cos_t * u * inv_ax2 - sin_t * v * inv_ay2);
+                j[2] = a_dpq * dq_dx0;
+    
+                let dq_dy0 = -2.0 * (sin_t * u * inv_ax2 + cos_t * v * inv_ay2);
+                j[3] = a_dpq * dq_dy0;
+    
+                j[4] = a_dpq * (-2.0 * u * u / (ax * ax * ax));
+                j[5] = a_dpq * (-2.0 * v * v / (ay * ay * ay));
+    
+                let dq_dtheta = theta_column.dq_dtheta(u, v, inv_ax2, inv_ay2);
+                j[6] = a_dpq * dq_dtheta;
+    
+                // Only include the β column when β is free — the one `ln` in the
+                // solver, and the reason the normal system is 8×8 instead of 7×7.
+                if beta_param.is_free() {
+                    j[7] = beta_param.column(params[1] * power, base, beta);
+                }
+    
+                for p in 0..np {
+                    jtr[p] += j[p] * r;
+                    for q in p..np {
+                        jtj[p * np + q] += j[p] * j[q];
+                    }
+                }
+            }
+    
+            // Fill symmetric lower triangle
+            for p in 0..np {
+                for q in 0..p {
+                    jtj[p * np + q] = jtj[q * np + p];
+                }
+            }
+    
+            // Damped normal equations
+            mat[..np * np].copy_from_slice(&jtj);
+            for p in 0..np {
+                mat[p * np + p] += lambda * jtj[p * np + p].max(1e-12);
+            }
+    
+            let solved = {
+                let mut ok = cholesky_solve_into(
+                    &mat[..np * np],
+                    &jtr,
+                    np,
+                    &mut chol_l,
+                    &mut chol_y,
+                    &mut delta_buf,
+                );
+                if !ok {
+                    for _ in 0..3 {
+                        lambda *= 10.0;
+                        for p in 0..np {
+                            mat[p * np + p] = jtj[p * np + p] + lambda * jtj[p * np + p].max(1e-12);
+                        }
+                        ok = cholesky_solve_into(
+                            &mat[..np * np],
+                            &jtr,
+                            np,
+                            &mut chol_l,
+                            &mut chol_y,
+                            &mut delta_buf,
+                        );
+                        if ok {
+                            break;
+                        }
+                    }
+                }
+                ok
+            };
+            if !solved {
+                break;
+            }
+            let delta = &delta_buf[..np];
+    
+            new_params[..8].copy_from_slice(&params[..8]);
+            for p in 0..np {
+                new_params[p] += delta[p];
+            }
+            // Keep alphas positive
+            if new_params[4] <= 0.0 { new_params[4] = params[4] * 0.5; }
+            if new_params[5] <= 0.0 { new_params[5] = params[5] * 0.5; }
+            // Keep beta in range (only when free)
+            beta_param.clamp_step(&mut new_params[7]);
+    
+            // Reject step if alpha too small or centroid drifts too far
+            if new_params[4] < 0.5 || new_params[5] < 0.5
+                || {
+                    let cdx = new_params[2] - params[2];
+                    let cdy = new_params[3] - params[3];
+                    cdx * cdx + cdy * cdy > 4.0
+                }
+            {
+                lambda *= nu;
+                nu *= 2.0;
+                // Before the first accepted step a refusal only shortens the next step (`GuardedStep`).
+                if guarded_step == GuardedStep::Counted || moved {
+                    consecutive_rejects += 1;
+                    if consecutive_rejects >= max_rejects {
+                        break;
+                    }
+                }
+                // `params` did not move, so `cur_*` still describe it.
+                continue;
+            }
+    
+            let new_cost = residual_cost_moffat_into(
+                pixels,
+                &new_params,
+                beta_param,
+                sampling,
+                cand_power,
+                cand_resid,
+            );
+    
+            let predicted: f64 = delta
+                .iter()
+                .enumerate()
+                .map(|(i, d)| d * (lambda * jtj[i * np + i].max(1e-12) * d + jtr[i]))
+                .sum();
+    
+            prev_cost = best_cost;
+            let mut step_accepted = false;
+            if predicted > 0.0 {
+                let rho = (best_cost - new_cost) / predicted;
+                if rho > 0.0 {
+                    params[..8].copy_from_slice(&new_params[..8]);
+                    best_cost = new_cost;
+                    // The candidate became `params`, so its per-sample state
+                    // becomes the cache the next Jacobian pass reads.
+                    std::mem::swap(&mut cur_power, &mut cand_power);
+                    std::mem::swap(&mut cur_resid, &mut cand_resid);
+                    lambda *= (1.0_f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3));
+                    nu = 2.0;
+                    step_accepted = true;
+                    moved = true;
+                    consecutive_rejects = 0;
+                } else {
+                    lambda *= nu;
+                    nu *= 2.0;
+                    consecutive_rejects += 1;
+                    if consecutive_rejects >= max_rejects {
+                        break;
+                    }
+                }
+            } else {
+                lambda *= nu;
+                nu *= 2.0;
+                consecutive_rejects += 1;
+                if consecutive_rejects >= max_rejects {
+                    break;
+                }
+            }
+    
+            // Dual convergence criterion
+            let param_norm = params[..np].iter().map(|p| p * p).sum::<f64>().sqrt();
+            let delta_norm = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+            let param_converged = delta_norm / param_norm.max(1e-12) < conv_tol;
+            let residual_converged = if step_accepted && best_cost > 0.0 {
+                (prev_cost - best_cost).abs() / best_cost < 1e-4
+            } else {
+                false
+            };
+            if param_converged || residual_converged {
+                converged = true;
+                break;
+            }
+        }
+    
+        LmResult {
+            converged,
+            final_cost: best_cost,
+            iters,
+        }
+    }
+
+    fn s2b_run_pre(
+        pixels: &[PixelSample],
+        init: &[f64; 8],
+        beta_param: BetaParam,
+        theta_column: ThetaColumn,
+        sampling: Sampling<'_>,
+        guarded_step: GuardedStep,
+    ) -> ([u64; 8], bool, u64, usize) {
+        let mut params = *init;
+        let mut scratch = MoffatScratch::default();
+        let r = lm_solve_moffat_with_pre_s2b(
+            pixels, &mut params, beta_param, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
+            theta_column, sampling, guarded_step, &mut scratch,
+        );
+        (params.map(f64::to_bits), r.converged, r.final_cost.to_bits(), r.iters)
+    }
+
+    fn s2b_run_new(
+        pixels: &[PixelSample],
+        init: &[f64; 8],
+        beta_param: BetaParam,
+        theta_column: ThetaColumn,
+        sampling: Sampling<'_>,
+        guarded_step: GuardedStep,
+    ) -> ([u64; 8], bool, u64, usize) {
+        let mut params = *init;
+        let mut scratch = MoffatScratch::default();
+        let r = lm_solve_moffat_with(
+            pixels, &mut params, beta_param, CALIBRATION_MAX_ITER, CALIBRATION_CONV_TOL, CALIBRATION_MAX_REJECTS,
+            theta_column, sampling, guarded_step, &mut scratch,
+        );
+        (params.map(f64::to_bits), r.converged, r.final_cost.to_bits(), r.iters)
+    }
+
+    /// A deterministic pseudo-random sequence in [0, 1).
+    fn s2b_rng(state: &mut u64) -> f64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Both accumulators against the loop the solver always ran, on rows built to hit the awkward spots (zeros, signed
+    /// zeros, tiny and huge magnitudes, an infinity), for both parameter counts.
+    #[test]
+    fn s2b_normal_equation_accumulators_match_the_loop_bit_for_bit() {
+        fn reference<const NP: usize>(rows: &[([f64; 8], f64)]) -> (Vec<u64>, Vec<u64>) {
+            let mut jtj = vec![0.0_f64; NP * NP];
+            let mut jtr = vec![0.0_f64; NP];
+            for (j, r) in rows {
+                for p in 0..NP {
+                    jtr[p] += j[p] * r;
+                    for q in p..NP {
+                        jtj[p * NP + q] += j[p] * j[q];
+                    }
+                }
+            }
+            let up = |p: usize, q: usize| q >= p;
+            (
+                (0..NP * NP).filter(|k| up(k / NP, k % NP)).map(|k| jtj[k].to_bits()).collect(),
+                jtr.iter().map(|v| v.to_bits()).collect(),
+            )
+        }
+        fn run<const NP: usize>(rows: &[([f64; 8], f64)]) {
+            let (want_tj, want_tr) = reference::<NP>(rows);
+            let mut scalar = NormalScalar::<NP>::new();
+            let mut fast = NormalEq::<NP>::new();
+            for (j, r) in rows {
+                scalar.add(j, *r);
+                fast.add(j, *r);
+            }
+            for (name, w) in [("scalar", 0), ("fast", 1)] {
+                let (mut tj, mut tr) = (vec![9.0_f64; NP * NP], vec![9.0_f64; NP]);
+                if w == 0 { scalar.write(&mut tj, &mut tr) } else { fast.write(&mut tj, &mut tr) }
+                let got_tj: Vec<u64> = (0..NP * NP).filter(|k| k % NP >= k / NP).map(|k| tj[k].to_bits()).collect();
+                assert_eq!(got_tj, want_tj, "{name} JtJ, np {NP}");
+                assert_eq!(tr.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want_tr, "{name} Jtr, np {NP}");
+            }
+        }
+        let mut st = 0x9E37_79B9_7F4A_7C15_u64;
+        let specials = [0.0, -0.0, 1e-310, -1e-310, 1e150, -1e150, 1.0, -1.0, 0.1, 3.0e-5, f64::MIN_POSITIVE];
+        for n in [1_usize, 2, 3, 7, 64, 513] {
+            let mut rows = Vec::new();
+            for i in 0..n {
+                let mut j = [0.0_f64; 8];
+                for (p, jp) in j.iter_mut().enumerate() {
+                    *jp = if i % 5 == 4 { specials[(i * 3 + p) % specials.len()] } else { (s2b_rng(&mut st) - 0.5) * 10f64.powi((s2b_rng(&mut st) * 8.0) as i32 - 4) };
+                }
+                rows.push((j, (s2b_rng(&mut st) - 0.5) * 100.0));
+            }
+            run::<7>(&rows);
+            run::<8>(&rows);
+        }
+        // an infinity propagates identically
+        let mut j = [1.0_f64; 8];
+        j[3] = f64::INFINITY;
+        run::<7>(&[(j, 2.0), ([0.5; 8], -1.0)]);
+        run::<8>(&[(j, 0.0), ([0.5; 8], -1.0)]);
+    }
+
+    /// The whole solver, new against the pre-S2b one, on every fixture star under every β arm, θ column, guard mode and
+    /// both samplings: params, convergence flag, final cost and iteration count equal as bits.
+    #[test]
+    fn s2b_lm_solver_matches_the_pre_s2b_solver_bit_for_bit() {
+        let fixtures = fixture_stars();
+        assert!(fixtures.len() >= 30);
+        let offsets = subsample_offsets(3);
+        let arms: [(Option<f64>, ThetaColumn, GuardedStep, bool); 6] = [
+            (Some(2.5), ThetaColumn::Legacy, GuardedStep::Counted, false),
+            (Some(4.0), ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
+            (Some(10.0), ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
+            (None, ThetaColumn::Legacy, GuardedStep::Counted, false),
+            (None, ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
+            (Some(3.2), ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, true),
+        ];
+        let mut cases = 0_usize;
+        for f in &fixtures {
+            for &(fixed_beta, theta_column, guarded_step, integrated) in &arms {
+                let init = moffat_init(f, fixed_beta);
+                let sampling = if integrated { Sampling::Integrated(&offsets) } else { Sampling::Point };
+                let beta_param = if integrated && fixed_beta.is_none() {
+                    BetaParam::FreeLn { ln_min: 1.5_f64.ln(), ln_max: 100.0_f64.ln() }
+                } else {
+                    BetaParam::fixed_or_linear(fixed_beta)
+                };
+                let mut start = init;
+                if let BetaParam::FreeLn { .. } = beta_param {
+                    start[7] = init[7].ln();
+                }
+                let want = s2b_run_pre(&f.pixels, &start, beta_param, theta_column, sampling, guarded_step);
+                let got = s2b_run_new(&f.pixels, &start, beta_param, theta_column, sampling, guarded_step);
+                assert_eq!(got, want, "{} {fixed_beta:?} {theta_column:?} {guarded_step:?} integrated {integrated}", f.label);
+                cases += 1;
+            }
+        }
+        assert!(cases >= 180, "{cases} cases");
+    }
+
+    /// A refused step leaves the parameters where they were, so the next iteration reuses the Jacobian pass instead of
+    /// rebuilding it (L2): on starts far from the data (the step guard refuses) and on noisy ones (the cost does not
+    /// improve) the solver runs fewer passes than iterations and still ends on exactly the pre-S2b bits.
+    #[test]
+    fn s2b_a_refused_step_reuses_the_jacobian_and_changes_nothing() {
+        let mut st = 0x1234_5678_9ABC_DEF1_u64;
+        let (mut reused_cases, mut cases) = (0_usize, 0_usize);
+        for k in 0..60 {
+            let n = 15 + (k % 4) * 4;
+            let mut px = moffat_stamp(n, 7.0 + s2b_rng(&mut st), 7.5 + s2b_rng(&mut st), 1.8 + s2b_rng(&mut st), 2.4, 0.4, 3.0);
+            for p in px.iter_mut() {
+                p.value = 100.0 * p.value + 5.0 + (s2b_rng(&mut st) - 0.5) * (k % 3) as f64 * 12.0;
+            }
+            let far = 1.0 + (k % 5) as f64;
+            let init = [4.0, 80.0, 7.0 + far, 7.0 - far, 0.9, 5.5, 0.1 * k as f64, if k % 2 == 0 { 3.0 } else { 4.0 }];
+            for (beta_param, guard) in [
+                (BetaParam::Fixed(init[7]), GuardedStep::UncountedBeforeFirstStep),
+                (BetaParam::FreeLinear, GuardedStep::Counted),
+            ] {
+                let want = s2b_run_pre(&px, &init, beta_param, ThetaColumn::Corrected, Sampling::Point, guard);
+                JACOBIAN_PASSES.with(|c| c.set(0));
+                let got = s2b_run_new(&px, &init, beta_param, ThetaColumn::Corrected, Sampling::Point, guard);
+                let passes = JACOBIAN_PASSES.with(|c| c.get());
+                assert_eq!(got, want, "case {k} {beta_param:?}");
+                assert!(passes <= got.3, "passes {passes} > iterations {}", got.3);
+                cases += 1;
+                reused_cases += usize::from(passes < got.3);
+            }
+        }
+        assert!(reused_cases >= 10, "the reuse path ran in {reused_cases} of {cases} cases only");
+    }
+
+    /// The debug counters' invariants on real solves (feature `lm-counters`; the totals are process-wide, so run it alone:
+    /// `cargo test --lib --features lm-counters s2b_counters -- --test-threads=1`): every iteration is a Jacobian pass computed
+    /// or reused, every cost pass beyond the seeding one belongs to a step the guard let through (accepted or refused on cost),
+    /// and the counters change no bits.
+    #[cfg(feature = "lm-counters")]
+    #[test]
+    fn s2b_counters_obey_their_invariants_and_change_nothing() {
+        use lm_counters::{lm_counters, lm_counters_reset};
+        let fixtures = fixture_stars();
+        lm_counters_reset();
+        let mut iters = [0_usize; 2];
+        let mut pixels = [0_u64; 2];
+        let mut solves = [0_u64; 2];
+        for f in fixtures.iter().take(12) {
+            for fixed_beta in [Some(4.0), None] {
+                let init = moffat_init(f, fixed_beta);
+                let beta_param = BetaParam::fixed_or_linear(fixed_beta);
+                let want = s2b_run_pre(&f.pixels, &init, beta_param, ThetaColumn::Legacy, Sampling::Point, GuardedStep::Counted);
+                let got = s2b_run_new(&f.pixels, &init, beta_param, ThetaColumn::Legacy, Sampling::Point, GuardedStep::Counted);
+                assert_eq!(got, want);
+                let k = usize::from(fixed_beta.is_none());
+                iters[k] += got.3;
+                pixels[k] += f.pixels.len() as u64;
+                solves[k] += 1;
+            }
+        }
+        let c = lm_counters();
+        for k in 0..2 {
+            assert_eq!(c[k].solves, solves[k], "np class {k}");
+            assert_eq!(c[k].iterations, iters[k] as u64);
+            assert_eq!(c[k].pixels, pixels[k]);
+            assert_eq!(c[k].jacobian_passes + c[k].jacobian_reused, c[k].iterations);
+            assert_eq!(c[k].cost_passes, c[k].solves + c[k].accepted_steps + c[k].refused_cost);
+            assert_eq!(c[k].pixel_histogram.iter().sum::<u64>(), c[k].solves);
+        }
+    }
+}

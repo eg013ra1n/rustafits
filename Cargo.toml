@@ -27,6 +27,8 @@ required-features = ["debug-pipeline"]
 
 [features]
 debug-pipeline = []
+# Debug-only Moffat LM solve counters (iterations, refused steps, Jacobian / cost passes, pixels), zero numeric effect.
+lm-counters = []
 
 [dependencies]
 anyhow = "1.0"
