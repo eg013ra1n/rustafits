@@ -3880,35 +3880,39 @@ mod tests {
         let fixtures = fixture_stars();
         assert!(fixtures.len() >= 30);
         let offsets = subsample_offsets(3);
-        let arms: [(Option<f64>, ThetaColumn, GuardedStep, bool); 6] = [
-            (Some(2.5), ThetaColumn::Legacy, GuardedStep::Counted, false),
-            (Some(4.0), ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
-            (Some(10.0), ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
-            (None, ThetaColumn::Legacy, GuardedStep::Counted, false),
-            (None, ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
-            (Some(3.2), ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, true),
+        // (fixed beta or free, ln beta parametrisation, theta column, guard mode, integrated sampling)
+        let arms: [(Option<f64>, bool, ThetaColumn, GuardedStep, bool); 8] = [
+            (Some(2.5), false, ThetaColumn::Legacy, GuardedStep::Counted, false),
+            (Some(4.0), false, ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
+            (Some(10.0), false, ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
+            (None, false, ThetaColumn::Legacy, GuardedStep::Counted, false),
+            (None, false, ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
+            (Some(3.2), false, ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, true),
+            // the production arms: the saturation verdict fit (free ln beta, point model) and the beta sample's integrated one
+            (None, true, ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, false),
+            (None, true, ThetaColumn::Corrected, GuardedStep::UncountedBeforeFirstStep, true),
         ];
         let mut cases = 0_usize;
         for f in &fixtures {
-            for &(fixed_beta, theta_column, guarded_step, integrated) in &arms {
+            for &(fixed_beta, ln, theta_column, guarded_step, integrated) in &arms {
                 let init = moffat_init(f, fixed_beta);
                 let sampling = if integrated { Sampling::Integrated(&offsets) } else { Sampling::Point };
-                let beta_param = if integrated && fixed_beta.is_none() {
+                let beta_param = if ln {
                     BetaParam::FreeLn { ln_min: 1.5_f64.ln(), ln_max: 100.0_f64.ln() }
                 } else {
                     BetaParam::fixed_or_linear(fixed_beta)
                 };
                 let mut start = init;
-                if let BetaParam::FreeLn { .. } = beta_param {
+                if ln {
                     start[7] = init[7].ln();
                 }
                 let want = s2b_run_pre(&f.pixels, &start, beta_param, theta_column, sampling, guarded_step);
                 let got = s2b_run_new(&f.pixels, &start, beta_param, theta_column, sampling, guarded_step);
-                assert_eq!(got, want, "{} {fixed_beta:?} {theta_column:?} {guarded_step:?} integrated {integrated}", f.label);
+                assert_eq!(got, want, "{} {fixed_beta:?} ln {ln} {theta_column:?} {guarded_step:?} integrated {integrated}", f.label);
                 cases += 1;
             }
         }
-        assert!(cases >= 180, "{cases} cases");
+        assert!(cases >= 240, "{cases} cases");
     }
 
     /// A refused step leaves the parameters where they were, so the next iteration reuses the Jacobian pass instead of
