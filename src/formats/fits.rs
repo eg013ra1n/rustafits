@@ -587,10 +587,7 @@ mod tests {
         for v in data {
             bytes.extend(((*v as i32 - 32768) as i16).to_be_bytes());
         }
-        let rem = bytes.len() % FITS_BLOCK_SIZE;
-        if rem != 0 {
-            bytes.extend(std::iter::repeat(0u8).take(FITS_BLOCK_SIZE - rem));
-        }
+        bytes.resize(bytes.len().div_ceil(FITS_BLOCK_SIZE) * FITS_BLOCK_SIZE, 0);
         std::fs::write(path, bytes).expect("failed to write synthetic FITS test file");
     }
 
