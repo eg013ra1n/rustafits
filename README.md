@@ -109,6 +109,57 @@ leaves no truncated images behind.
 Batch throughput: 9 real 26 MP frames on 4 cores take 0.9 s in one call,
 versus 2.5 s for a shell loop over single-file calls.
 
+`convert` is the default command; `rustafits convert …` spells it out (for an
+input file literally named `info`, `analyze` or `completions`).
+
+### Headers: `rustafits info`
+
+Reads only the header (a few KB per file), so it is instant on a whole night:
+
+```bash
+$ rustafits info tests/
+FILE             SIZE       TYPE  BAYER    EXP  FILTER  GAIN   TEMP  DATE-OBS                 OBJECT
+tests/mono.fits  6252x4176  u16   -       30.0  L         56   -9.5  2025-10-25T16:22:10.582  C/2025 A6 (Lemmon)
+tests/osc.fits   6248x4176  u16   RGGB    15.0  -        100  -10.4  2025-10-25T15:53:47.995  C/2025 A6 (Lemmon)
+tests/test.xisf  6224x4168  u16   RGGB   120.0  -        101  -10.0  2025-09-26T17:25:21.185  Ghost Nebula
+
+rustafits info night1/ -r -k FOCALLEN -k AIRMASS   # extra keyword columns
+rustafits info light.fits --all                    # every keyword
+rustafits info night1/ --json | --csv
+```
+
+Columns come from the FITS cards N.I.N.A., SharpCap, ASIAIR etc. write, with
+XISF property ids as fallback (`Instrument:ExposureTime`, …).
+
+### Star metrics: `rustafits analyze`
+
+Per-frame quality for culling subs. The analyzer runs with the library
+defaults — the same settings Athenaeum uses — so the numbers match Athenaeum's
+for the same file.
+
+```bash
+$ rustafits analyze tests/ --sort fwhm
+FILE             STARS  FWHM   HFR    ECC    SNR  WEIGHT    BG  NOISE  TRAIL
+tests/mono.fits    679  1.95  1.50  0.408   55.0   128.2   848   34.1  -
+tests/osc.fits     297  2.63  2.05  0.473   25.0   34.10  1276   41.5  -
+tests/test.xisf  14089  3.44  2.07  0.562  202.0   91793   291    8.5  yes
+
+rustafits analyze night1/ --csv > night1.csv              # full precision
+rustafits analyze night1/ --focal-length 448 --pixel-size 3.76   # + arcsec
+```
+
+`--sort stars|fwhm|hfr|ecc|snr|weight|name` (best first; `--reverse` for
+worst first), `--json`, `--csv`, `--sigma`, `--measure-cap`, `--no-debayer`,
+`-j` (default 2 frames at once — analysis already uses every core).
+
+### Shell completion
+
+```bash
+rustafits completions zsh  > ~/.zfunc/_rustafits
+rustafits completions bash > ~/.local/share/bash-completion/completions/rustafits
+rustafits completions fish > ~/.config/fish/completions/rustafits.fish
+```
+
 ## Library Usage
 
 Add to your `Cargo.toml`:

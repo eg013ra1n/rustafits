@@ -23,8 +23,19 @@ output extension (see Changed), hence a minor bump when released.
   don't stop the batch (exit 1 at the end); bad output names are rejected
   before any work; writes are atomic (temp file + rename). 9 real 26 MP
   frames on 4 cores: 0.9 s in one call vs 2.5 s for a shell loop.
-- **The `cli` feature** (default): clap and indicatif are optional and only
-  the binary needs them — library users can set `default-features = false`.
+- **`rustafits info`**: header summary without reading pixels (size, type,
+  Bayer, exposure, filter, gain, temperature, date, object; `-k KEY` extra
+  columns, `--all`, `--json`, `--csv`).
+- **`rustafits analyze`**: per-frame stars, FWHM, HFR, eccentricity, SNR,
+  SNR weight, background, noise, trail flag — library defaults, i.e. the same
+  numbers Athenaeum shows. `--sort … --reverse`, `--json`, `--csv`, arcsec
+  with `--focal-length/--pixel-size`, parallel frames, progress bar.
+- **`rustafits completions <shell>`** (bash, zsh, fish, elvish, powershell).
+- **`ImageConverter::read_header`** → `ImageHeader` (layout + every FITS card
+  or XISF FITSKeyword/Property, `get(key)`), without reading pixel data.
+  New public types `ImageHeader`, `HeaderKeyword`, `FileFormat`.
+- **The `cli` feature** (default): clap, clap_complete and indicatif are
+  optional and only the binary needs them — library users can set `default-features = false`.
 - **`encode_png`**: in-memory PNG encoding next to `encode_jpeg`.
 - **`PngCompression`** (`None` / `Fast` / `Balanced` / `High`) with
   `ImageConverter::with_png_compression`, `ImageConverter::save_processed_with`
@@ -64,6 +75,12 @@ output extension (see Changed), hence a minor bump when released.
 
 ### Fixed
 
+- `cargo test` passes on x86_64: the two bit-for-bit fitting pins (recorded
+  on aarch64) failed there since they were added — and with them the AUR
+  PKGBUILD's `check()`. They stay exact on aarch64 and allow
+  1e-12 · max(1, |pin|) per field elsewhere (libm rounding; iteration counts
+  and flags still exact).
+- `rustafits … | head` exits quietly instead of panicking on a closed pipe.
 - CLI help and README gave `--max-stars` a default of 200; the CLI default is
   500 (the library default stays 200).
 - README claimed `--log` shows stretch parameters; it shows the settings.

@@ -35,7 +35,7 @@ cargo clippy
 
 ### Crate Structure
 
-The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public. The default `cli` feature carries the `rustafits` binary's only extra deps (clap, indicatif); the binary requires it, and library users (Athenaeum) can build with `default-features = false`. `tests/cli.rs` drives the binary end to end on synthetic FITS.
+The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public. The default `cli` feature carries the `rustafits` binary's only extra deps (clap, clap_complete, indicatif, libc); the binary requires it, and library users (Athenaeum) can build with `default-features = false`. The binary lives in `src/bin/rustafits/`: `main.rs` (clap; conversion is the default command, plus `info`, `analyze`, `completions`), `batch.rs` (input collection, shared pool, worker loop, progress bar), `convert.rs`, `info.rs`, `analyze.rs`, `report.rs` (table/JSON/CSV). `analyze` must keep `ImageAnalyzer`'s library defaults — Athenaeum uses them, and `tests/cli.rs` pins the CLI's numbers to `ImageAnalyzer::new().analyze()`. `tests/cli.rs` drives the binary end to end on synthetic FITS.
 
 ### Processing Pipeline
 
@@ -121,6 +121,11 @@ Always test changes against all four files when modifying processing code.
 row-banded parallel version is diffed against, and a pin against an external
 reference demosaic. Both live in the module's test section — a change to the
 band split must keep the serial diff bit-identical.
+
+The bit-for-bit pins in `analysis::fitting`'s tests are recorded on aarch64
+and compared exactly there; elsewhere `assert_bits_pinned` allows
+1e-12 · max(1, |pin|) per field (x86_64 libm rounds differently; round-star θ
+and near-zero fields drift most). Re-record pins on aarch64.
 
 `tests/jpeg_encoder.rs` needs no fixtures: it guards the JPEG encoder with
 synthetic images and decodes them with `jpeg-decoder` — deliberately an
