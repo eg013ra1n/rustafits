@@ -5,7 +5,7 @@ use std::time::Instant;
 
 fn read_f32_fits(path: &str) -> (Vec<f32>, usize, usize) {
     let b = std::fs::read(path).unwrap();
-    let (mut w, mut h) = (0usize, 0usize);
+    let (mut w, mut h, mut bitpix) = (0usize, 0usize, 0i64);
     let mut off = 0;
     'outer: loop {
         for c in 0..36 {
@@ -13,10 +13,12 @@ fn read_f32_fits(path: &str) -> (Vec<f32>, usize, usize) {
             let v = |k: &str| card.starts_with(k).then(|| card[10..].split('/').next().unwrap().trim().parse::<usize>().unwrap());
             if let Some(x) = v("NAXIS1  ") { w = x; }
             if let Some(x) = v("NAXIS2  ") { h = x; }
+            if card.starts_with("BITPIX  ") { bitpix = card[10..].split('/').next().unwrap().trim().parse().unwrap(); }
             if card.starts_with("END ") { off += 2880; break 'outer; }
         }
         off += 2880;
     }
+    assert_eq!(bitpix, -32, "bg_bench reads float32 FITS only (BITPIX = -32); {path} has BITPIX = {bitpix}");
     let d = (0..w * h).map(|i| f32::from_be_bytes(b[off + i * 4..off + i * 4 + 4].try_into().unwrap())).collect();
     (d, w, h)
 }

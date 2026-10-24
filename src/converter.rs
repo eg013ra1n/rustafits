@@ -132,6 +132,8 @@ impl ImageConverter {
         input_path: P,
         output_path: Q,
     ) -> Result<()> {
+        // Reject an unsupported output extension before the (expensive) processing.
+        output::OutputFormat::from_path(output_path.as_ref())?;
         let image = self.process(&input_path)?;
 
         output::save_image(&image, output_path.as_ref(), self.quality)

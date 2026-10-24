@@ -42,12 +42,13 @@ The package produces two binaries (`rustafits`, `rustafits-debug`) and a library
 
 Pipeline flow for u16 data:
 1. Format reader (FITS big-endian / XISF little-endian) → `(ImageMetadata, PixelData)`
-2. Debayer (if Bayer pattern detected) — 2x2 super-pixel, produces planar f32 RGB
-   at HALF the input width and height. This is the only debayer in the render
-   pipeline: `vng_debayer_f32` is a library entry point callers invoke directly
-   (Athenaeum's calibrated-lights export does), not a stage `ImageConverter` can
-   be switched to. Consequence worth knowing: an OSC frame can never be rendered
-   at its native resolution through `ImageConverter`.
+2. Debayer (if Bayer pattern detected) — by default 2x2 super-pixel, producing
+   planar f32 RGB at HALF the input width and height (so it consumes a factor 2
+   of `--downscale`). `ImageConverter::with_vng_debayer()` switches the render
+   pipeline to `vng_debayer_f32` instead: full native resolution, and the whole
+   downscale factor still applies. `vng_debayer_f32` is also a library entry
+   point callers invoke directly (Athenaeum's calibrated-lights export does).
+   The CLI does not expose VNG.
 3. Downscale (integer factor, operates on raw u16 before float conversion when possible)
 4. u16→f32 conversion (SIMD-accelerated)
 5. Preview binning (optional 2x2)

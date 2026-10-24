@@ -67,15 +67,35 @@ pub fn encode_jpeg(
     .map_err(|e| anyhow::anyhow!("JPEG encoding failed: {e}"))
 }
 
-pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+/// Output file format, chosen from the output path's extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Jpeg,
+    Png,
+}
 
-    match ext.as_str() {
-        "png" => {
+impl OutputFormat {
+    /// `.png` → PNG; `.jpg`, `.jpeg` or no extension at all → JPEG (case-insensitive).
+    /// Any other extension is an error rather than a JPEG stream under a misleading
+    /// name (`out.tif` used to receive JPEG bytes silently).
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let Some(ext) = path.extension() else {
+            return Ok(OutputFormat::Jpeg);
+        };
+        match ext.to_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("png") => Ok(OutputFormat::Png),
+            Some("jpg") | Some("jpeg") => Ok(OutputFormat::Jpeg),
+            _ => anyhow::bail!(
+                "unsupported output format '.{}' (expected .jpg, .jpeg or .png)",
+                ext.to_string_lossy()
+            ),
+        }
+    }
+}
+
+pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()> {
+    match OutputFormat::from_path(path)? {
+        OutputFormat::Png => {
             let file = File::create(path).context("Failed to create output file")?;
             let writer = BufWriter::new(file);
             let color_type = if image.channels == 4 {
@@ -93,7 +113,7 @@ pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()
                 )
                 .context("PNG encoding failed")?;
         }
-        _ => {
+        OutputFormat::Jpeg => {
             // RGBA is handed to the encoder as-is — it reads 4 bytes per pixel
             // and discards alpha itself, so the old de-interleaving Vec
             // allocation (W*H*3 bytes per frame) is gone. Byte-equality of the
@@ -163,6 +183,36 @@ mod tests {
             encode_jpeg(&rgb, 32, 24, 3, 100).unwrap(),
             "quality above 100 should behave as 100"
         );
+    }
+
+    #[test]
+    fn output_format_follows_the_extension() {
+        let f = |p: &str| OutputFormat::from_path(Path::new(p));
+        assert_eq!(f("a.png").unwrap(), OutputFormat::Png);
+        assert_eq!(f("a.PNG").unwrap(), OutputFormat::Png);
+        assert_eq!(f("a.jpg").unwrap(), OutputFormat::Jpeg);
+        assert_eq!(f("a.JPEG").unwrap(), OutputFormat::Jpeg);
+        assert_eq!(f("dir/a").unwrap(), OutputFormat::Jpeg, "no extension stays JPEG");
+        assert!(f("a.tif").is_err());
+        assert!(f("a.jpg.bak").is_err());
+    }
+
+    #[test]
+    fn save_image_refuses_an_unknown_extension_without_writing() {
+        let dir = std::env::temp_dir().join(format!("rustafits-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.tif");
+        let image = ProcessedImage {
+            data: synth_rgb(8, 8),
+            width: 8,
+            height: 8,
+            is_color: true,
+            channels: 3,
+            flip_vertical: false,
+        };
+        assert!(save_image(&image, &path, 90).is_err());
+        assert!(!path.exists(), "nothing may be written under the wrong name");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

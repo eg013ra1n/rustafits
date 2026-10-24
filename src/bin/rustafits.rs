@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
-use astroimage::{annotate_image, AnnotationConfig, ImageAnalyzer, ImageConverter};
+use astroimage::{annotate_image, AnnotationConfig, ImageAnalyzer, ImageConverter, OutputFormat};
 use std::env;
 use std::process;
 
 fn print_usage(program: &str) {
-    eprintln!("FITS/XISF to JPEG Converter");
+    eprintln!("FITS/XISF to JPEG/PNG Converter");
     eprintln!();
-    eprintln!("Usage: {} <input> <output.jpg> [OPTIONS]", program);
+    eprintln!("Usage: {} <input> <output.jpg|output.png> [OPTIONS]", program);
     eprintln!();
     eprintln!("Supported input formats:");
     eprintln!("  .fits, .fit   - FITS (Flexible Image Transport System)");
@@ -18,9 +18,9 @@ fn print_usage(program: &str) {
     eprintln!("  --no-debayer         Disable Bayer pattern debayering");
     eprintln!("  --preview            Enable preview mode (2x2 binning for mono, faster)");
     eprintln!("  --annotate           Overlay star detection ellipses on the output image");
-    eprintln!("  --max-stars <N>      Max stars for annotation analysis (default: 200)");
+    eprintln!("  --max-stars <N>      Max stars for annotation analysis (default: 500)");
     eprintln!("  --measure-cap <N>    Max stars to PSF-fit (default: 2000, 0 = all)");
-    eprintln!("  --log                Show detailed conversion information");
+    eprintln!("  --log                Show detailed conversion information (on stderr)");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} image.fits image.jpg", program);
@@ -131,14 +131,17 @@ fn run() -> Result<()> {
         }
     }
 
+    // Fail on an unsupported output extension before reading or analysing anything.
+    OutputFormat::from_path(std::path::Path::new(output_path))?;
+
     if log_enabled {
-        println!("Converting to JPEG...");
-        println!("  Input:  {}", input_path);
-        println!("  Output: {}", output_path);
-        println!("  Downscale: {}x", downscale);
-        println!("  Quality: {}", quality);
-        println!("  Debayer: {}", if apply_debayer { "enabled" } else { "disabled" });
-        println!("  Preview mode: {}", if preview_mode { "enabled" } else { "disabled" });
+        eprintln!("Converting...");
+        eprintln!("  Input:  {}", input_path);
+        eprintln!("  Output: {}", output_path);
+        eprintln!("  Downscale: {}x", downscale);
+        eprintln!("  Quality: {}", quality);
+        eprintln!("  Debayer: {}", if apply_debayer { "enabled" } else { "disabled" });
+        eprintln!("  Preview mode: {}", if preview_mode { "enabled" } else { "disabled" });
     }
 
     // Build converter with options
@@ -174,7 +177,7 @@ fn run() -> Result<()> {
             .context("Analysis failed")?;
 
         if log_enabled {
-            println!("Analysis: {} stars detected, median FWHM={:.2}, median ecc={:.3}",
+            eprintln!("Analysis: {} stars detected, median FWHM={:.2}, median ecc={:.3}",
                 result.stars_detected, result.median_fwhm, result.median_eccentricity);
         }
 
@@ -196,7 +199,7 @@ fn run() -> Result<()> {
     }
 
     if log_enabled {
-        println!("Conversion successful!");
+        eprintln!("Conversion successful!");
     }
 
     Ok(())

@@ -79,7 +79,7 @@ rustafits <input> <output> [OPTIONS]
   --no-debayer      Disable Bayer debayering
   --preview         2x2 binning for mono images
   --annotate        Overlay star detection ellipses on the output
-  --max-stars <N>   Max stars for annotation analysis (default: 200)
+  --max-stars <N>   Max stars for annotation analysis (default: 500)
   --log             Show detailed information
 ```
 
@@ -566,7 +566,7 @@ rustafits/
 
 **Slow conversion**: Use `--preview` for mono images or `--downscale 2`
 
-**Black/white output**: Run with `--log` to check stretch parameters
+**Black/white output**: the auto-stretch is computed from the frame's median and MAD, so a blank, fully saturated or heavily clipped frame stretches to flat black or white. (`--log` shows the conversion settings, not the stretch parameters.)
 
 **Downscale + Bayer/OSC**: The super-pixel debayer already halves resolution (2x). A `--downscale 2` on a Bayer image produces debayer-only output with no extra downscale. Use `--downscale 4` or higher for additional reduction beyond debayering.
 

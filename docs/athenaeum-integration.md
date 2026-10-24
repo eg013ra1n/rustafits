@@ -38,6 +38,10 @@ ImageConverter::save_processed(&image, "output.jpg", 95)?;
 ImageConverter::save_processed(&image, "output.png", 0)?;  // quality ignored for PNG
 ```
 
+The format follows the extension: `.png` → PNG; `.jpg`, `.jpeg` or no
+extension → JPEG. Any other extension is an error (before 1.6 it silently wrote
+a JPEG stream under that name).
+
 ### Builder Methods
 
 | Method | Default | Description |
@@ -47,6 +51,7 @@ ImageConverter::save_processed(&image, "output.png", 0)?;  // quality ignored fo
 | `without_debayer()` | debayer on | Skip Bayer debayering. |
 | `with_preview_mode()` | off | 2x2 binning for fast previews. |
 | `with_rgba_output()` | RGB | Output RGBA instead of RGB. |
+| `with_vng_debayer()` | super-pixel | Debayer CFA input at native resolution (VNG) instead of 2x2 super-pixel; the full downscale factor still applies. |
 | `with_thread_pool(pool)` | global | Route parallel work to a custom rayon pool. |
 
 ---
