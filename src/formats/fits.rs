@@ -164,80 +164,73 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     let bytes_per_pixel = (hdr.bitpix.unsigned_abs() as usize) / 8;
     let data_size = num_pixels * bytes_per_pixel;
 
-    let mut raw_data = vec![0u8; data_size];
-    reader
-        .read_exact(&mut raw_data)
-        .context("Failed to read FITS data")?;
-
     const CHUNK: usize = 65536;
     const PAR_THRESHOLD: usize = CHUNK * 2;
+    let use_par = num_pixels >= PAR_THRESHOLD;
 
+    // Same-width samples (BITPIX 16 → u16, ±32 → f32) are read straight into
+    // the destination buffer and converted in place, so the raw bytes and the
+    // decoded pixels never coexist (52 MB instead of 104 MB transient for a
+    // 26 MP 16-bit frame). BITPIX 8 and -64 change width and keep a raw buffer.
     let (dtype, pixels) = match hdr.bitpix {
         16 => {
             let mut u16_data = vec![0u16; num_pixels];
-            let src = &raw_data;
-            let use_par = num_pixels >= PAR_THRESHOLD;
+            reader
+                .read_exact(as_bytes_mut(&mut u16_data))
+                .context("Failed to read FITS data")?;
 
-            if hdr.bzero == 32768.0 && hdr.bscale == 1.0 {
+            // `u16::from_be` on the in-memory sample is the file's big-endian
+            // value on any host; the loops below auto-vectorize.
+            let bzero = hdr.bzero;
+            let bscale = hdr.bscale;
+            let convert: &(dyn Fn(&mut [u16]) + Sync) = if bzero == 32768.0 && bscale == 1.0 {
                 // Fast path: signed→unsigned via byte-swap + XOR 0x8000
-                let convert = |s: &[u8], d: &mut [u16]| {
-                    bswap_u16_xor(s, d);
-                };
-                if use_par {
-                    src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
-                } else {
-                    convert(src, &mut u16_data);
-                }
-            } else if hdr.bzero == 0.0 && hdr.bscale == 1.0 {
-                let convert = |s: &[u8], d: &mut [u16]| {
-                    bswap_u16(s, d);
-                };
-                if use_par {
-                    src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
-                } else {
-                    convert(src, &mut u16_data);
-                }
+                &|d: &mut [u16]| d.iter_mut().for_each(|v| *v = u16::from_be(*v) ^ 0x8000)
+            } else if bzero == 0.0 && bscale == 1.0 {
+                &|d: &mut [u16]| d.iter_mut().for_each(|v| *v = u16::from_be(*v))
             } else {
-                let bzero = hdr.bzero;
-                let bscale = hdr.bscale;
-                let convert = |s: &[u8], d: &mut [u16]| {
-                    for i in 0..d.len() {
-                        let val = i16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+                &move |d: &mut [u16]| {
+                    for v in d.iter_mut() {
+                        let val = u16::from_be(*v) as i16;
                         let scaled = bzero + bscale * val as f64;
-                        d[i] = scaled.clamp(0.0, 65535.0) as u16;
+                        *v = scaled.clamp(0.0, 65535.0) as u16;
                     }
-                };
-                if use_par {
-                    src.par_chunks(CHUNK * 2).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
-                } else {
-                    convert(src, &mut u16_data);
                 }
+            };
+            if use_par {
+                u16_data.par_chunks_mut(CHUNK).for_each(convert);
+            } else {
+                convert(&mut u16_data);
             }
 
             (DataType::Uint16, PixelData::Uint16(u16_data))
         }
-        -32 => {
+        -32 | 32 => {
             let mut f32_data = vec![0f32; num_pixels];
-            let src = &raw_data;
+            reader
+                .read_exact(as_bytes_mut(&mut f32_data))
+                .context("Failed to read FITS data")?;
+
             let bzero = hdr.bzero;
             let bscale = hdr.bscale;
-
-            let convert = |s: &[u8], d: &mut [f32]| {
-                for i in 0..d.len() {
-                    let off = i * 4;
-                    let val = f32::from_be_bytes([s[off], s[off + 1], s[off + 2], s[off + 3]]);
-                    d[i] = (bzero + bscale * val as f64) as f32;
+            let is_float = hdr.bitpix == -32;
+            let convert = |d: &mut [f32]| {
+                for v in d.iter_mut() {
+                    let bits = u32::from_be(v.to_bits());
+                    let val = if is_float { f32::from_bits(bits) as f64 } else { bits as i32 as f64 };
+                    *v = (bzero + bscale * val) as f32;
                 }
             };
-            if num_pixels >= PAR_THRESHOLD {
-                src.par_chunks(CHUNK * 4).zip(f32_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
+            if use_par {
+                f32_data.par_chunks_mut(CHUNK).for_each(convert);
             } else {
-                convert(src, &mut f32_data);
+                convert(&mut f32_data);
             }
 
             (DataType::Float32, PixelData::Float32(f32_data))
         }
         8 => {
+            let raw_data = read_raw_bytes(&mut reader, data_size)?;
             let mut u16_data = vec![0u16; num_pixels];
             let bzero = hdr.bzero;
             let bscale = hdr.bscale;
@@ -248,7 +241,7 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
                     d[i] = (scaled * 256.0) as u16;
                 }
             };
-            if num_pixels >= PAR_THRESHOLD {
+            if use_par {
                 raw_data.par_chunks(CHUNK).zip(u16_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
             } else {
                 convert(&raw_data, &mut u16_data);
@@ -256,28 +249,8 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
 
             (DataType::Uint16, PixelData::Uint16(u16_data))
         }
-        32 => {
-            let mut f32_data = vec![0f32; num_pixels];
-            let src = &raw_data;
-            let bzero = hdr.bzero;
-            let bscale = hdr.bscale;
-
-            let convert = |s: &[u8], d: &mut [f32]| {
-                for i in 0..d.len() {
-                    let off = i * 4;
-                    let val = i32::from_be_bytes([s[off], s[off + 1], s[off + 2], s[off + 3]]);
-                    d[i] = (bzero + bscale * val as f64) as f32;
-                }
-            };
-            if num_pixels >= PAR_THRESHOLD {
-                src.par_chunks(CHUNK * 4).zip(f32_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
-            } else {
-                convert(src, &mut f32_data);
-            }
-
-            (DataType::Float32, PixelData::Float32(f32_data))
-        }
         -64 => {
+            let raw_data = read_raw_bytes(&mut reader, data_size)?;
             let mut f32_data = vec![0f32; num_pixels];
             let src = &raw_data;
             let bzero = hdr.bzero;
@@ -293,7 +266,7 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
                     d[i] = (bzero + bscale * val) as f32;
                 }
             };
-            if num_pixels >= PAR_THRESHOLD {
+            if use_par {
                 src.par_chunks(CHUNK * 8).zip(f32_data.par_chunks_mut(CHUNK)).for_each(|(s, d)| convert(s, d));
             } else {
                 convert(src, &mut f32_data);
@@ -316,103 +289,22 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     Ok((meta, pixels))
 }
 
-/// SIMD-accelerated big-endian u16 byte swap.
-fn bswap_u16(src: &[u8], dst: &mut [u16]) {
-    let n = dst.len();
-    let mut i = 0;
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        use std::arch::aarch64::*;
-        // NEON: vrev16q_u8 swaps adjacent bytes in each 16-bit lane (16 bytes = 8 u16 at a time)
-        while i + 8 <= n {
-            unsafe {
-                let bytes = vld1q_u8(src.as_ptr().add(i * 2));
-                let swapped = vrev16q_u8(bytes);
-                vst1q_u8(dst.as_mut_ptr().add(i) as *mut u8, swapped);
-            }
-            i += 8;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("ssse3") {
-            i = unsafe { bswap_u16_ssse3(src, dst, i, n) };
-        }
-    }
-
-    // Scalar remainder
-    for j in i..n {
-        dst[j] = u16::from_be_bytes([src[j * 2], src[j * 2 + 1]]);
-    }
+fn read_raw_bytes(reader: &mut BufReader<File>, len: usize) -> Result<Vec<u8>> {
+    let mut raw = vec![0u8; len];
+    reader.read_exact(&mut raw).context("Failed to read FITS data")?;
+    Ok(raw)
 }
 
-/// SIMD-accelerated big-endian u16 byte swap with XOR 0x8000.
-fn bswap_u16_xor(src: &[u8], dst: &mut [u16]) {
-    let n = dst.len();
-    let mut i = 0;
+/// Marker for plain sample types that may be filled byte-wise from a file.
+trait PlainSample: Copy {}
+impl PlainSample for u16 {}
+impl PlainSample for f32 {}
 
-    #[cfg(target_arch = "aarch64")]
-    {
-        use std::arch::aarch64::*;
-        let xor_mask = unsafe { vdupq_n_u16(0x8000) };
-        while i + 8 <= n {
-            unsafe {
-                let bytes = vld1q_u8(src.as_ptr().add(i * 2));
-                let swapped = vrev16q_u8(bytes);
-                let vals = vreinterpretq_u16_u8(swapped);
-                let result = veorq_u16(vals, xor_mask);
-                vst1q_u16(dst.as_mut_ptr().add(i), result);
-            }
-            i += 8;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("ssse3") {
-            i = unsafe { bswap_u16_xor_ssse3(src, dst, i, n) };
-        }
-    }
-
-    // Scalar remainder
-    for j in i..n {
-        let raw = u16::from_be_bytes([src[j * 2], src[j * 2 + 1]]);
-        dst[j] = raw ^ 0x8000;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "ssse3")]
-unsafe fn bswap_u16_ssse3(src: &[u8], dst: &mut [u16], start: usize, n: usize) -> usize {
-    use std::arch::x86_64::*;
-    let shuffle = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
-    let mut i = start;
-    while i + 8 <= n {
-        let bytes = _mm_loadu_si128(src.as_ptr().add(i * 2) as *const __m128i);
-        let swapped = _mm_shuffle_epi8(bytes, shuffle);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, swapped);
-        i += 8;
-    }
-    i
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "ssse3")]
-unsafe fn bswap_u16_xor_ssse3(src: &[u8], dst: &mut [u16], start: usize, n: usize) -> usize {
-    use std::arch::x86_64::*;
-    let shuffle = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
-    let xor_mask = _mm_set1_epi16(0x8000u16 as i16);
-    let mut i = start;
-    while i + 8 <= n {
-        let bytes = _mm_loadu_si128(src.as_ptr().add(i * 2) as *const __m128i);
-        let swapped = _mm_shuffle_epi8(bytes, shuffle);
-        let result = _mm_xor_si128(swapped, xor_mask);
-        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, result);
-        i += 8;
-    }
-    i
+/// View a sample buffer as its raw bytes, to `read_exact` into it directly.
+fn as_bytes_mut<T: PlainSample>(data: &mut [T]) -> &mut [u8] {
+    // SAFETY: u16 and f32 have no padding and every bit pattern is a valid
+    // value, u8 has alignment 1, and the length covers exactly the same bytes.
+    unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
 }
 
 #[cfg(test)]
