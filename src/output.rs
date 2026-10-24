@@ -3,7 +3,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use image::codecs::png::PngEncoder;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder};
 
 use crate::types::ProcessedImage;
@@ -93,7 +93,61 @@ impl OutputFormat {
     }
 }
 
+/// PNG DEFLATE effort. Stretched astro frames are mostly noise, so the levels
+/// differ a lot. Measured on a 6252x4176 RGB render (78 MB raw, 4 cores):
+/// `None` ~0.1 s / 78 MB, `Fast` ~0.27 s / 77 MB, `Balanced` ~8 s / 30 MB,
+/// `High` ~12 s / 28.5 MB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PngCompression {
+    /// Stored, unfiltered: fastest, largest.
+    None,
+    /// The encoder's default (fast DEFLATE, adaptive filter); byte-identical to
+    /// what `save_processed` has always written.
+    #[default]
+    Fast,
+    /// zlib-default DEFLATE with adaptive filtering.
+    Balanced,
+    /// Maximum DEFLATE effort with adaptive filtering.
+    High,
+}
+
+impl PngCompression {
+    fn encoder_settings(self) -> (CompressionType, FilterType) {
+        match self {
+            // Filtering only helps DEFLATE; without it, it is wasted work.
+            PngCompression::None => (CompressionType::Uncompressed, FilterType::NoFilter),
+            PngCompression::Fast => (CompressionType::Fast, FilterType::Adaptive),
+            PngCompression::Balanced => (CompressionType::Default, FilterType::Adaptive),
+            PngCompression::High => (CompressionType::Best, FilterType::Adaptive),
+        }
+    }
+}
+
+impl std::str::FromStr for PngCompression {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(PngCompression::None),
+            "fast" => Ok(PngCompression::Fast),
+            "balanced" => Ok(PngCompression::Balanced),
+            "high" => Ok(PngCompression::High),
+            _ => anyhow::bail!("unknown PNG compression '{s}' (expected none, fast, balanced or high)"),
+        }
+    }
+}
+
 pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()> {
+    save_image_with(image, path, quality, PngCompression::default())
+}
+
+/// [`save_image`] with an explicit PNG compression level (ignored for JPEG).
+pub fn save_image_with(
+    image: &ProcessedImage,
+    path: &Path,
+    quality: u8,
+    png_compression: PngCompression,
+) -> Result<()> {
     match OutputFormat::from_path(path)? {
         OutputFormat::Png => {
             let file = File::create(path).context("Failed to create output file")?;
@@ -103,7 +157,8 @@ pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()
             } else {
                 ColorType::Rgb8
             };
-            let encoder = PngEncoder::new(writer);
+            let (compression, filter) = png_compression.encoder_settings();
+            let encoder = PngEncoder::new_with_quality(writer, compression, filter);
             encoder
                 .write_image(
                     &image.data,
@@ -183,6 +238,53 @@ mod tests {
             encode_jpeg(&rgb, 32, 24, 3, 100).unwrap(),
             "quality above 100 should behave as 100"
         );
+    }
+
+    fn encode_png(image: &ProcessedImage, level: Option<PngCompression>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let color = if image.channels == 4 { ColorType::Rgba8 } else { ColorType::Rgb8 };
+        let encoder = match level {
+            None => PngEncoder::new(&mut buf),
+            Some(l) => {
+                let (c, f) = l.encoder_settings();
+                PngEncoder::new_with_quality(&mut buf, c, f)
+            }
+        };
+        encoder
+            .write_image(&image.data, image.width as u32, image.height as u32, color.into())
+            .unwrap();
+        buf
+    }
+
+    fn synth_image(w: usize, h: usize) -> ProcessedImage {
+        ProcessedImage { data: synth_rgb(w, h), width: w, height: h, is_color: true, channels: 3, flip_vertical: false }
+    }
+
+    /// The default level must keep writing exactly what `PngEncoder::new`
+    /// (the pre-option behaviour) writes.
+    #[test]
+    fn default_png_compression_is_the_old_encoder_output() {
+        let img = synth_image(37, 23);
+        assert_eq!(encode_png(&img, Some(PngCompression::default())), encode_png(&img, None));
+    }
+
+    #[test]
+    fn every_png_level_round_trips_the_pixels() {
+        let img = synth_image(37, 23);
+        for level in [PngCompression::None, PngCompression::Fast, PngCompression::Balanced, PngCompression::High] {
+            let png = encode_png(&img, Some(level));
+            let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+            assert_eq!(decoded.into_rgb8().into_raw(), img.data, "{level:?}");
+        }
+    }
+
+    #[test]
+    fn png_compression_parses_its_names() {
+        assert_eq!("none".parse::<PngCompression>().unwrap(), PngCompression::None);
+        assert_eq!("FAST".parse::<PngCompression>().unwrap(), PngCompression::Fast);
+        assert_eq!("balanced".parse::<PngCompression>().unwrap(), PngCompression::Balanced);
+        assert_eq!("high".parse::<PngCompression>().unwrap(), PngCompression::High);
+        assert!("best".parse::<PngCompression>().is_err());
     }
 
     #[test]

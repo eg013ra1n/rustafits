@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use astroimage::{annotate_image, AnnotationConfig, ImageAnalyzer, ImageConverter, OutputFormat};
+use astroimage::{annotate_image, AnnotationConfig, ImageAnalyzer, ImageConverter, OutputFormat, PngCompression};
 use std::env;
 use std::process;
 
@@ -15,6 +15,8 @@ fn print_usage(program: &str) {
     eprintln!("Options:");
     eprintln!("  --downscale <N>      Downscale factor (1 = no downscaling, default: 1)");
     eprintln!("  --quality <Q>        JPEG quality 1-100 (default: 95)");
+    eprintln!("  --png-compression <L> PNG compression: none|fast|balanced|high (default: fast;");
+    eprintln!("                       none is ~2.5x faster, balanced ~2.5x smaller but ~30x slower)");
     eprintln!("  --no-debayer         Disable Bayer pattern debayering");
     eprintln!("  --preview            Enable preview mode (2x2 binning for mono, faster)");
     eprintln!("  --annotate           Overlay star detection ellipses on the output image");
@@ -27,6 +29,7 @@ fn print_usage(program: &str) {
     eprintln!("  {} image.xisf image.jpg", program);
     eprintln!("  {} image.fits image.jpg --downscale 2 --quality 90", program);
     eprintln!("  {} raw.fits output.jpg --no-debayer --log", program);
+    eprintln!("  {} image.fits image.png --png-compression none", program);
 }
 
 fn main() {
@@ -56,6 +59,7 @@ fn run() -> Result<()> {
     let mut max_stars: usize = 500;
     let mut measure_cap: usize = 2000;
     let mut log_enabled = false;
+    let mut png_compression = PngCompression::Fast;
 
     let mut i = 3;
     while i < args.len() {
@@ -82,6 +86,13 @@ fn run() -> Result<()> {
                 if quality < 1 || quality > 100 {
                     return Err(anyhow::anyhow!("Quality must be between 1 and 100"));
                 }
+                i += 2;
+            }
+            "--png-compression" => {
+                if i + 1 >= args.len() {
+                    return Err(anyhow::anyhow!("--png-compression requires a value"));
+                }
+                png_compression = args[i + 1].parse()?;
                 i += 2;
             }
             "--no-debayer" => {
@@ -147,7 +158,8 @@ fn run() -> Result<()> {
     // Build converter with options
     let mut converter = ImageConverter::new()
         .with_downscale(downscale)
-        .with_quality(quality);
+        .with_quality(quality)
+        .with_png_compression(png_compression);
 
     if !apply_debayer {
         converter = converter.without_debayer();
@@ -190,7 +202,7 @@ fn run() -> Result<()> {
         annotate_image(&mut image, &result, &AnnotationConfig::default());
 
         // Save
-        ImageConverter::save_processed(&image, output_path, quality)
+        ImageConverter::save_processed_with(&image, output_path, quality, png_compression)
             .context("Image save failed")?;
     } else {
         // Standard conversion

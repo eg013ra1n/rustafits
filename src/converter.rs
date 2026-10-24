@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::formats;
-use crate::output;
+use crate::output::{self, PngCompression};
 use crate::pipeline;
 use crate::types::{ImageMetadata, PixelData, ProcessConfig, ProcessedImage};
 
@@ -15,6 +15,7 @@ pub struct ImageConverter {
     preview_mode: bool,
     rgba_output: bool,
     vng_debayer: bool,
+    png_compression: PngCompression,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
@@ -27,6 +28,7 @@ impl ImageConverter {
             preview_mode: false,
             rgba_output: false,
             vng_debayer: false,
+            png_compression: PngCompression::Fast,
             thread_pool: None,
         }
     }
@@ -63,6 +65,13 @@ impl ImageConverter {
     /// [`ProcessConfig::vng_debayer`].
     pub fn with_vng_debayer(mut self) -> Self {
         self.vng_debayer = true;
+        self
+    }
+
+    /// PNG compression level used by [`convert`](Self::convert) when the
+    /// output is `.png` (default [`PngCompression::Fast`]; ignored for JPEG).
+    pub fn with_png_compression(mut self, level: PngCompression) -> Self {
+        self.png_compression = level;
         self
     }
 
@@ -126,6 +135,18 @@ impl ImageConverter {
             .context("Image save failed")
     }
 
+    /// [`save_processed`](Self::save_processed) with an explicit PNG
+    /// compression level (ignored for JPEG).
+    pub fn save_processed_with<P: AsRef<Path>>(
+        image: &ProcessedImage,
+        output_path: P,
+        quality: u8,
+        png_compression: PngCompression,
+    ) -> Result<()> {
+        output::save_image_with(image, output_path.as_ref(), quality, png_compression)
+            .context("Image save failed")
+    }
+
     /// Process a FITS/XISF image and save the result as JPEG or PNG.
     pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
@@ -136,7 +157,7 @@ impl ImageConverter {
         output::OutputFormat::from_path(output_path.as_ref())?;
         let image = self.process(&input_path)?;
 
-        output::save_image(&image, output_path.as_ref(), self.quality)
+        output::save_image_with(&image, output_path.as_ref(), self.quality, self.png_compression)
             .context("Image save failed")?;
 
         Ok(())
