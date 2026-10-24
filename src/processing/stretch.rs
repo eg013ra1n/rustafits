@@ -1,3 +1,7 @@
+use rayon::prelude::*;
+
+use crate::processing::color;
+
 /// Quickselect: find k-th smallest element (in-place, modifies slice).
 pub(crate) fn quickselect(arr: &mut [f32], k: usize) -> f32 {
     if arr.is_empty() {
@@ -520,6 +524,116 @@ fn apply_stretch_neon(
     }
 }
 
+/// Pixels per parallel work unit for the whole-frame stretch passes below.
+///
+/// Must be a multiple of 8, the widest SIMD body. The SIMD bodies and their
+/// scalar tails do not round alike (x86: the vector path rounds to nearest,
+/// the scalar tail truncates; NEON: a refined reciprocal estimate instead of
+/// a division), so *which* pixels land in a tail is part of the output. With
+/// chunk starts on the same 8-pixel grid as one pass over the whole channel,
+/// every chunk but the last is pure SIMD body and the last one carries exactly
+/// the original tail: byte-identical to the single pass for any width.
+/// (Splitting per image row would put `width % 8` tail pixels on every row.)
+pub(crate) const PAR_CHUNK: usize = 32 * 1024;
+#[allow(clippy::manual_is_multiple_of)] // `is_multiple_of` needs Rust 1.87
+const _: () = assert!(PAR_CHUNK % 8 == 0);
+
+/// `(native_shadows, native_highlights, k1, k2, midtones)`, as `apply_stretch` takes them.
+pub(crate) type StretchCoeffs = (f32, f32, f32, f32, f32);
+
+/// The signature shared by `apply_stretch` and its per-ISA bodies.
+type StretchKernel = fn(&[f32], &mut [u8], usize, usize, f32, f32, f32, f32, f32);
+
+/// Stretch a mono u16 plane straight into interleaved RGB (`bpp` 3) or RGBA
+/// (`bpp` 4, alpha 255), in parallel, without a full-frame gray intermediate.
+pub(crate) fn stretch_gray_u16_interleaved(data: &[u16], out: &mut [u8], bpp: usize, c: StretchCoeffs) {
+    assert_eq!(out.len(), data.len() * bpp, "output must hold bpp bytes per pixel");
+    let (ns, nh, k1, k2, m) = c;
+    out.par_chunks_mut(PAR_CHUNK * bpp)
+        .zip(data.par_chunks(PAR_CHUNK))
+        .for_each_init(
+            || vec![0u8; PAR_CHUNK],
+            |gray, (o, src)| {
+                let gray = &mut gray[..src.len()];
+                apply_stretch_from_u16(src, gray, 0, 1, ns, nh, k1, k2, m);
+                replicate_gray(gray, o, bpp);
+            },
+        );
+}
+
+/// [`stretch_gray_u16_interleaved`] for a mono f32 plane.
+pub(crate) fn stretch_gray_f32_interleaved(data: &[f32], out: &mut [u8], bpp: usize, c: StretchCoeffs) {
+    stretch_gray_f32_interleaved_with(apply_stretch, data, out, bpp, c);
+}
+
+fn stretch_gray_f32_interleaved_with(
+    kernel: StretchKernel,
+    data: &[f32],
+    out: &mut [u8],
+    bpp: usize,
+    c: StretchCoeffs,
+) {
+    assert_eq!(out.len(), data.len() * bpp, "output must hold bpp bytes per pixel");
+    let (ns, nh, k1, k2, m) = c;
+    out.par_chunks_mut(PAR_CHUNK * bpp)
+        .zip(data.par_chunks(PAR_CHUNK))
+        .for_each_init(
+            || vec![0u8; PAR_CHUNK],
+            |gray, (o, src)| {
+                let gray = &mut gray[..src.len()];
+                kernel(src, gray, 0, 1, ns, nh, k1, k2, m);
+                replicate_gray(gray, o, bpp);
+            },
+        );
+}
+
+fn replicate_gray(gray: &[u8], out: &mut [u8], bpp: usize) {
+    if bpp == 4 {
+        color::replicate_gray_to_rgba_into(gray, out);
+    } else {
+        color::replicate_gray_to_rgb_into(gray, out);
+    }
+}
+
+/// Stretch planar channels (RRR…GGG…BBB…, `channel_size` pixels each, one
+/// coefficient set per channel) into interleaved RGB (`bpp` 3) or RGBA (`bpp`
+/// 4, alpha 255), in parallel over pixel chunks.
+pub(crate) fn stretch_planar_interleaved(
+    planes: &[f32],
+    channel_size: usize,
+    out: &mut [u8],
+    bpp: usize,
+    coeffs: &[StretchCoeffs],
+) {
+    stretch_planar_interleaved_with(apply_stretch, planes, channel_size, out, bpp, coeffs);
+}
+
+fn stretch_planar_interleaved_with(
+    kernel: StretchKernel,
+    planes: &[f32],
+    channel_size: usize,
+    out: &mut [u8],
+    bpp: usize,
+    coeffs: &[StretchCoeffs],
+) {
+    assert!(coeffs.len() <= bpp, "more channels than output bytes per pixel");
+    assert!(planes.len() >= coeffs.len() * channel_size, "planes shorter than channels x channel_size");
+    assert_eq!(out.len(), channel_size * bpp, "output must hold bpp bytes per pixel");
+    out.par_chunks_mut(PAR_CHUNK * bpp).enumerate().for_each(|(k, o)| {
+        let start = k * PAR_CHUNK;
+        let end = start + o.len() / bpp;
+        for (c, &(ns, nh, k1, k2, m)) in coeffs.iter().enumerate() {
+            let plane = &planes[c * channel_size..(c + 1) * channel_size];
+            kernel(&plane[start..end], o, c, bpp, ns, nh, k1, k2, m);
+        }
+        if bpp == 4 {
+            for px in o.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +725,164 @@ mod tests {
                 (a - u).abs() <= 3,
                 "u16-domain ({probe} ADU) → {a}, [0,1]-domain → {u}: must agree within 3"
             );
+        }
+    }
+
+    // ---- Chunked whole-frame passes vs the single-pass bodies they replaced ----
+    //
+    // The oracles below are the pre-1.6 pipeline bodies: one kernel call over
+    // the whole channel (stride `bpp` for colour), then gray→RGB(A) by copy.
+    // Each is run with the same kernel as the chunked pass, for every kernel
+    // the host can execute, so the SSE2 path is checked even on AVX2 hardware.
+
+    const SIZES: &[usize] = &[
+        0, 1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 1003 * 7, 1006 * 5,
+        PAR_CHUNK - 1, PAR_CHUNK, PAR_CHUNK + 1, PAR_CHUNK + 7, 2 * PAR_CHUNK + 5, 100_003,
+    ];
+
+    fn scalar_kernel(d: &[f32], o: &mut [u8], off: usize, stride: usize, ns: f32, nh: f32, k1: f32, k2: f32, m: f32) {
+        for (i, &v) in d.iter().enumerate() {
+            o[off + i * stride] = stretch_pixel(v, ns, nh, k1, k2, m);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn sse2_kernel(d: &[f32], o: &mut [u8], off: usize, stride: usize, ns: f32, nh: f32, k1: f32, k2: f32, m: f32) {
+        apply_stretch_sse2(d, o, off, stride, ns, nh, k1, k2, m);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_kernel(d: &[f32], o: &mut [u8], off: usize, stride: usize, ns: f32, nh: f32, k1: f32, k2: f32, m: f32) {
+        assert!(is_x86_feature_detected!("avx2"));
+        unsafe { apply_stretch_avx2(d, o, off, stride, ns, nh, k1, k2, m) };
+    }
+
+    fn kernels() -> Vec<(&'static str, StretchKernel)> {
+        let mut k: Vec<(&'static str, StretchKernel)> = vec![("dispatch", apply_stretch), ("scalar", scalar_kernel)];
+        #[cfg(target_arch = "x86_64")]
+        {
+            k.push(("sse2", sse2_kernel));
+            if is_x86_feature_detected!("avx2") {
+                k.push(("avx2", avx2_kernel));
+            }
+        }
+        k
+    }
+
+    /// Frame-like data spanning below-shadows, the curve and above-highlights,
+    /// with NaN sprinkled in (float frames carry it).
+    fn frame_f32(n: usize, seed: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let j = i.wrapping_mul(2654435761).wrapping_add(seed);
+                if j % 997 == 0 {
+                    f32::NAN
+                } else {
+                    let t = ((j % 10007) as f32 / 10007.0).powi(3);
+                    400.0 + t * 64000.0
+                }
+            })
+            .collect()
+    }
+
+    fn coeffs_for(data: &[f32]) -> StretchCoeffs {
+        let p = compute_stretch_params(data, 65536.0);
+        let hs = if p.highlights == p.shadows { 1.0 } else { 1.0 / (p.highlights - p.shadows) };
+        (
+            p.shadows * 65536.0,
+            p.highlights * 65536.0,
+            (p.midtones - 1.0) * hs * 255.0 / 65536.0,
+            (2.0 * p.midtones - 1.0) * hs / 65536.0,
+            p.midtones,
+        )
+    }
+
+    fn replicate_oracle(gray: &[u8], bpp: usize) -> Vec<u8> {
+        gray.iter()
+            .flat_map(|&g| if bpp == 4 { vec![g, g, g, 255] } else { vec![g, g, g] })
+            .collect()
+    }
+
+    #[test]
+    fn chunked_gray_f32_is_byte_identical_to_one_pass() {
+        for (name, kernel) in kernels() {
+            for &n in SIZES {
+                let data = frame_f32(n, n);
+                let c = if n > 0 { coeffs_for(&data) } else { (0.0, 65536.0, 0.001, 0.0001, 0.5) };
+                let mut gray = vec![0u8; n];
+                kernel(&data, &mut gray, 0, 1, c.0, c.1, c.2, c.3, c.4);
+                for bpp in [3, 4] {
+                    let mut out = vec![0u8; n * bpp];
+                    stretch_gray_f32_interleaved_with(kernel, &data, &mut out, bpp, c);
+                    assert!(out == replicate_oracle(&gray, bpp), "{name}: n={n} bpp={bpp}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_gray_u16_is_byte_identical_to_one_pass() {
+        for &n in SIZES {
+            let data: Vec<u16> = frame_f32(n, 3 * n)
+                .into_iter()
+                .map(|v| if v.is_nan() { 0 } else { v as u16 })
+                .collect();
+            let as_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+            let c = if n > 0 { coeffs_for(&as_f32) } else { (0.0, 65536.0, 0.001, 0.0001, 0.5) };
+            let mut gray = vec![0u8; n];
+            apply_stretch_from_u16(&data, &mut gray, 0, 1, c.0, c.1, c.2, c.3, c.4);
+            for bpp in [3, 4] {
+                let mut out = vec![0u8; n * bpp];
+                stretch_gray_u16_interleaved(&data, &mut out, bpp, c);
+                assert!(out == replicate_oracle(&gray, bpp), "n={n} bpp={bpp}");
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_planar_is_byte_identical_to_one_pass() {
+        for (name, kernel) in kernels() {
+            for &n in SIZES {
+                let planes: Vec<f32> = (0..3).flat_map(|c| frame_f32(n, 7 * n + c)).collect();
+                let coeffs: Vec<StretchCoeffs> = (0..3)
+                    .map(|c| if n > 0 { coeffs_for(&planes[c * n..(c + 1) * n]) } else { (0.0, 65536.0, 0.001, 0.0001, 0.5) })
+                    .collect();
+                for bpp in [3, 4] {
+                    let mut oracle = vec![0u8; n * bpp];
+                    for (c, &(ns, nh, k1, k2, m)) in coeffs.iter().enumerate() {
+                        kernel(&planes[c * n..(c + 1) * n], &mut oracle, c, bpp, ns, nh, k1, k2, m);
+                    }
+                    if bpp == 4 {
+                        for i in 0..n {
+                            oracle[i * 4 + 3] = 255;
+                        }
+                    }
+                    let mut out = vec![0u8; n * bpp];
+                    stretch_planar_interleaved_with(kernel, &planes, n, &mut out, bpp, &coeffs);
+                    assert!(out == oracle, "{name}: n={n} bpp={bpp}");
+                }
+            }
+        }
+    }
+
+    /// Guards the guard: on x86 the SIMD bodies round to nearest while the
+    /// scalar tail truncates, so a split that moves pixels into a tail (one
+    /// call per 1003-pixel row) must change bytes. If this ever stops holding,
+    /// the identity tests above no longer prove anything about chunk alignment.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_misaligned_split_would_change_bytes() {
+        let (w, h) = (1003, 7);
+        let data = frame_f32(w * h, 11);
+        let c = coeffs_for(&data);
+        for (name, kernel) in kernels().into_iter().filter(|(n, _)| *n == "sse2" || *n == "avx2") {
+            let mut whole = vec![0u8; w * h];
+            kernel(&data, &mut whole, 0, 1, c.0, c.1, c.2, c.3, c.4);
+            let mut per_row = vec![0u8; w * h];
+            for (src, dst) in data.chunks(w).zip(per_row.chunks_mut(w)) {
+                kernel(src, dst, 0, 1, c.0, c.1, c.2, c.3, c.4);
+            }
+            assert!(whole != per_row, "{name}: per-row split unexpectedly identical");
         }
     }
 }
