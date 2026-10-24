@@ -1,4 +1,4 @@
-//! `rustafits` — convert FITS/XISF astronomical images to auto-stretched JPEG/PNG.
+//! Conversion to JPEG/PNG — the default command.
 //!
 //! One file (`rustafits in.fits out.jpg`, the classic form) or many
 //! (`rustafits *.fits -o previews/ -j 4`): inputs are planned up front (output
@@ -9,19 +9,17 @@
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use astroimage::{
     annotate_image, encode_jpeg, encode_png, AnnotationConfig, ImageAnalyzer, ImageConverter,
-    OutputFormat, PngCompression, ProcessedImage, ThreadPool, ThreadPoolBuilder,
+    OutputFormat, PngCompression, ProcessedImage, ThreadPool,
 };
-use clap::{Parser, ValueEnum};
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use clap::{Args, ValueEnum};
 
-const INPUT_EXTENSIONS: &[&str] = &["fits", "fit", "fts", "xisf"];
+use crate::batch::{self, file_name, has_extension, Input, INPUT_EXTENSIONS};
 
 /// Files converted at once when `--jobs` is not given. Every file already uses
 /// all cores for its pixel work; extra jobs mainly overlap the single-threaded
@@ -30,25 +28,10 @@ const INPUT_EXTENSIONS: &[&str] = &["fits", "fit", "fts", "xisf"];
 /// --annotate the analysis saturates the cores by itself, 11.5 s at 1 job,
 /// 8.6 s at 2 or 4, but 1.5 GB at 2 and 2.2 GB at 4 — hence a lower cap.
 const DEFAULT_MAX_JOBS: usize = 4;
-const DEFAULT_MAX_JOBS_ANNOTATE: usize = 2;
+pub const DEFAULT_MAX_JOBS_ANALYSIS: usize = 2;
 
-const EXAMPLES: &str = "\
-Examples:
-  rustafits light.fits                      # → light.jpg next to it
-  rustafits m31.fits m31.png                # classic form: input, output
-  rustafits *.fits -o previews/             # batch into a directory
-  rustafits night1/ -r -o out/ -n           # a tree, mirrored; skip existing
-  rustafits m31.xisf -o - | viewer -        # JPEG on stdout
-  rustafits osc.fits -o full.jpg --vng      # OSC at native resolution";
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "rustafits",
-    version,
-    about = "Convert FITS/XISF astronomical images to auto-stretched JPEG/PNG",
-    after_help = EXAMPLES
-)]
-struct Cli {
+#[derive(Args, Debug, Clone)]
+pub struct ConvertArgs {
     /// Input FITS/XISF files or directories (.fits .fit .fts .xisf). With
     /// exactly two paths, the second is the output if it is `-`, ends in
     /// .jpg/.jpeg/.png, or does not exist (the classic `in out` form).
@@ -191,93 +174,54 @@ struct Job {
     format: OutputFormat,
 }
 
-fn main() {
-    let cli = Cli::parse();
-    match run(cli) {
-        Ok(true) => {}
-        Ok(false) => std::process::exit(1),
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            std::process::exit(1);
-        }
-    }
+#[derive(Default)]
+struct Tally {
+    converted: usize,
+    skipped: usize,
+    failed: usize,
 }
 
 /// `Ok(false)`: the run happened but at least one file failed.
-fn run(cli: Cli) -> Result<bool> {
-    let jobs = plan(&cli)?;
-
-    let pool = Arc::new(
-        ThreadPoolBuilder::new()
-            .num_threads(cli.threads.map_or(0, |n| n as usize))
-            .build()
-            .context("failed to create thread pool")?,
-    );
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let default_jobs = if cli.annotate { DEFAULT_MAX_JOBS_ANNOTATE } else { DEFAULT_MAX_JOBS };
-    let workers = cli
-        .jobs
-        .map_or(default_jobs.min(cores), |n| n as usize)
-        .min(jobs.len())
-        .max(1);
-
-    let batch = jobs.len() > 1;
-    let bar = if batch && !cli.quiet {
-        let bar = ProgressBar::with_draw_target(Some(jobs.len() as u64), ProgressDrawTarget::stderr());
-        bar.set_style(
-            ProgressStyle::with_template("{elapsed_precise} [{bar:30}] {pos}/{len} eta {eta}  {msg}")
-                .expect("valid template")
-                .progress_chars("=> "),
-        );
-        bar
-    } else {
-        ProgressBar::hidden()
-    };
+pub fn run(args: ConvertArgs) -> Result<bool> {
+    let jobs = plan(&args)?;
+    let pool = batch::thread_pool(args.threads)?;
+    let default_jobs = if args.annotate { DEFAULT_MAX_JOBS_ANALYSIS } else { DEFAULT_MAX_JOBS };
+    let workers = batch::workers(args.jobs, default_jobs, jobs.len());
+    let bar = batch::progress_bar(jobs.len(), args.quiet);
 
     let started = Instant::now();
-    let next = AtomicUsize::new(0);
     let tally = Mutex::new(Tally::default());
-
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(job) = jobs.get(i) else { break };
-                bar.set_message(file_name(&job.input));
-
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    convert_one(job, &cli, &pool)
-                }))
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error (panic) while converting")));
-
-                let mut t = tally.lock().unwrap();
-                match outcome {
-                    Ok(Outcome::Converted(report)) => {
-                        t.converted += 1;
-                        if cli.verbose {
-                            bar.suspend(|| eprintln!("{}", report.line(job)));
-                        }
-                    }
-                    Ok(Outcome::Skipped) => {
-                        t.skipped += 1;
-                        if cli.verbose {
-                            bar.suspend(|| eprintln!("skip {} (exists)", job.target.display()));
-                        }
-                    }
-                    Err(e) => {
-                        t.failed += 1;
-                        bar.suspend(|| eprintln!("error: {}: {e:#}", job.input.display()));
+    batch::run_parallel(
+        &jobs,
+        workers,
+        &bar,
+        |job| file_name(&job.input),
+        |job| convert_one(job, &args, &pool),
+        |job, outcome| {
+            let mut t = tally.lock().unwrap();
+            match outcome {
+                Ok(Outcome::Converted(report)) => {
+                    t.converted += 1;
+                    if args.verbose {
+                        eprintln!("{}", report.line(job));
                     }
                 }
-                drop(t);
-                bar.inc(1);
-            });
-        }
-    });
-    bar.finish_and_clear();
+                Ok(Outcome::Skipped) => {
+                    t.skipped += 1;
+                    if args.verbose {
+                        eprintln!("skip {} (exists)", job.target.display());
+                    }
+                }
+                Err(e) => {
+                    t.failed += 1;
+                    eprintln!("error: {}: {e:#}", job.input.display());
+                }
+            }
+        },
+    );
 
     let t = tally.into_inner().unwrap();
-    if !cli.quiet && (batch || cli.verbose) {
+    if !args.quiet && (jobs.len() > 1 || args.verbose) {
         let mut summary = format!("{} converted", t.converted);
         if t.skipped > 0 {
             summary += &format!(", {} skipped", t.skipped);
@@ -290,44 +234,20 @@ fn run(cli: Cli) -> Result<bool> {
     Ok(t.failed == 0)
 }
 
-#[derive(Default)]
-struct Tally {
-    converted: usize,
-    skipped: usize,
-    failed: usize,
-}
-
 // ---------------------------------------------------------------- planning
 
 /// Resolve inputs and output paths, and reject everything that can be caught
 /// before any pixel work: missing inputs, unsupported output extensions,
 /// two inputs mapping to one output, `-` with several inputs.
-fn plan(cli: &Cli) -> Result<Vec<Job>> {
-    let (input_paths, positional_output) = split_positionals(&cli.paths);
-    let output = match (positional_output, &cli.output) {
+fn plan(args: &ConvertArgs) -> Result<Vec<Job>> {
+    let (input_paths, positional_output) = split_positionals(&args.paths);
+    let output = match (positional_output, &args.output) {
         (Some(_), Some(_)) => bail!("output given twice: as the second path and with -o"),
         (p, o) => p.or(o.clone()),
     };
+    let mut inputs = batch::collect_inputs(&input_paths, args.recursive)?;
 
-    let mut inputs = Vec::new(); // (path, path relative to its root for mirroring)
-    for path in &input_paths {
-        if path.is_dir() {
-            let before = inputs.len();
-            collect_dir(path, path, cli.recursive, &mut inputs)?;
-            if inputs.len() == before {
-                eprintln!("warning: no FITS/XISF files in {}", path.display());
-            }
-        } else if path.is_file() {
-            inputs.push((path.clone(), PathBuf::from(path.file_name().unwrap_or_default())));
-        } else {
-            bail!("input not found: {}", path.display());
-        }
-    }
-    if inputs.is_empty() {
-        bail!("no FITS/XISF input files");
-    }
-
-    let format = cli.format.unwrap_or(Format::Jpg);
+    let format = args.format.unwrap_or(Format::Jpg);
     let derived = |base: &Path| base.with_extension(format.extension());
 
     let jobs: Vec<Job> = match output {
@@ -338,31 +258,31 @@ fn plan(cli: &Cli) -> Result<Vec<Job>> {
             if std::io::stdout().is_terminal() {
                 bail!("refusing to write image data to a terminal; redirect stdout or use -o FILE");
             }
-            vec![Job { input: inputs.remove(0).0, target: Target::Stdout, format: format.output_format() }]
+            vec![Job { input: inputs.remove(0).path, target: Target::Stdout, format: format.output_format() }]
         }
         Some(o) if inputs.len() > 1 || o.is_dir() || ends_with_separator(&o) => inputs
             .into_iter()
-            .map(|(input, rel)| Job {
+            .map(|Input { path, rel }| Job {
                 target: Target::File(o.join(derived(&rel))),
                 format: format.output_format(),
-                input,
+                input: path,
             })
             .collect(),
         Some(o) => {
             let out_format = OutputFormat::from_path(&o)?;
-            if let Some(f) = cli.format {
+            if let Some(f) = args.format {
                 if f.output_format() != out_format {
                     bail!("--format {} conflicts with the output name {}", f.extension(), o.display());
                 }
             }
-            vec![Job { input: inputs.remove(0).0, target: Target::File(o), format: out_format }]
+            vec![Job { input: inputs.remove(0).path, target: Target::File(o), format: out_format }]
         }
         None => inputs
             .into_iter()
-            .map(|(input, _)| Job {
-                target: Target::File(derived(&input)),
+            .map(|Input { path, .. }| Job {
+                target: Target::File(derived(&path)),
                 format: format.output_format(),
-                input,
+                input: path,
             })
             .collect(),
     };
@@ -398,40 +318,10 @@ fn split_positionals(paths: &[PathBuf]) -> (Vec<PathBuf>, Option<PathBuf>) {
     (paths.to_vec(), None)
 }
 
-fn collect_dir(root: &Path, dir: &Path, recursive: bool, out: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("cannot read directory {}", dir.display()))?
-        .map(|e| e.map(|e| e.path()))
-        .collect::<std::io::Result<_>>()
-        .with_context(|| format!("cannot read directory {}", dir.display()))?;
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            if recursive {
-                collect_dir(root, &path, recursive, out)?;
-            }
-        } else if has_extension(&path, INPUT_EXTENSIONS) {
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-            out.push((path, rel));
-        }
-    }
-    Ok(())
-}
-
-fn has_extension(path: &Path, exts: &[&str]) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| exts.iter().any(|x| e.eq_ignore_ascii_case(x)))
-}
-
 fn ends_with_separator(path: &Path) -> bool {
     path.as_os_str()
         .to_str()
         .is_some_and(|s| s.ends_with('/') || s.ends_with(std::path::MAIN_SEPARATOR))
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 // -------------------------------------------------------------- conversion
@@ -475,8 +365,8 @@ impl Report {
     }
 }
 
-fn convert_one(job: &Job, cli: &Cli, pool: &Arc<ThreadPool>) -> Result<Outcome> {
-    if cli.skip_existing {
+fn convert_one(job: &Job, args: &ConvertArgs, pool: &Arc<ThreadPool>) -> Result<Outcome> {
+    if args.skip_existing {
         if let Target::File(out) = &job.target {
             if out.exists() {
                 return Ok(Outcome::Skipped);
@@ -488,11 +378,11 @@ fn convert_one(job: &Job, cli: &Cli, pool: &Arc<ThreadPool>) -> Result<Outcome> 
     let (meta, pixels) = ImageConverter::read_raw(&job.input)?;
     let read = t.elapsed();
 
-    let analysis = if cli.annotate {
+    let analysis = if args.annotate {
         let t = Instant::now();
         let result = ImageAnalyzer::new()
-            .with_max_stars(cli.max_stars as usize)
-            .with_measure_cap(cli.measure_cap)
+            .with_max_stars(args.max_stars as usize)
+            .with_measure_cap(args.measure_cap)
             .with_thread_pool(pool.clone())
             .analyze_raw(&meta, &pixels)
             .context("analysis failed")?;
@@ -502,15 +392,15 @@ fn convert_one(job: &Job, cli: &Cli, pool: &Arc<ThreadPool>) -> Result<Outcome> 
     };
 
     let mut converter = ImageConverter::new()
-        .with_downscale(cli.downscale as usize)
+        .with_downscale(args.downscale as usize)
         .with_thread_pool(pool.clone());
-    if cli.no_debayer {
+    if args.no_debayer {
         converter = converter.without_debayer();
     }
-    if cli.vng {
+    if args.vng {
         converter = converter.with_vng_debayer();
     }
-    if cli.preview {
+    if args.preview {
         converter = converter.with_preview_mode();
     }
 
@@ -522,7 +412,7 @@ fn convert_one(job: &Job, cli: &Cli, pool: &Arc<ThreadPool>) -> Result<Outcome> 
     let process = t.elapsed();
 
     let t = Instant::now();
-    let bytes = encode(&image, job.format, cli)?;
+    let bytes = encode(&image, job.format, args)?;
     let encode = t.elapsed();
 
     let t = Instant::now();
@@ -546,12 +436,12 @@ fn convert_one(job: &Job, cli: &Cli, pool: &Arc<ThreadPool>) -> Result<Outcome> 
     }))
 }
 
-fn encode(image: &ProcessedImage, format: OutputFormat, cli: &Cli) -> Result<Vec<u8>> {
+fn encode(image: &ProcessedImage, format: OutputFormat, args: &ConvertArgs) -> Result<Vec<u8>> {
     let channels = image.channels as usize;
     match format {
-        OutputFormat::Jpeg => encode_jpeg(&image.data, image.width, image.height, channels, cli.quality),
+        OutputFormat::Jpeg => encode_jpeg(&image.data, image.width, image.height, channels, args.quality),
         OutputFormat::Png => {
-            encode_png(&image.data, image.width, image.height, channels, cli.png_compression.into())
+            encode_png(&image.data, image.width, image.height, channels, args.png_compression.into())
         }
     }
 }

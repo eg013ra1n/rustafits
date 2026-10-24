@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use astroimage::ImageConverter;
+use astroimage::{ImageAnalyzer, ImageConverter};
 
 const BIN: &str = env!("CARGO_BIN_EXE_rustafits");
 
@@ -20,6 +20,30 @@ fn scratch(name: &str) -> PathBuf {
 /// Minimal 16-bit FITS (BZERO 32768) with a gradient, a few "stars" and an
 /// optional Bayer pattern — enough structure for a non-flat stretch.
 fn write_fits(path: &Path, w: usize, h: usize, bayer: Option<&str>) {
+    let mut extra = Vec::new();
+    if let Some(p) = bayer {
+        extra.push(format!("BAYERPAT= '{p}'"));
+    }
+    write_fits_with(path, w, h, &extra, |x, y| {
+        let noise = ((x * 7919 + y * 104_729) % 97) as f64;
+        let star = if (x % 17 == 5) && (y % 13 == 4) { 20_000.0 } else { 0.0 };
+        1500.0 + (x + y) as f64 * 3.0 + noise + star
+    });
+}
+
+/// A star field the analyzer measures: round Gaussian stars of width `sigma`
+/// on a 24 px grid over a noisy background, plus header keywords.
+fn write_star_field(path: &Path, sigma: f64, extra: &[String]) {
+    write_fits_with(path, 320, 240, extra, |x, y| {
+        let noise = (((x * 7919 + y * 104_729) % 61) as f64 - 30.0) * 1.5;
+        let (cx, cy) = (((x / 24) * 24 + 12) as f64, ((y / 24) * 24 + 12) as f64);
+        let amp = 4000.0 + ((x / 24 * 7 + y / 24 * 13) % 9) as f64 * 1500.0;
+        let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
+        1000.0 + noise + amp * (-r2 / (2.0 * sigma * sigma)).exp()
+    });
+}
+
+fn write_fits_with(path: &Path, w: usize, h: usize, extra: &[String], pixel: impl Fn(usize, usize) -> f64) {
     let mut cards = vec![
         "SIMPLE  =                    T".to_string(),
         "BITPIX  =                   16".to_string(),
@@ -29,17 +53,13 @@ fn write_fits(path: &Path, w: usize, h: usize, bayer: Option<&str>) {
         "BZERO   =                32768".to_string(),
         "BSCALE  =                    1".to_string(),
     ];
-    if let Some(p) = bayer {
-        cards.push(format!("BAYERPAT= '{p}'"));
-    }
+    cards.extend(extra.iter().cloned());
     cards.push("END".to_string());
     let header: String = cards.iter().map(|c| format!("{c:<80}")).collect();
     let mut bytes = format!("{header:<width$}", width = header.len().next_multiple_of(2880)).into_bytes();
     for y in 0..h {
         for x in 0..w {
-            let noise = ((x * 7919 + y * 104_729) % 97) as i64;
-            let star = if (x % 17 == 5) && (y % 13 == 4) { 20_000 } else { 0 };
-            let v = (1500 + (x + y) as i64 * 3 + noise + star).min(65_535);
+            let v = pixel(x, y).round().clamp(0.0, 65_535.0) as i64;
             bytes.extend_from_slice(&((v - 32_768) as i16).to_be_bytes());
         }
     }
@@ -220,5 +240,117 @@ fn verbose_reports_each_file_on_stderr() {
         assert!(o.stdout.is_empty(), "logs never go to stdout");
         let err = stderr(&o);
         assert!(err.contains("m.fits -> out.jpg") && err.contains("64x48"), "{flag}: {err}");
+    }
+}
+
+fn stdout(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+#[test]
+fn info_summarises_headers_without_pixels() {
+    let dir = scratch("info");
+    let extra = |exp: &str, filter: &str| {
+        vec![
+            format!("EXPTIME = {exp:>20} / [s]"),
+            format!("FILTER  = '{filter}'"),
+            "FOCALLEN=                448.0".to_string(),
+            "COMMENT  synthetic".to_string(),
+        ]
+    };
+    write_star_field(&dir.join("a.fits"), 1.5, &extra("30.0", "Ha"));
+    write_star_field(&dir.join("b.fits"), 1.5, &extra("120.0", "OIII"));
+
+    let o = run(&dir, &["info", "a.fits", "b.fits", "-k", "FOCALLEN"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert!(lines[0].starts_with("FILE") && lines[0].contains("EXP") && lines[0].ends_with("FOCALLEN"));
+    assert!(lines[1].contains("a.fits") && lines[1].contains("320x240") && lines[1].contains("30.0") && lines[1].contains("Ha"));
+    assert!(lines[2].contains("120.0") && lines[2].contains("OIII") && lines[2].contains("448.0"));
+
+    let o = run(&dir, &["info", "a.fits", "--csv"]);
+    assert_eq!(stdout(&o).lines().nth(1).unwrap(), "a.fits,320x240,u16,-,30.0,Ha,-,-,-,-");
+
+    let o = run(&dir, &["info", "a.fits", "--json"]);
+    let json = stdout(&o);
+    assert!(json.contains("\"width\": 320") && json.contains("\"bayer\": null"), "{json}");
+    assert!(json.contains("{\"key\": \"FILTER\", \"value\": \"Ha\", \"comment\": \"\"}"), "{json}");
+
+    let o = run(&dir, &["info", "a.fits", "--all"]);
+    let all = stdout(&o);
+    assert!(all.contains("EXPTIME  = 30.0  / [s]") && all.contains("COMMENT  = synthetic"), "{all}");
+}
+
+/// Parse `analyze --csv` into (header, rows).
+fn analyze_csv(dir: &Path, args: &[&str]) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut full = vec!["analyze", "--csv", "--quiet"];
+    full.extend_from_slice(args);
+    let o = run(dir, &full);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    let mut lines = out.lines().map(|l| l.split(',').map(str::to_string).collect::<Vec<_>>());
+    let header = lines.next().unwrap();
+    (header, lines.collect())
+}
+
+#[test]
+fn analyze_reports_exactly_what_the_library_measures() {
+    let dir = scratch("analyze");
+    write_star_field(&dir.join("sharp.fits"), 1.2, &[]);
+    write_star_field(&dir.join("soft.fits"), 2.2, &[]);
+
+    let (header, rows) = analyze_csv(&dir, &["sharp.fits", "soft.fits"]);
+    let col = |name: &str| header.iter().position(|h| h == name).unwrap();
+    for (row, file) in rows.iter().zip(["sharp.fits", "soft.fits"]) {
+        let lib = ImageAnalyzer::new().analyze(dir.join(file)).unwrap();
+        assert!(lib.stars_detected > 20, "{file}: the field must be measurable");
+        assert_eq!(row[col("file")], file);
+        assert_eq!(row[col("stars_detected")], lib.stars_detected.to_string());
+        assert_eq!(row[col("median_fwhm")], lib.median_fwhm.to_string());
+        assert_eq!(row[col("median_hfr")], lib.median_hfr.to_string());
+        assert_eq!(row[col("median_eccentricity")], lib.median_eccentricity.to_string());
+        assert_eq!(row[col("snr_weight")], lib.snr_weight.to_string());
+    }
+
+    // Best-first by FWHM puts the sharp field first whatever the input order.
+    let (_, rows) = analyze_csv(&dir, &["soft.fits", "sharp.fits", "--sort", "fwhm"]);
+    assert_eq!((rows[0][0].as_str(), rows[1][0].as_str()), ("sharp.fits", "soft.fits"));
+    let (_, rows) = analyze_csv(&dir, &["sharp.fits", "soft.fits", "--sort", "fwhm", "--reverse"]);
+    assert_eq!(rows[0][0], "soft.fits");
+
+    // Table and JSON carry the same frames.
+    let o = run(&dir, &["analyze", "sharp.fits", "soft.fits", "--quiet"]);
+    let table = stdout(&o);
+    assert!(table.starts_with("FILE") && table.contains("sharp.fits") && table.contains("soft.fits"), "{table}");
+    let o = run(&dir, &["analyze", "sharp.fits", "--json"]);
+    assert!(stdout(&o).contains("\"file\": \"sharp.fits\""));
+}
+
+#[test]
+fn analyze_reports_a_broken_file_and_keeps_the_rest() {
+    let dir = scratch("analyze-broken");
+    write_star_field(&dir.join("good.fits"), 1.5, &[]);
+    std::fs::write(dir.join("broken.fits"), b"SIMPLE  =                    T").unwrap();
+    let o = run(&dir, &["analyze", "good.fits", "broken.fits", "--csv", "--quiet"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("broken.fits"));
+    assert_eq!(stdout(&o).lines().count(), 2, "header + the good frame");
+}
+
+#[test]
+fn convert_subcommand_and_completions() {
+    let dir = scratch("subcommands");
+    write_fits(&dir.join("m.fits"), 64, 48, None);
+    assert!(run(&dir, &["convert", "m.fits", "a.jpg"]).status.success());
+    assert!(run(&dir, &["m.fits", "b.jpg"]).status.success());
+    assert_eq!(std::fs::read(dir.join("a.jpg")).unwrap(), std::fs::read(dir.join("b.jpg")).unwrap());
+
+    for shell in ["bash", "zsh", "fish"] {
+        let o = run(&dir, &["completions", shell]);
+        assert!(o.status.success(), "{shell}");
+        let script = stdout(&o);
+        assert!(script.contains("rustafits") && script.contains("analyze") && script.contains("png-compression"), "{shell}");
     }
 }
