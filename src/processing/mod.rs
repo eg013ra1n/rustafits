@@ -1,4 +1,5 @@
 pub mod binning;
+pub mod cfa;
 pub mod color;
 pub mod debayer;
 pub mod downscale;
