@@ -49,7 +49,7 @@ Pipeline flow for u16 data:
    pipeline to `vng_debayer_f32` instead: full native resolution, and the whole
    downscale factor still applies. `vng_debayer_f32` is also a library entry
    point callers invoke directly (Athenaeum's calibrated-lights export does).
-   The CLI does not expose VNG.
+   The CLI exposes it as `--vng`.
 3. Downscale (integer factor, operates on raw u16 before float conversion when possible)
 4. u16→f32 conversion (SIMD-accelerated)
 5. Preview binning (optional 2x2)
