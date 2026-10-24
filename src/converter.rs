@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use crate::formats;
 use crate::output::{self, PngCompression};
 use crate::pipeline;
-use crate::types::{ImageMetadata, PixelData, ProcessConfig, ProcessedImage};
+use crate::types::{ImageHeader, ImageMetadata, PixelData, ProcessConfig, ProcessedImage};
 
 pub struct ImageConverter {
     downscale: usize,
@@ -83,6 +83,13 @@ impl ImageConverter {
     /// Read raw pixel data from a FITS/XISF file without any processing.
     pub fn read_raw<P: AsRef<Path>>(path: P) -> Result<(ImageMetadata, PixelData)> {
         formats::read_image(path.as_ref()).context("Failed to read image")
+    }
+
+    /// Read a FITS/XISF header without its pixel data: dimensions, sample
+    /// type, Bayer pattern, orientation and every keyword. Fast — a few KB of
+    /// I/O — so suitable for listing large sets of files.
+    pub fn read_header<P: AsRef<Path>>(path: P) -> Result<ImageHeader> {
+        formats::read_header(path.as_ref()).context("Failed to read header")
     }
 
     /// Process pre-read image data (skips file I/O).

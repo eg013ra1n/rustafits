@@ -28,4 +28,7 @@ pub use converter::ImageConverter;
 pub use output::encode_jpeg;
 pub use output::{encode_png, OutputFormat, PngCompression};
 pub use rayon::{ThreadPool, ThreadPoolBuilder};
-pub use types::{BayerPattern, DataType, ImageMetadata, PixelData, ProcessedImage};
+pub use types::{
+    BayerPattern, DataType, FileFormat, HeaderKeyword, ImageHeader, ImageMetadata, PixelData,
+    ProcessedImage,
+};

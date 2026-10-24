@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 
-use crate::types::{BayerPattern, DataType, ImageMetadata, PixelData};
+use crate::types::{BayerPattern, DataType, FileFormat, HeaderKeyword, ImageHeader, ImageMetadata, PixelData};
 
 const FITS_BLOCK_SIZE: usize = 2880;
 const FITS_CARD_SIZE: usize = 80;
@@ -58,7 +58,9 @@ fn parse_string_keyword(card: &str, keyword: &str) -> Option<String> {
     Some(s)
 }
 
-fn read_fits_header(reader: &mut BufReader<File>) -> Result<FitsHeader> {
+/// Read the primary header up to END. With `cards_out`, every card before END
+/// is also collected (as the parser saw it) for [`read_fits_header_info`].
+fn read_fits_header(reader: &mut BufReader<File>, mut cards_out: Option<&mut Vec<String>>) -> Result<FitsHeader> {
     let mut hdr = FitsHeader {
         bitpix: 0,
         naxis: 0,
@@ -86,6 +88,9 @@ fn read_fits_header(reader: &mut BufReader<File>) -> Result<FitsHeader> {
             if card.starts_with("END") && card.as_bytes().get(3).map_or(true, |&b| b == b' ') {
                 found_end = true;
                 break;
+            }
+            if let Some(cards) = cards_out.as_deref_mut() {
+                cards.push(card.to_string());
             }
 
             if let Some(v) = parse_int_keyword(card, "BITPIX  ") {
@@ -123,12 +128,9 @@ fn read_fits_header(reader: &mut BufReader<File>) -> Result<FitsHeader> {
     Ok(hdr)
 }
 
-pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
-    let file = File::open(path).context("Failed to open FITS file")?;
-    let mut reader = BufReader::new(file);
-
-    let hdr = read_fits_header(&mut reader)?;
-
+/// Channels, Bayer pattern and display flip implied by a header — shared by
+/// the pixel reader and the header-only reader so they cannot disagree.
+fn layout(hdr: &FitsHeader) -> Result<(usize, BayerPattern, bool)> {
     let channels = if hdr.naxis >= 3 && hdr.naxis3 > 0 {
         if hdr.naxis3 != 1 && hdr.naxis3 != 3 {
             bail!(
@@ -159,6 +161,86 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     // displayed N.I.N.A. files — explicit TOP-DOWN — flipped relative to
     // PixInsight's display of the same file.)
     let flip_vertical = !hdr.roworder.eq_ignore_ascii_case("TOP-DOWN");
+
+    Ok((channels, bayer_pattern, flip_vertical))
+}
+
+/// Header-only read: layout and every keyword, no pixel data.
+pub fn read_fits_header_info(path: &Path) -> Result<ImageHeader> {
+    let file = File::open(path).context("Failed to open FITS file")?;
+    let mut reader = BufReader::new(file);
+    let mut cards = Vec::new();
+    let hdr = read_fits_header(&mut reader, Some(&mut cards))?;
+    let (channels, bayer_pattern, flip_vertical) = layout(&hdr)?;
+    let sample_type = match hdr.bitpix {
+        8 => "u8",
+        16 if hdr.bzero == 32768.0 && hdr.bscale == 1.0 => "u16",
+        16 => "i16",
+        32 if hdr.bzero == 2147483648.0 && hdr.bscale == 1.0 => "u32",
+        32 => "i32",
+        -32 => "f32",
+        -64 => "f64",
+        other => bail!("Unsupported BITPIX value: {}", other),
+    };
+    Ok(ImageHeader {
+        format: FileFormat::Fits,
+        width: hdr.naxis1,
+        height: hdr.naxis2,
+        channels,
+        sample_type,
+        bayer_pattern,
+        flip_vertical,
+        keywords: cards.iter().filter_map(|c| parse_card(c)).collect(),
+    })
+}
+
+/// One 80-column card → keyword. `KEY     = value / comment`; string values
+/// are unquoted (`''` → `'`); cards without a value indicator (COMMENT,
+/// HISTORY, …) keep their text as the value; blank cards are dropped.
+fn parse_card(card: &str) -> Option<HeaderKeyword> {
+    let key = card.get(..8).unwrap_or(card).trim_end();
+    if key.is_empty() {
+        return None;
+    }
+    let rest = card.get(8..).unwrap_or("");
+    let (value, comment) = match rest.strip_prefix('=') {
+        Some(v) => {
+            let v = v.trim_start();
+            if let Some(quoted) = v.strip_prefix('\'') {
+                let mut value = String::new();
+                let mut chars = quoted.chars();
+                while let Some(c) = chars.next() {
+                    if c != '\'' {
+                        value.push(c);
+                        continue;
+                    }
+                    let tail = chars.as_str();
+                    if let Some(after) = tail.strip_prefix('\'') {
+                        value.push('\'');
+                        chars = after.chars();
+                    } else {
+                        break;
+                    }
+                }
+                let comment = chars.as_str().split_once('/').map_or("", |(_, c)| c.trim());
+                (value.trim_end().to_string(), comment.to_string())
+            } else {
+                let (val, com) = v.split_once('/').unwrap_or((v, ""));
+                (val.trim().to_string(), com.trim().to_string())
+            }
+        }
+        None => (rest.trim().to_string(), String::new()),
+    };
+    Some(HeaderKeyword { key: key.to_string(), value, comment })
+}
+
+pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
+    let file = File::open(path).context("Failed to open FITS file")?;
+    let mut reader = BufReader::new(file);
+
+    let hdr = read_fits_header(&mut reader, None)?;
+
+    let (channels, bayer_pattern, flip_vertical) = layout(&hdr)?;
 
     let num_pixels = hdr.naxis1 * hdr.naxis2 * channels;
     let bytes_per_pixel = (hdr.bitpix.unsigned_abs() as usize) / 8;
@@ -377,5 +459,46 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(result.is_ok(), "NAXIS3=3 must still parse: {:?}", result.err());
+    }
+
+    #[test]
+    fn parse_card_reads_values_strings_and_commentary() {
+        let card = |s: &str| format!("{s:<80}");
+        let kw = parse_card(&card("EXPTIME =                300.0 / [s] Exposure time")).unwrap();
+        assert_eq!((kw.key.as_str(), kw.value.as_str(), kw.comment.as_str()), ("EXPTIME", "300.0", "[s] Exposure time"));
+        let kw = parse_card(&card("FILTER  = 'Ha      '           / Filter name")).unwrap();
+        assert_eq!((kw.value.as_str(), kw.comment.as_str()), ("Ha", "Filter name"));
+        let kw = parse_card(&card("OBJECT  = 'O''Neil / A'")).unwrap();
+        assert_eq!((kw.value.as_str(), kw.comment.as_str()), ("O'Neil / A", ""), "'' escape and a slash inside the string");
+        let kw = parse_card(&card("HISTORY Calibrated with darks")).unwrap();
+        assert_eq!((kw.key.as_str(), kw.value.as_str()), ("HISTORY", "Calibrated with darks"));
+        assert!(parse_card(&card("")).is_none(), "blank card");
+    }
+
+    #[test]
+    fn header_info_agrees_with_the_pixel_reader() {
+        let mut bytes = build_header_block(&[
+            make_card("SIMPLE", "T"),
+            make_card("BITPIX", 16),
+            make_card("NAXIS", 2),
+            make_card("NAXIS1", 4),
+            make_card("NAXIS2", 3),
+            make_card("BZERO", 32768),
+            make_card("BAYERPAT", "'GRBG'"),
+            make_card("EXPTIME", "120.0 / seconds"),
+        ]);
+        bytes.extend(std::iter::repeat(0u8).take(2880));
+        let path = std::env::temp_dir().join(format!("rustafits-hdr-{}.fits", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let info = read_fits_header_info(&path).unwrap();
+        let (meta, _) = read_fits_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!((info.width, info.height, info.channels), (meta.width, meta.height, meta.channels));
+        assert_eq!((info.bayer_pattern, info.flip_vertical), (meta.bayer_pattern, meta.flip_vertical));
+        assert_eq!(info.sample_type, "u16");
+        assert_eq!(info.get("exptime"), Some("120.0"));
+        assert_eq!(info.get("BAYERPAT"), Some("GRBG"));
+        assert_eq!(info.keywords.len(), 8);
     }
 }

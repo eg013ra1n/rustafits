@@ -14,6 +14,50 @@ pub enum DataType {
     Float32,
 }
 
+/// Container format of an input file.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FileFormat {
+    Fits,
+    Xisf,
+}
+
+/// One header keyword: a FITS card, an XISF `<FITSKeyword>`, or an XISF
+/// `<Property>` (key = its id, e.g. `Instrument:ExposureTime`). String values
+/// are unquoted; commentary cards (COMMENT, HISTORY) carry their text as value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeaderKeyword {
+    pub key: String,
+    pub value: String,
+    pub comment: String,
+}
+
+/// What a file's header says, read without touching the pixel data.
+/// `width`, `height`, `channels`, `bayer_pattern` and `flip_vertical` are the
+/// values `ImageConverter::read_raw` would report for the same file.
+#[derive(Clone, Debug)]
+pub struct ImageHeader {
+    pub format: FileFormat,
+    pub width: usize,
+    pub height: usize,
+    pub channels: usize,
+    /// Stored sample type: `u8`, `u16`, `i16`, `u32`, `i32`, `f32` or `f64`.
+    pub sample_type: &'static str,
+    pub bayer_pattern: BayerPattern,
+    pub flip_vertical: bool,
+    /// Every keyword in file order.
+    pub keywords: Vec<HeaderKeyword>,
+}
+
+impl ImageHeader {
+    /// Value of the first keyword named `key` (case-insensitive).
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.keywords
+            .iter()
+            .find(|k| k.key.eq_ignore_ascii_case(key))
+            .map(|k| k.value.as_str())
+    }
+}
+
 pub enum PixelData {
     Uint16(Vec<u16>),
     Float32(Vec<f32>),

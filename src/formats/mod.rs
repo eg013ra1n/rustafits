@@ -7,13 +7,30 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 
-use crate::types::{ImageMetadata, PixelData};
+use crate::types::{ImageHeader, ImageMetadata, PixelData};
 
 pub fn read_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     if is_xisf(path) {
         xisf::read_xisf_image(path)
     } else if is_fits(path) {
         fits::read_fits_image(path)
+    } else {
+        bail!(
+            "Unsupported file format: {}",
+            path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("unknown")
+        )
+    }
+}
+
+/// Read a FITS/XISF header without its pixel data: layout (as `read_image`
+/// would report it) and every keyword.
+pub fn read_header(path: &Path) -> Result<ImageHeader> {
+    if is_xisf(path) {
+        xisf::read_xisf_header_info(path)
+    } else if is_fits(path) {
+        fits::read_fits_header_info(path)
     } else {
         bail!(
             "Unsupported file format: {}",
