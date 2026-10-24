@@ -3047,9 +3047,9 @@ mod tests {
         )
         .unwrap();
         // θ 44.838°, not converged.
-        assert_eq!(
-            result_bits(&fixed),
-            [
+        assert_bits_pinned(
+            &result_bits(&fixed),
+            &[
                 0x3f3597d2f746f108,
                 0x3fef2644e43b3e52,
                 0x402e000000000000,
@@ -3059,7 +3059,8 @@ mod tests {
                 0x3fe90ad307042a7c,
                 0x4010000000000000,
                 0x3f8177ab7774f2fb,
-            ]
+            ],
+            "fixed beta",
         );
         assert!(!fixed.converged);
         let free = fit_moffat_2d(
@@ -3077,9 +3078,9 @@ mod tests {
         )
         .unwrap();
         // θ 48.396°, β 1.87, not converged.
-        assert_eq!(
-            result_bits(&free),
-            [
+        assert_bits_pinned(
+            &result_bits(&free),
+            &[
                 0xbf61565c765f8519,
                 0x3fefaedc7e5b15b2,
                 0x402e000000000000,
@@ -3089,7 +3090,8 @@ mod tests {
                 0x3feb078330706328,
                 0x3ffdf1d4ebb0f55c,
                 0x3f87d78dba90a921,
-            ]
+            ],
+            "free beta",
         );
         assert!(!free.converged);
     }
@@ -3300,6 +3302,27 @@ mod tests {
         assert_eq!((lm.iters, lm.converged), (10, false));
     }
 
+    /// Golden bit patterns in this module are recorded on aarch64, the release machine, and stay exact there. On other
+    /// targets libm's `exp` / `powf` round differently and the solves drift by far less than anything measurable but
+    /// more than a last bit where a field is ill-conditioned. Measured on x86_64: well-conditioned fields land 0-2 ULP
+    /// off; θ of a round star (undefined, pinned at -5e-15 rad) comes out as another value near zero; a background or
+    /// residual near zero differs by up to 3e-9 relative — every difference under 1e-17 absolute except θ's ~1e-14,
+    /// with identical iteration counts and flags. So off aarch64 each value must be within 1e-12 · max(1, |pin|):
+    /// still a pin against any real change to the solver, not against the platform's libm. Results are not required
+    /// to match across platforms to the bit (owner decision, 2026-10-24); callers compare iterations/flags exactly.
+    fn assert_bits_pinned(actual: &[u64], golden: &[u64], what: &str) {
+        assert_eq!(actual.len(), golden.len(), "{what}: field count");
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(actual, golden, "{what}");
+            return;
+        }
+        for (i, (&a, &g)) in actual.iter().zip(golden).enumerate() {
+            let (a, g) = (f64::from_bits(a), f64::from_bits(g));
+            let tol = 1e-12 * g.abs().max(1.0);
+            assert!((a - g).abs() <= tol, "{what}[{i}]: {a:e} vs pinned {g:e} (|diff| {:e} > {tol:e})", (a - g).abs());
+        }
+    }
+
     /// Every field of a bounded fit as bits, its iteration count and its convergence flag.
     fn bounded_bits(r: &Moffat2DBoundedResult) -> ([u64; 9], usize, bool) {
         let bits = [r.b, r.a, r.x0, r.y0, r.alpha_x, r.alpha_y, r.theta, r.beta, r.fit_residual].map(f64::to_bits);
@@ -3367,8 +3390,10 @@ mod tests {
                 true,
             ),
         ];
-        for (r, g) in runs.iter().zip(golden) {
-            assert_eq!(bounded_bits(r), g);
+        for (k, (r, (g_bits, g_iters, g_conv))) in runs.iter().zip(golden).enumerate() {
+            let (bits, iters, converged) = bounded_bits(r);
+            assert_bits_pinned(&bits, &g_bits, &format!("run {k}"));
+            assert_eq!((iters, converged), (g_iters, g_conv), "run {k}");
         }
         assert!(fit_moffat_2d_bounded(&ell, 0.0, 1.0, 15.0, 15.0, 1.5, 2.4, 0.0, 3.0, (1.5, 100.0), 100, 1e-5, 5, 0).is_none(), "k = 0");
     }
