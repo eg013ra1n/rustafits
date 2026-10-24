@@ -1,6 +1,6 @@
 [package]
 name = "rustafits"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 authors = ["Vilen Sharifov <vilen.sharifov@gmail.com>"]
 description = "High-performance FITS to JPEG converter for astronomical images with auto-stretch and Bayer debayering"

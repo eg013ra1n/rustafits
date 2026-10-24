@@ -166,9 +166,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustafits = "1.5"
+rustafits = "1.6"
 # Library only, without the CLI's clap/indicatif dependencies:
-# rustafits = { version = "1.5", default-features = false }
+# rustafits = { version = "1.6", default-features = false }
 ```
 
 ### File output

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-10-24
+
 Render-path speed work (same bytes), selectable PNG compression, and fixes.
 One behaviour change: `save_processed` / `convert` refuse an unsupported
 output extension (see Changed), hence a minor bump when released.
