@@ -42,7 +42,10 @@ The package produces two binaries (`rustafits`, `rustafits-debug`) and a library
 `converter.rs` (builder API) → `pipeline.rs` (orchestration) → processing modules → `output.rs`
 
 Pipeline flow for u16 data:
-1. Format reader (FITS big-endian / XISF little-endian) → `(ImageMetadata, PixelData)`
+1. Format reader (FITS big-endian / XISF little-endian) → `(ImageMetadata, PixelData)`.
+   FITS `bayer_pattern` is `BAYERPAT` with odd `XBAYROFF` / `YBAYROFF` folded
+   in (column / row swap of the 2×2 cell), so it addresses the stored pixels
+   as read — in file row order, whatever `flip_vertical` says.
 2. Debayer (if Bayer pattern detected) — by default 2x2 super-pixel, producing
    planar f32 RGB at HALF the input width and height (so it consumes a factor 2
    of `--downscale`). `ImageConverter::with_vng_debayer()` switches the render
@@ -88,7 +91,7 @@ Pipeline flow for u16 data:
   cmake/nasm); PNG through `image`. RGBA is passed to the JPEG encoder
   unchanged — it drops alpha itself, so do NOT de-interleave to RGB first.
 - `formats/` — `fits.rs` (FITS reader), `xisf.rs` (XISF reader with zlib/LZ4/Zstd decompression)
-- `processing/` — `stretch.rs`, `debayer.rs` (super-pixel 2x2 + native-resolution green interpolation), `vng.rs` (full-resolution 8-gradient VNG demosaic, rayon over 64-row bands), `binning.rs`, `downscale.rs`, `color.rs`
+- `processing/` — `stretch.rs`, `debayer.rs` (super-pixel 2x2 + native-resolution green interpolation), `vng.rs` (full-resolution 8-gradient VNG demosaic, rayon over 64-row bands), `cfa.rs` (green-site mask / `G1 + G2` sum / single green phase, for measuring a raw mosaic without interpolation — Athenaeum's Analysis tab), `binning.rs`, `downscale.rs`, `color.rs`
 - `platesolving/` — quad building and matching (`pattern_matcher.rs`, incl. `build_quads_multi`), `ransac.rs`, `wcs.rs`, `projection.rs` (gnomonic), `proper_motion.rs`, `transform.rs`, `types.rs`. Reference: `docs/platesolving.md`.
 - `analysis/` — `background.rs` (mesh-grid + MRS wavelet), `detection.rs` (DAOFIND), `fitting.rs` (two-pass Moffat-primary PSF calibration, LmResult + fit_residual), `metrics.rs` (fit_residual per star), `snr.rs`, `convolution.rs`, `render.rs`, `mod.rs` (two-stage trail detection, residual-weighted statistics)
 - `annotate.rs` — 3-tier annotation API (raw geometry / RGBA layer / burn-in)

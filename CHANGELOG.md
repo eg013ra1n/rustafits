@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`processing::cfa`**: green-site helpers for measuring a raw CFA mosaic
+  without interpolation — `green_mask` (`true` on the green sites, file row
+  order), `green_sum` (`G1 + G2` per 2×2 cell at half width and height, equal
+  to twice the green plane of `super_pixel_debayer_f32`) and `green_phase`
+  (the G1 sample of every cell, a half-resolution plane of real samples for
+  sky / noise statistics). Odd last row / column left out; `BayerPattern::None`
+  gives an empty result. Parallel (rayon).
+
+### Fixed
+
+- FITS: `XBAYROFF` / `YBAYROFF` are folded into the Bayer pattern. It used to
+  come from `BAYERPAT` alone, so a file with an odd offset was debayered with
+  the wrong phase — red and blue exchanged (odd X and Y), or green and magenta
+  (one of them) — by both the super-pixel and the VNG render, and with one odd
+  offset the analysis' green interpolation took red / blue sites for green. An odd `XBAYROFF` swaps the 2×2 cell's columns
+  (RGGB → GRBG), an odd `YBAYROFF` its rows (RGGB → GBRG). `read_header` reports
+  the same folded pattern. Files without the keywords, or with even offsets,
+  read and render exactly as before.
+
 ## [1.6.0] — 2026-10-24
 
 Render-path speed work (same bytes), selectable PNG compression, and fixes.
