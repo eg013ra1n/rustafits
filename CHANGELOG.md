@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- FITS: `XBAYROFF` / `YBAYROFF` are folded into the Bayer pattern. It used to
+  come from `BAYERPAT` alone, so a file with an odd offset was debayered with
+  the wrong phase — red and blue exchanged (odd X and Y), or green and magenta
+  (one of them) — by both the super-pixel and the VNG render, and with one odd
+  offset the analysis' green interpolation took red / blue sites for green. An odd `XBAYROFF` swaps the 2×2 cell's columns
+  (RGGB → GRBG), an odd `YBAYROFF` its rows (RGGB → GBRG). `read_header` reports
+  the same folded pattern. Files without the keywords, or with even offsets,
+  read and render exactly as before.
+
 ## [1.6.0] — 2026-10-24
 
 Render-path speed work (same bytes), selectable PNG compression, and fixes.

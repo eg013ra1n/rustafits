@@ -19,6 +19,8 @@ struct FitsHeader {
     bzero: f64,
     bscale: f64,
     bayerpat: String,
+    xbayroff: i32,
+    ybayroff: i32,
     roworder: String,
 }
 
@@ -70,6 +72,8 @@ fn read_fits_header(reader: &mut BufReader<File>, mut cards_out: Option<&mut Vec
         bzero: 0.0,
         bscale: 1.0,
         bayerpat: String::new(),
+        xbayroff: 0,
+        ybayroff: 0,
         roworder: String::new(),
     };
 
@@ -109,6 +113,10 @@ fn read_fits_header(reader: &mut BufReader<File>, mut cards_out: Option<&mut Vec
                 hdr.bscale = v;
             } else if let Some(v) = parse_string_keyword(card, "BAYERPAT") {
                 hdr.bayerpat = v;
+            } else if let Some(v) = parse_int_keyword(card, "XBAYROFF") {
+                hdr.xbayroff = v;
+            } else if let Some(v) = parse_int_keyword(card, "YBAYROFF") {
+                hdr.ybayroff = v;
             } else if let Some(v) = parse_string_keyword(card, "ROWORDER") {
                 hdr.roworder = v;
             }
@@ -150,6 +158,9 @@ fn layout(hdr: &FitsHeader) -> Result<(usize, BayerPattern, bool)> {
         "GRBG" => BayerPattern::Grbg,
         _ => BayerPattern::None,
     };
+    // BAYERPAT names the cell that starts XBAYROFF / YBAYROFF sites into the
+    // stored frame; fold the offsets in so the pattern addresses pixel (0, 0).
+    let bayer_pattern = shift_bayer_pattern(bayer_pattern, hdr.xbayroff % 2 != 0, hdr.ybayroff % 2 != 0);
 
     // Astronomical convention (PixInsight, ds9, Siril, AstroImageJ):
     //   ROWORDER = 'TOP-DOWN'  → row 0 is the top of the displayed image,
@@ -163,6 +174,35 @@ fn layout(hdr: &FitsHeader) -> Result<(usize, BayerPattern, bool)> {
     let flip_vertical = !hdr.roworder.eq_ignore_ascii_case("TOP-DOWN");
 
     Ok((channels, bayer_pattern, flip_vertical))
+}
+
+/// `pattern` as seen from one site further right (`odd_x`: the 2×2 cell's
+/// columns swap, RGGB → GRBG) and/or one site further down (`odd_y`: its rows
+/// swap, RGGB → GBRG).
+fn shift_bayer_pattern(pattern: BayerPattern, odd_x: bool, odd_y: bool) -> BayerPattern {
+    use BayerPattern as P;
+    let pattern = if odd_x {
+        match pattern {
+            P::Rggb => P::Grbg,
+            P::Grbg => P::Rggb,
+            P::Gbrg => P::Bggr,
+            P::Bggr => P::Gbrg,
+            P::None => P::None,
+        }
+    } else {
+        pattern
+    };
+    if odd_y {
+        match pattern {
+            P::Rggb => P::Gbrg,
+            P::Gbrg => P::Rggb,
+            P::Grbg => P::Bggr,
+            P::Bggr => P::Grbg,
+            P::None => P::None,
+        }
+    } else {
+        pattern
+    }
 }
 
 /// Header-only read: layout and every keyword, no pixel data.
@@ -523,6 +563,110 @@ mod tests {
         assert_eq!(info.get("exptime"), Some("120.0"));
         assert_eq!(info.get("BAYERPAT"), Some("GRBG"));
         assert_eq!(info.keywords.len(), 8);
+    }
+
+    /// Writes an unsigned 16-bit (BZERO 32768) top-down CFA FITS with the given
+    /// BAYERPAT and, when `offsets` is set, XBAYROFF / YBAYROFF.
+    fn write_cfa_fits(path: &Path, width: usize, height: usize, bayerpat: &str, offsets: Option<(i32, i32)>, data: &[u16]) {
+        assert_eq!(data.len(), width * height);
+        let mut cards = vec![
+            make_card("SIMPLE", "T"),
+            make_card("BITPIX", 16),
+            make_card("NAXIS", 2),
+            make_card("NAXIS1", width),
+            make_card("NAXIS2", height),
+            make_card("BZERO", 32768),
+            make_card("BAYERPAT", format!("'{bayerpat}'")),
+            make_card("ROWORDER", "'TOP-DOWN'"),
+        ];
+        if let Some((x, y)) = offsets {
+            cards.push(make_card("XBAYROFF", format!("{x} / Bayer pattern X axis offset")));
+            cards.push(make_card("YBAYROFF", format!("{y} / Bayer pattern Y axis offset")));
+        }
+        let mut bytes = build_header_block(&cards);
+        for v in data {
+            bytes.extend(((*v as i32 - 32768) as i16).to_be_bytes());
+        }
+        let rem = bytes.len() % FITS_BLOCK_SIZE;
+        if rem != 0 {
+            bytes.extend(std::iter::repeat(0u8).take(FITS_BLOCK_SIZE - rem));
+        }
+        std::fs::write(path, bytes).expect("failed to write synthetic FITS test file");
+    }
+
+    #[test]
+    fn bayer_offsets_fold_into_the_pattern() {
+        use BayerPattern as P;
+        // (BAYERPAT, [pattern at (0,0), (1,0), (0,1), (1,1) offsets]): an odd
+        // XBAYROFF swaps the cell's columns, an odd YBAYROFF its rows.
+        let table = [
+            ("RGGB", [P::Rggb, P::Grbg, P::Gbrg, P::Bggr]),
+            ("GRBG", [P::Grbg, P::Rggb, P::Bggr, P::Gbrg]),
+            ("GBRG", [P::Gbrg, P::Bggr, P::Rggb, P::Grbg]),
+            ("BGGR", [P::Bggr, P::Gbrg, P::Grbg, P::Rggb]),
+        ];
+        let path = std::env::temp_dir().join(format!("rustafits_test_bayroff_{}.fits", std::process::id()));
+        for (bayerpat, expected) in table {
+            let base = expected[0];
+            // Only the parity counts: even and negative offsets behave like 0 / 1.
+            let cases = [
+                (None, base),
+                (Some((0, 0)), expected[0]),
+                (Some((1, 0)), expected[1]),
+                (Some((0, 1)), expected[2]),
+                (Some((1, 1)), expected[3]),
+                (Some((2, 4)), expected[0]),
+                (Some((3, -1)), expected[3]),
+            ];
+            for (offsets, want) in cases {
+                write_cfa_fits(&path, 4, 2, bayerpat, offsets, &[0; 8]);
+                let info = read_fits_header_info(&path).unwrap();
+                let (meta, _) = read_fits_image(&path).unwrap();
+                assert_eq!(meta.bayer_pattern, want, "BAYERPAT {bayerpat}, offsets {offsets:?}");
+                assert_eq!(info.bayer_pattern, want, "header-only read, BAYERPAT {bayerpat}, offsets {offsets:?}");
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A star lit only on the red sites of the sensor renders red, whichever
+    /// (BAYERPAT, XBAYROFF, YBAYROFF) spelling describes that sensor — with
+    /// the super-pixel and the VNG debayer.
+    #[test]
+    fn red_star_stays_red_for_every_bayer_offset() {
+        let (w, h) = (32usize, 32usize);
+        let path = std::env::temp_dir().join(format!("rustafits_test_red_star_{}.fits", std::process::id()));
+        for bayerpat in ["RGGB", "GRBG", "GBRG", "BGGR"] {
+            // Colour (0 = R, 1 = G, 2 = B) of each site of BAYERPAT's cell, by (y & 1) * 2 + (x & 1).
+            let cell: Vec<usize> = bayerpat.chars().map(|c| "RGB".find(c).unwrap()).collect();
+            for (xoff, yoff) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                // The sensor: pixel (x, y) sits at site (x + XBAYROFF, y + YBAYROFF) of the cell.
+                let color_at = |x: usize, y: usize| cell[((y + yoff) & 1) * 2 + ((x + xoff) & 1)];
+                let data: Vec<u16> = (0..w * h)
+                    .map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        let star = x.abs_diff(16) <= 3 && y.abs_diff(16) <= 3 && color_at(x, y) == 0;
+                        if star { 50000 } else { 1000 + ((x / 2 * 7 + y / 2 * 13) % 50) as u16 }
+                    })
+                    .collect();
+                write_cfa_fits(&path, w, h, bayerpat, Some((xoff as i32, yoff as i32)), &data);
+
+                for (name, converter, centre) in [
+                    ("super-pixel", crate::ImageConverter::new(), (8, 8)),
+                    ("VNG", crate::ImageConverter::new().with_vng_debayer(), (16, 16)),
+                ] {
+                    let img = converter.process(&path).unwrap();
+                    assert!(img.is_color);
+                    let at = (centre.1 * img.width + centre.0) * img.channels as usize;
+                    let (r, g, b) = (img.data[at], img.data[at + 1], img.data[at + 2]);
+                    assert!(
+                        r > g.saturating_add(100) && r > b.saturating_add(100),
+                        "{name}, BAYERPAT {bayerpat}, offsets ({xoff}, {yoff}): star renders as RGB ({r}, {g}, {b})"
+                    );
+                }
+            }
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     /// Writes a BITPIX 16, BZERO 0 FITS (width x height, mono) with the given
