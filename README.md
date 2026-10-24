@@ -55,38 +55,59 @@ brew install rustafits
 ## CLI Usage
 
 ```bash
-# Basic conversion
+# One file — the classic form still works
 rustafits image.fits output.jpg
 rustafits image.xisf output.png
 
-# Fast preview (2x2 binning)
-rustafits large.fits preview.jpg --preview
+# Output next to the input (light.jpg), or PNG with -f
+rustafits light.fits
+rustafits light.fits -f png
 
-# Downscaled output
-rustafits large.fits preview.jpg --downscale 4
+# Batch: many files or directories into one output directory
+rustafits *.fits -o previews/
+rustafits night1/ -r -o out/ -n      # recurse, mirror the tree, skip existing
 
-# Star annotation overlay
-rustafits image.fits annotated.jpg --annotate --max-stars 500 --log
+# Pipe: JPEG on stdout
+rustafits m31.xisf -o - > m31.jpg
 
-# Options
-rustafits <input> <output> [OPTIONS]
-  --downscale <N>   Downscale factor (default: 1)
-                    For Bayer/OSC images, the super-pixel debayer
-                    inherently halves resolution, so --downscale 2
-                    equals debayer only, --downscale 4 = debayer + 2x
-                    extra downscale, etc.
-  --quality <Q>     JPEG quality 1-100 (default: 95)
-  --png-compression <L>
-                    PNG compression: none | fast | balanced | high
-                    (default: fast). Astro frames barely compress at
-                    fast; none is ~2.5x faster, balanced ~2.5x smaller
-                    but ~30x slower
-  --no-debayer      Disable Bayer debayering
-  --preview         2x2 binning for mono images
-  --annotate        Overlay star detection ellipses on the output
-  --max-stars <N>   Max stars for annotation analysis (default: 500)
-  --log             Show detailed information (on stderr)
+# Fast preview, downscale, annotation, native-resolution OSC
+rustafits large.fits -p                       # 2x2 binning
+rustafits large.fits -d 4
+rustafits image.fits annotated.jpg -a -v
+rustafits osc.fits full.jpg --vng
 ```
+
+Inputs are `.fits` `.fit` `.fts` `.xisf` files or directories. With exactly
+two paths, the second is the output if it is `-`, ends in `.jpg`/`.jpeg`/`.png`,
+or does not exist yet. A batch shows a progress bar and a summary on stderr; a
+failing file is reported and the others carry on (exit code 1 if any failed).
+Output names are checked before any work starts — an unsupported extension,
+two inputs mapping to one output, or `-` with several inputs is an error.
+Files are written through a temporary file and renamed, so an interrupted run
+leaves no truncated images behind.
+
+| Option | Default | |
+|---|---|---|
+| `-o, --output <PATH>` | next to input | Output file (one input; `-` = stdout) or directory (several inputs, existing dir, or trailing `/`) |
+| `-f, --format jpg\|png` | jpg | Format for derived names and stdout; an explicit file name decides its own |
+| `-r, --recursive` | off | Descend into subdirectories (mirrored under `-o DIR`) |
+| `-n, --skip-existing` | off | Skip inputs whose output already exists |
+| `-j, --jobs <N>` | min(4, cores); 2 with `-a` | Files converted concurrently |
+| `--threads <N>` | all cores | Threads for pixel processing, shared by all jobs |
+| `-q, --quality <Q>` | 95 | JPEG quality 1–100 |
+| `--png-compression <L>` | fast | `none` \| `fast` \| `balanced` \| `high`. Astro frames barely compress at fast; none is ~2.5x faster, balanced ~2.5x smaller but ~30x slower |
+| `-d, --downscale <N>` | 1 | Integer factor. Bayer/OSC: the super-pixel debayer already halves, so 2 = debayer only, 4 = debayer + 2x |
+| `-p, --preview` | off | 2x2 binning for mono images |
+| `--no-debayer` | off | Keep the raw Bayer mosaic |
+| `--vng` | off | Debayer at native resolution (VNG) instead of 2x2 super-pixel |
+| `-a, --annotate` | off | Overlay star detection ellipses |
+| `--max-stars <N>` | 500 | Max stars kept for annotation |
+| `--measure-cap <N>` | 2000 | Max stars PSF-fitted for annotation (0 = all) |
+| `-v, --verbose` | off | Per-file details and timings on stderr (`--log` is an alias) |
+| `--quiet` | off | Errors only |
+
+Batch throughput: 9 real 26 MP frames on 4 cores take 0.9 s in one call,
+versus 2.5 s for a shell loop over single-file calls.
 
 ## Library Usage
 
@@ -95,6 +116,8 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 rustafits = "1.5"
+# Library only, without the CLI's clap/indicatif dependencies:
+# rustafits = { version = "1.5", default-features = false }
 ```
 
 ### File output

@@ -20,8 +20,9 @@ cargo test <test_name>          # run a single test
 # Build debug binary (exposes analysis internals)
 cargo build --features debug-pipeline
 
-# Run CLI
-cargo run -- input.fits output.jpg [--downscale 2] [--quality 90] [--preview] [--annotate] [--no-debayer] [--log]
+# Run CLI (classic form, or batch: several inputs/dirs, -o DIR, -j N; see --help)
+cargo run --release -- input.fits output.jpg [-d 2] [-q 90] [-p] [-a] [--no-debayer] [--vng] [-v]
+cargo run --release -- dir/ -r -o out/ -n
 
 # Check without building
 cargo check
@@ -34,7 +35,7 @@ cargo clippy
 
 ### Crate Structure
 
-The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public.
+The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public. The default `cli` feature carries the `rustafits` binary's only extra deps (clap, indicatif); the binary requires it, and library users (Athenaeum) can build with `default-features = false`. `tests/cli.rs` drives the binary end to end on synthetic FITS.
 
 ### Processing Pipeline
 

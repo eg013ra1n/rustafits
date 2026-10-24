@@ -13,6 +13,19 @@ output extension (see Changed), hence a minor bump when released.
 
 ### Added
 
+- **A new CLI (clap)** with batch conversion. The classic
+  `rustafits in.fits out.jpg` writes the same bytes as before. New: several
+  inputs and directories (`-r` mirrors the tree under `-o DIR`), output next
+  to the input by default, `-o FILE|DIR|-` (stdout), `-f jpg|png`,
+  `-n/--skip-existing`, `-j/--jobs` (default min(4, cores), 2 with
+  `--annotate`) and `--threads`, a progress bar and summary, `-v` per-file
+  timings, `--quiet`, `--vng`, short flags `-q -d -p -a`. Errors in one file
+  don't stop the batch (exit 1 at the end); bad output names are rejected
+  before any work; writes are atomic (temp file + rename). 9 real 26 MP
+  frames on 4 cores: 0.9 s in one call vs 2.5 s for a shell loop.
+- **The `cli` feature** (default): clap and indicatif are optional and only
+  the binary needs them — library users can set `default-features = false`.
+- **`encode_png`**: in-memory PNG encoding next to `encode_jpeg`.
 - **`PngCompression`** (`None` / `Fast` / `Balanced` / `High`) with
   `ImageConverter::with_png_compression`, `ImageConverter::save_processed_with`
   and the CLI flag `--png-compression`. The default `Fast` writes exactly
@@ -28,7 +41,11 @@ output extension (see Changed), hence a minor bump when released.
   `.jpeg` or no extension → JPEG; anything else (e.g. `.tif`) used to receive
   a JPEG stream silently and now fails before anything is written.
   `convert()` and the CLI check it before reading the input.
-- **CLI `--log` writes to stderr**, keeping stdout clean.
+- **CLI `--log` writes to stderr**, keeping stdout clean; it is now an alias
+  of `-v/--verbose` and prints one line per file with timings instead of the
+  settings banner.
+- **CLI usage errors exit with code 2** (clap's convention); conversion
+  failures still exit 1.
 
 ### Changed — same bytes, less time
 
@@ -61,7 +78,8 @@ output extension (see Changed), hence a minor bump when released.
   sizes 0–17, around the chunk size, RGB and RGBA, NaN; parallel flip vs the
   serial body; a test that a misaligned split *would* change bytes. PNG:
   default level pinned to the old encoder output, every level round-trips.
-  Output extension rules.
+  Output extension rules. `tests/cli.rs`: the binary end to end on synthetic
+  FITS (classic form vs the library, batch, -r, -n, stdout, failures).
 
 ## [1.5.0] — 2026-10-24
 
