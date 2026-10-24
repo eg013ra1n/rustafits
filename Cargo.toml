@@ -11,6 +11,8 @@ documentation = "https://github.com/eg013ra1n/rustafits#readme"
 readme = "README.md"
 keywords = ["astronomy", "fits", "image-processing", "converter", "astrophotography"]
 categories = ["multimedia::images", "science", "command-line-utilities"]
+# Test fixtures are tracked in git but far over the crates.io 10 MB package limit.
+exclude = ["tests/*.fits"]
 
 [lib]
 name = "astroimage"
