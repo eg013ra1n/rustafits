@@ -5,6 +5,15 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- FITS: BITPIX 16 files with BZERO 0 are read correctly — data stored as
+  unsigned with a −32768 offset (more than 1 % negative samples) gets the
+  32768 offset; signed data clamps negatives to 0 instead of wrapping them to
+  32768–65535.
+
 ## [1.5.0] — 2026-10-24
 
 Six commits since 1.4.0, all speed work on the analysis kernels from the
