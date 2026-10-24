@@ -343,38 +343,6 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     Ok((meta, pixels))
 }
 
-/// SIMD-accelerated big-endian u16 byte swap.
-fn bswap_u16(src: &[u8], dst: &mut [u16]) {
-    let n = dst.len();
-    let mut i = 0;
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        use std::arch::aarch64::*;
-        // NEON: vrev16q_u8 swaps adjacent bytes in each 16-bit lane (16 bytes = 8 u16 at a time)
-        while i + 8 <= n {
-            unsafe {
-                let bytes = vld1q_u8(src.as_ptr().add(i * 2));
-                let swapped = vrev16q_u8(bytes);
-                vst1q_u8(dst.as_mut_ptr().add(i) as *mut u8, swapped);
-            }
-            i += 8;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("ssse3") {
-            i = unsafe { bswap_u16_ssse3(src, dst, i, n) };
-        }
-    }
-
-    // Scalar remainder
-    for j in i..n {
-        dst[j] = u16::from_be_bytes([src[j * 2], src[j * 2 + 1]]);
-    }
-}
-
 /// SIMD-accelerated big-endian u16 byte swap with XOR 0x8000.
 fn bswap_u16_xor(src: &[u8], dst: &mut [u16]) {
     let n = dst.len();
