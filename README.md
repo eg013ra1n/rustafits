@@ -89,7 +89,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustafits = "0.8"
+rustafits = "1.5"
 ```
 
 ### File output
