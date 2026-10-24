@@ -137,6 +137,38 @@ impl std::str::FromStr for PngCompression {
     }
 }
 
+/// Encode an RGB (3 ch) or RGBA (4 ch) buffer to a PNG byte stream, in memory.
+/// Same bytes as [`save_image_with`] writes for the same level.
+pub fn encode_png(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    compression: PngCompression,
+) -> Result<Vec<u8>> {
+    let color_type = match channels {
+        3 => ColorType::Rgb8,
+        4 => ColorType::Rgba8,
+        n => anyhow::bail!("unsupported channel count for PNG encoding: {n}"),
+    };
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(channels))
+        .context("image dimensions overflow")?;
+    if data.len() < expected {
+        anyhow::bail!(
+            "pixel buffer too small: {} bytes, need {expected} for {width}x{height}x{channels}",
+            data.len()
+        );
+    }
+    let mut buf = Vec::new();
+    let (c, f) = compression.encoder_settings();
+    PngEncoder::new_with_quality(&mut buf, c, f)
+        .write_image(&data[..expected], width as u32, height as u32, color_type.into())
+        .context("PNG encoding failed")?;
+    Ok(buf)
+}
+
 pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()> {
     save_image_with(image, path, quality, PngCompression::default())
 }
@@ -240,7 +272,7 @@ mod tests {
         );
     }
 
-    fn encode_png(image: &ProcessedImage, level: Option<PngCompression>) -> Vec<u8> {
+    fn encode_png_direct(image: &ProcessedImage, level: Option<PngCompression>) -> Vec<u8> {
         let mut buf = Vec::new();
         let color = if image.channels == 4 { ColorType::Rgba8 } else { ColorType::Rgb8 };
         let encoder = match level {
@@ -265,17 +297,33 @@ mod tests {
     #[test]
     fn default_png_compression_is_the_old_encoder_output() {
         let img = synth_image(37, 23);
-        assert_eq!(encode_png(&img, Some(PngCompression::default())), encode_png(&img, None));
+        assert_eq!(encode_png_direct(&img, Some(PngCompression::default())), encode_png_direct(&img, None));
     }
 
     #[test]
     fn every_png_level_round_trips_the_pixels() {
         let img = synth_image(37, 23);
         for level in [PngCompression::None, PngCompression::Fast, PngCompression::Balanced, PngCompression::High] {
-            let png = encode_png(&img, Some(level));
+            let png = encode_png_direct(&img, Some(level));
             let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
             assert_eq!(decoded.into_rgb8().into_raw(), img.data, "{level:?}");
         }
+    }
+
+    #[test]
+    fn encode_png_matches_the_file_writer() {
+        let img = synth_image(37, 23);
+        let dir = std::env::temp_dir().join(format!("rustafits-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.png");
+        for level in [PngCompression::None, PngCompression::Fast, PngCompression::High] {
+            save_image_with(&img, &path, 95, level).unwrap();
+            let mem = encode_png(&img.data, img.width, img.height, 3, level).unwrap();
+            assert_eq!(mem, std::fs::read(&path).unwrap(), "{level:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(encode_png(&img.data, img.width, img.height, 2, PngCompression::Fast).is_err());
+        assert!(encode_png(&img.data[..10], img.width, img.height, 3, PngCompression::Fast).is_err());
     }
 
     #[test]
