@@ -75,6 +75,10 @@ output extension (see Changed), hence a minor bump when released.
 
 ### Fixed
 
+- FITS: BITPIX 16 files with BZERO 0 are read correctly — data stored as
+  unsigned with a −32768 offset (more than 1 % negative samples) gets the
+  32768 offset; signed data clamps negatives to 0 instead of wrapping them to
+  32768–65535.
 - `cargo test` passes on x86_64: the two bit-for-bit fitting pins (recorded
   on aarch64) failed there since they were added — and with them the AUR
   PKGBUILD's `check()`. They stay exact on aarch64 and allow

@@ -265,11 +265,34 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
             // value on any host; the loops below auto-vectorize.
             let bzero = hdr.bzero;
             let bscale = hdr.bscale;
-            let convert: &(dyn Fn(&mut [u16]) + Sync) = if bzero == 32768.0 && bscale == 1.0 {
+            // BITPIX 16 without BZERO: the stored value is signed. Some writers
+            // store unsigned data shifted by -32768 and omit BZERO; more than 1 %
+            // negative samples marks that case, read it as BZERO 32768. Otherwise
+            // the file is genuinely signed and negatives clamp to 0 (never wrap).
+            let offset_data = bzero == 0.0 && bscale == 1.0 && {
+                // The sign bit of the big-endian sample, before any conversion.
+                let count_neg =
+                    |d: &[u16]| -> usize { d.iter().filter(|v| u16::from_be(**v) & 0x8000 != 0).count() };
+                let negatives: usize = if use_par {
+                    u16_data.par_chunks(CHUNK).map(count_neg).sum()
+                } else {
+                    count_neg(&u16_data)
+                };
+                let offset_data = negatives * 100 > num_pixels;
+                tracing::debug!(
+                    path = %path.display(),
+                    negatives,
+                    samples = num_pixels,
+                    offset_data,
+                    "fits bitpix16 bzero0 sign rule"
+                );
+                offset_data
+            };
+            let convert: &(dyn Fn(&mut [u16]) + Sync) = if (bzero == 32768.0 && bscale == 1.0) || offset_data {
                 // Fast path: signed→unsigned via byte-swap + XOR 0x8000
                 &|d: &mut [u16]| d.iter_mut().for_each(|v| *v = u16::from_be(*v) ^ 0x8000)
             } else if bzero == 0.0 && bscale == 1.0 {
-                &|d: &mut [u16]| d.iter_mut().for_each(|v| *v = u16::from_be(*v))
+                &|d: &mut [u16]| d.iter_mut().for_each(|v| *v = (u16::from_be(*v) as i16).max(0) as u16)
             } else {
                 &move |d: &mut [u16]| {
                     for v in d.iter_mut() {
@@ -500,5 +523,73 @@ mod tests {
         assert_eq!(info.get("exptime"), Some("120.0"));
         assert_eq!(info.get("BAYERPAT"), Some("GRBG"));
         assert_eq!(info.keywords.len(), 8);
+    }
+
+    /// Writes a BITPIX 16, BZERO 0 FITS (width x height, mono) with the given
+    /// stored samples (big-endian signed).
+    fn write_bitpix16_bzero0(path: &Path, width: usize, height: usize, stored: &[i16]) {
+        assert_eq!(stored.len(), width * height);
+        let cards = vec![
+            make_card("SIMPLE", "T"),
+            make_card("BITPIX", 16),
+            make_card("NAXIS", 2),
+            make_card("NAXIS1", width),
+            make_card("NAXIS2", height),
+            make_card("BZERO", 0),
+            make_card("BSCALE", 1),
+            make_card("ROWORDER", "'TOP-DOWN'"),
+        ];
+        let mut bytes = build_header_block(&cards);
+        for v in stored {
+            bytes.extend(v.to_be_bytes());
+        }
+        let rem = bytes.len() % FITS_BLOCK_SIZE;
+        if rem != 0 {
+            bytes.extend(std::iter::repeat(0u8).take(FITS_BLOCK_SIZE - rem));
+        }
+        std::fs::write(path, bytes).expect("failed to write synthetic FITS test file");
+    }
+
+    fn read_u16(path: &Path) -> Vec<u16> {
+        let result = read_fits_image(path);
+        let _ = std::fs::remove_file(path);
+        match result.expect("read failed").1 {
+            PixelData::Uint16(v) => v,
+            _ => panic!("expected Uint16 pixels"),
+        }
+    }
+
+    #[test]
+    fn bitpix16_bzero0_offset_data_reads_with_32768() {
+        let path = std::env::temp_dir()
+            .join(format!("rustafits_test_b16z0_offset_{}.fits", std::process::id()));
+        // 1000 samples, mostly negative (offset-stored unsigned data).
+        let mut stored: Vec<i16> = (0..1000).map(|i| -30000 + i as i16).collect();
+        stored[0] = -30000;
+        stored[1] = 0;
+        stored[2] = 32767;
+        write_bitpix16_bzero0(&path, 100, 10, &stored);
+        let out = read_u16(&path);
+        assert_eq!(out[0], 2768);
+        assert_eq!(out[1], 32768);
+        assert_eq!(out[2], 65535);
+        assert_eq!(out[3], (-30000i32 + 3 + 32768) as u16);
+    }
+
+    #[test]
+    fn bitpix16_bzero0_signed_data_clamps_negatives() {
+        let path = std::env::temp_dir()
+            .join(format!("rustafits_test_b16z0_signed_{}.fits", std::process::id()));
+        let mut stored: Vec<i16> = (0..1000).map(|i| 100 + (i % 901) as i16).collect();
+        for i in [3usize, 100, 400, 700, 999] {
+            stored[i] = -5;
+        }
+        write_bitpix16_bzero0(&path, 100, 10, &stored);
+        let out = read_u16(&path);
+        for (i, v) in stored.iter().enumerate() {
+            let want = (*v).max(0) as u16;
+            assert_eq!(out[i], want, "sample {i}");
+        }
+        assert_eq!(out[3], 0);
     }
 }
