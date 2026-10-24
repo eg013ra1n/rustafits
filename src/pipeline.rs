@@ -169,7 +169,7 @@ fn process_f32(
     apply_stretch_and_finalize(float_data, width, height, is_color, num_channels, &meta, config)
 }
 
-fn compute_stretch_coefficients_u16(channel_data: &[u16]) -> (f32, f32, f32, f32, f32) {
+fn compute_stretch_coefficients_u16(channel_data: &[u16]) -> stretch::StretchCoeffs {
     let max_input = 65536.0f32;
     let params = stretch::compute_stretch_params_u16(channel_data, max_input);
     let hs_range_factor = if params.highlights == params.shadows {
@@ -195,21 +195,12 @@ fn apply_stretch_u16_and_finalize(
     let channel_size = width * height;
     let bpp: usize = if config.rgba_output { 4 } else { 3 };
 
-    let out_data = if config.auto_stretch {
-        let (ns, nh, k1, k2, m) = compute_stretch_coefficients_u16(&data[..channel_size]);
-
-        let mut temp = vec![0u8; channel_size];
-        stretch::apply_stretch_from_u16(
-            &data[..channel_size], &mut temp, 0, 1, ns, nh, k1, k2, m,
-        );
-        if config.rgba_output {
-            color::replicate_gray_to_rgba(&temp)
-        } else {
-            color::replicate_gray_to_rgb(&temp)
-        }
-    } else {
-        vec![0u8; channel_size * bpp]
-    };
+    let mut out_data = vec![0u8; channel_size * bpp];
+    if config.auto_stretch {
+        let coeffs = compute_stretch_coefficients_u16(&data[..channel_size]);
+        // Stretch and gray→RGB(A) in one parallel pass, no full-frame gray buffer.
+        stretch::stretch_gray_u16_interleaved(&data[..channel_size], &mut out_data, bpp, coeffs);
+    }
 
     let mut result = ProcessedImage {
         data: out_data,
@@ -227,7 +218,7 @@ fn apply_stretch_u16_and_finalize(
     Ok(result)
 }
 
-fn compute_stretch_coefficients(channel_data: &[f32]) -> (f32, f32, f32, f32, f32) {
+fn compute_stretch_coefficients(channel_data: &[f32]) -> stretch::StretchCoeffs {
     let max_input = 65536.0f32;
     let params = stretch::compute_stretch_params(channel_data, max_input);
     let hs_range_factor = if params.highlights == params.shadows {
@@ -266,41 +257,12 @@ fn apply_stretch_and_finalize(
                 })
                 .collect();
 
-            // Apply stretch with stride directly into out_data
-            for c in 0..num_channels {
-                let ch = &float_data[c * channel_size..(c + 1) * channel_size];
-                let (ns, nh, k1, k2, m) = coeffs[c];
-                stretch::apply_stretch(ch, &mut out_data, c, bpp, ns, nh, k1, k2, m);
-            }
-
-            // Fill alpha channel if RGBA
-            if config.rgba_output {
-                for i in 0..channel_size {
-                    out_data[i * 4 + 3] = 255;
-                }
-            }
+            // All channels (and alpha) interleaved in one parallel pass.
+            stretch::stretch_planar_interleaved(&float_data, channel_size, &mut out_data, bpp, &coeffs);
         } else {
             let channel_data = &float_data[0..channel_size];
-            let (native_shadows, native_highlights, k1, k2, midtones) =
-                compute_stretch_coefficients(channel_data);
-
-            let mut temp = vec![0u8; channel_size];
-            stretch::apply_stretch(
-                channel_data,
-                &mut temp,
-                0,
-                1,
-                native_shadows,
-                native_highlights,
-                k1,
-                k2,
-                midtones,
-            );
-            if config.rgba_output {
-                out_data = color::replicate_gray_to_rgba(&temp);
-            } else {
-                out_data = color::replicate_gray_to_rgb(&temp);
-            }
+            let coeffs = compute_stretch_coefficients(channel_data);
+            stretch::stretch_gray_f32_interleaved(channel_data, &mut out_data, bpp, coeffs);
         }
     }
 

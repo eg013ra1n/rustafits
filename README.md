@@ -55,32 +55,109 @@ brew install rustafits
 ## CLI Usage
 
 ```bash
-# Basic conversion
+# One file — the classic form still works
 rustafits image.fits output.jpg
 rustafits image.xisf output.png
 
-# Fast preview (2x2 binning)
-rustafits large.fits preview.jpg --preview
+# Output next to the input (light.jpg), or PNG with -f
+rustafits light.fits
+rustafits light.fits -f png
 
-# Downscaled output
-rustafits large.fits preview.jpg --downscale 4
+# Batch: many files or directories into one output directory
+rustafits *.fits -o previews/
+rustafits night1/ -r -o out/ -n      # recurse, mirror the tree, skip existing
 
-# Star annotation overlay
-rustafits image.fits annotated.jpg --annotate --max-stars 500 --log
+# Pipe: JPEG on stdout
+rustafits m31.xisf -o - > m31.jpg
 
-# Options
-rustafits <input> <output> [OPTIONS]
-  --downscale <N>   Downscale factor (default: 1)
-                    For Bayer/OSC images, the super-pixel debayer
-                    inherently halves resolution, so --downscale 2
-                    equals debayer only, --downscale 4 = debayer + 2x
-                    extra downscale, etc.
-  --quality <Q>     JPEG quality 1-100 (default: 95)
-  --no-debayer      Disable Bayer debayering
-  --preview         2x2 binning for mono images
-  --annotate        Overlay star detection ellipses on the output
-  --max-stars <N>   Max stars for annotation analysis (default: 200)
-  --log             Show detailed information
+# Fast preview, downscale, annotation, native-resolution OSC
+rustafits large.fits -p                       # 2x2 binning
+rustafits large.fits -d 4
+rustafits image.fits annotated.jpg -a -v
+rustafits osc.fits full.jpg --vng
+```
+
+Inputs are `.fits` `.fit` `.fts` `.xisf` files or directories. With exactly
+two paths, the second is the output if it is `-`, ends in `.jpg`/`.jpeg`/`.png`,
+or does not exist yet. A batch shows a progress bar and a summary on stderr; a
+failing file is reported and the others carry on (exit code 1 if any failed).
+Output names are checked before any work starts — an unsupported extension,
+two inputs mapping to one output, or `-` with several inputs is an error.
+Files are written through a temporary file and renamed, so an interrupted run
+leaves no truncated images behind.
+
+| Option | Default | |
+|---|---|---|
+| `-o, --output <PATH>` | next to input | Output file (one input; `-` = stdout) or directory (several inputs, existing dir, or trailing `/`) |
+| `-f, --format jpg\|png` | jpg | Format for derived names and stdout; an explicit file name decides its own |
+| `-r, --recursive` | off | Descend into subdirectories (mirrored under `-o DIR`) |
+| `-n, --skip-existing` | off | Skip inputs whose output already exists |
+| `-j, --jobs <N>` | min(4, cores); 2 with `-a` | Files converted concurrently |
+| `--threads <N>` | all cores | Threads for pixel processing, shared by all jobs |
+| `-q, --quality <Q>` | 95 | JPEG quality 1–100 |
+| `--png-compression <L>` | fast | `none` \| `fast` \| `balanced` \| `high`. Astro frames barely compress at fast; none is ~2.5x faster, balanced ~2.5x smaller but ~30x slower |
+| `-d, --downscale <N>` | 1 | Integer factor. Bayer/OSC: the super-pixel debayer already halves, so 2 = debayer only, 4 = debayer + 2x |
+| `-p, --preview` | off | 2x2 binning for mono images |
+| `--no-debayer` | off | Keep the raw Bayer mosaic |
+| `--vng` | off | Debayer at native resolution (VNG) instead of 2x2 super-pixel |
+| `-a, --annotate` | off | Overlay star detection ellipses |
+| `--max-stars <N>` | 500 | Max stars kept for annotation |
+| `--measure-cap <N>` | 2000 | Max stars PSF-fitted for annotation (0 = all) |
+| `-v, --verbose` | off | Per-file details and timings on stderr (`--log` is an alias) |
+| `--quiet` | off | Errors only |
+
+Batch throughput: 9 real 26 MP frames on 4 cores take 0.9 s in one call,
+versus 2.5 s for a shell loop over single-file calls.
+
+`convert` is the default command; `rustafits convert …` spells it out (for an
+input file literally named `info`, `analyze` or `completions`).
+
+### Headers: `rustafits info`
+
+Reads only the header (a few KB per file), so it is instant on a whole night:
+
+```bash
+$ rustafits info tests/
+FILE             SIZE       TYPE  BAYER    EXP  FILTER  GAIN   TEMP  DATE-OBS                 OBJECT
+tests/mono.fits  6252x4176  u16   -       30.0  L         56   -9.5  2025-10-25T16:22:10.582  C/2025 A6 (Lemmon)
+tests/osc.fits   6248x4176  u16   RGGB    15.0  -        100  -10.4  2025-10-25T15:53:47.995  C/2025 A6 (Lemmon)
+tests/test.xisf  6224x4168  u16   RGGB   120.0  -        101  -10.0  2025-09-26T17:25:21.185  Ghost Nebula
+
+rustafits info night1/ -r -k FOCALLEN -k AIRMASS   # extra keyword columns
+rustafits info light.fits --all                    # every keyword
+rustafits info night1/ --json | --csv
+```
+
+Columns come from the FITS cards N.I.N.A., SharpCap, ASIAIR etc. write, with
+XISF property ids as fallback (`Instrument:ExposureTime`, …).
+
+### Star metrics: `rustafits analyze`
+
+Per-frame quality for culling subs. The analyzer runs with the library
+defaults — the same settings Athenaeum uses — so the numbers match Athenaeum's
+for the same file.
+
+```bash
+$ rustafits analyze tests/ --sort fwhm
+FILE             STARS  FWHM   HFR    ECC    SNR  WEIGHT    BG  NOISE  TRAIL
+tests/mono.fits    679  1.95  1.50  0.408   55.0   128.2   848   34.1  -
+tests/osc.fits     297  2.63  2.05  0.473   25.0   34.10  1276   41.5  -
+tests/test.xisf  14089  3.44  2.07  0.562  202.0   91793   291    8.5  yes
+
+rustafits analyze night1/ --csv > night1.csv              # full precision
+rustafits analyze night1/ --focal-length 448 --pixel-size 3.76   # + arcsec
+```
+
+`--sort stars|fwhm|hfr|ecc|snr|weight|name` (best first; `--reverse` for
+worst first), `--json`, `--csv`, `--sigma`, `--measure-cap`, `--no-debayer`,
+`-j` (default 2 frames at once — analysis already uses every core).
+
+### Shell completion
+
+```bash
+rustafits completions zsh  > ~/.zfunc/_rustafits
+rustafits completions bash > ~/.local/share/bash-completion/completions/rustafits
+rustafits completions fish > ~/.config/fish/completions/rustafits.fish
 ```
 
 ## Library Usage
@@ -90,6 +167,8 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 rustafits = "1.5"
+# Library only, without the CLI's clap/indicatif dependencies:
+# rustafits = { version = "1.5", default-features = false }
 ```
 
 ### File output
@@ -311,7 +390,7 @@ Three API tiers for different integration needs:
 
 **`annotate_image(image, result, config)`** — Calls `compute_annotations()` internally, then draws directly onto the `ProcessedImage.data` buffer (RGB or RGBA). Reads `image.flip_vertical` automatically. Simplest path — one call, image modified in place.
 
-**`ImageConverter::save_processed(image, path, quality)`** — Saves a `ProcessedImage` to disk as JPEG or PNG. Use after `annotate_image()` or any other post-processing on the pixel buffer.
+**`ImageConverter::save_processed(image, path, quality)`** — Saves a `ProcessedImage` to disk as JPEG or PNG. Use after `annotate_image()` or any other post-processing on the pixel buffer. The format follows the extension: `.png` → PNG; `.jpg`, `.jpeg` or none → JPEG; anything else is an error. `save_processed_with(image, path, quality, PngCompression::None)` picks the PNG compression level (`ImageConverter::with_png_compression` does the same for `convert()`).
 
 #### AnnotationConfig fields
 
@@ -566,7 +645,7 @@ rustafits/
 
 **Slow conversion**: Use `--preview` for mono images or `--downscale 2`
 
-**Black/white output**: Run with `--log` to check stretch parameters
+**Black/white output**: the auto-stretch is computed from the frame's median and MAD, so a blank, fully saturated or heavily clipped frame stretches to flat black or white. (`--log` shows the conversion settings, not the stretch parameters.)
 
 **Downscale + Bayer/OSC**: The super-pixel debayer already halves resolution (2x). A `--downscale 2` on a Bayer image produces debayer-only output with no extra downscale. Use `--downscale 4` or higher for additional reduction beyond debayering.
 

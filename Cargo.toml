@@ -20,7 +20,8 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "rustafits"
-path = "src/bin/rustafits.rs"
+path = "src/bin/rustafits/main.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "rustafits-debug"
@@ -28,6 +29,10 @@ path = "src/bin/debug.rs"
 required-features = ["debug-pipeline"]
 
 [features]
+default = ["cli"]
+# The `rustafits` binary: argument parsing and the batch progress bar. Library
+# users (Athenaeum) can set `default-features = false` to skip these deps.
+cli = ["dep:clap", "dep:clap_complete", "dep:indicatif", "dep:libc"]
 debug-pipeline = []
 # Debug-only Moffat LM solve counters (iterations, refused steps, Jacobian / cost passes, pixels), zero numeric effect.
 lm-counters = []
@@ -54,6 +59,11 @@ base64 = "0.23"
 rayon = "1.10"
 nalgebra = "0.35"
 tracing = "0.1"
+clap = { version = "4.6", features = ["derive"], optional = true }
+clap_complete = { version = "4.6", optional = true }
+indicatif = { version = "0.18", optional = true }
+# Already in the tree via indicatif; the CLI uses it to restore default SIGPIPE.
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # Independent decoder for tests/jpeg_encoder.rs. Deliberately NOT the encoder's

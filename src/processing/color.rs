@@ -1,27 +1,32 @@
 /// Replicate grayscale u8 to interleaved RGB u8.
 pub fn replicate_gray_to_rgb(gray: &[u8]) -> Vec<u8> {
     let mut rgb = vec![0u8; gray.len() * 3];
+    replicate_gray_to_rgb_into(gray, &mut rgb);
+    rgb
+}
+
+/// Replicate grayscale u8 into a caller-provided interleaved RGB buffer
+/// (`rgb.len() == gray.len() * 3`).
+pub fn replicate_gray_to_rgb_into(gray: &[u8], rgb: &mut [u8]) {
+    assert_eq!(rgb.len(), gray.len() * 3, "RGB buffer must be 3x the gray length");
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe { gray_to_rgb_avx2(gray, &mut rgb) };
+            unsafe { gray_to_rgb_avx2(gray, rgb) };
         } else {
-            gray_to_rgb_sse2(gray, &mut rgb);
+            gray_to_rgb_sse2(gray, rgb);
         }
-        return rgb;
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        gray_to_rgb_neon(gray, &mut rgb);
-        return rgb;
+        gray_to_rgb_neon(gray, rgb);
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        gray_to_rgb_scalar(gray, &mut rgb);
-        rgb
+        gray_to_rgb_scalar(gray, rgb);
     }
 }
 
@@ -160,23 +165,23 @@ unsafe fn gray_to_rgb_avx2(gray: &[u8], rgb: &mut [u8]) {
 /// Replicate grayscale u8 to interleaved RGBA u8 (alpha = 255).
 pub fn replicate_gray_to_rgba(gray: &[u8]) -> Vec<u8> {
     let mut rgba = vec![0u8; gray.len() * 4];
+    replicate_gray_to_rgba_into(gray, &mut rgba);
+    rgba
+}
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        gray_to_rgba_scalar(gray, &mut rgba);
-        return rgba;
-    }
+/// Replicate grayscale u8 into a caller-provided interleaved RGBA buffer
+/// (`rgba.len() == gray.len() * 4`, alpha = 255).
+pub fn replicate_gray_to_rgba_into(gray: &[u8], rgba: &mut [u8]) {
+    assert_eq!(rgba.len(), gray.len() * 4, "RGBA buffer must be 4x the gray length");
 
     #[cfg(target_arch = "aarch64")]
     {
-        gray_to_rgba_neon(gray, &mut rgba);
-        return rgba;
+        gray_to_rgba_neon(gray, rgba);
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
-        gray_to_rgba_scalar(gray, &mut rgba);
-        rgba
+        gray_to_rgba_scalar(gray, rgba);
     }
 }
 
@@ -218,16 +223,23 @@ fn gray_to_rgba_neon(gray: &[u8], rgba: &mut [u8]) {
 }
 
 /// Vertical flip of an image with `bytes_per_pixel` bytes per pixel.
+///
+/// Row pairs (y, height-1-y) are swapped in parallel; an odd middle row stays.
 pub fn vertical_flip(data: &mut [u8], width: usize, height: usize, bytes_per_pixel: usize) {
+    use rayon::prelude::*;
+
     let row_bytes = width * bytes_per_pixel;
-    let mut temp = vec![0u8; row_bytes];
-    for y in 0..height / 2 {
-        let top = y * row_bytes;
-        let bot = (height - 1 - y) * row_bytes;
-        temp.copy_from_slice(&data[top..top + row_bytes]);
-        data.copy_within(bot..bot + row_bytes, top);
-        data[bot..bot + row_bytes].copy_from_slice(&temp);
+    if row_bytes == 0 || height < 2 {
+        return;
     }
+    let half = height / 2;
+    let data = &mut data[..height * row_bytes];
+    let (top, rest) = data.split_at_mut(half * row_bytes);
+    // Skip the middle row of an odd height: `bottom` holds the last `half` rows.
+    let bottom = &mut rest[(height - 2 * half) * row_bytes..];
+    top.par_chunks_mut(row_bytes)
+        .zip(bottom.par_chunks_mut(row_bytes).rev())
+        .for_each(|(a, b)| a.swap_with_slice(b));
 }
 
 /// Convert u16 slice to f32 (parallel with SIMD dispatch per chunk).
@@ -346,5 +358,40 @@ unsafe fn u16_to_f32_avx2(data: &[u16], output: &mut [f32]) {
     // Scalar remainder
     for idx in i..count {
         *output.get_unchecked_mut(idx) = *data.get_unchecked(idx) as f32;
+    }
+}
+
+#[cfg(test)]
+mod flip_tests {
+    use super::vertical_flip;
+
+    /// The pre-1.6 serial body, kept as the oracle.
+    fn flip_oracle(data: &mut [u8], width: usize, height: usize, bytes_per_pixel: usize) {
+        let row_bytes = width * bytes_per_pixel;
+        let mut temp = vec![0u8; row_bytes];
+        for y in 0..height / 2 {
+            let top = y * row_bytes;
+            let bot = (height - 1 - y) * row_bytes;
+            temp.copy_from_slice(&data[top..top + row_bytes]);
+            data.copy_within(bot..bot + row_bytes, top);
+            data[bot..bot + row_bytes].copy_from_slice(&temp);
+        }
+    }
+
+    #[test]
+    fn parallel_flip_matches_the_serial_body() {
+        for bpp in [1, 3, 4] {
+            for width in [0, 1, 2, 5, 1003] {
+                for height in [0, 1, 2, 3, 4, 7, 777] {
+                    // One trailing row's worth of slack: rows past `height` are untouched.
+                    let len = width * (height + 1) * bpp;
+                    let data: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+                    let (mut a, mut b) = (data.clone(), data);
+                    vertical_flip(&mut a, width, height, bpp);
+                    flip_oracle(&mut b, width, height, bpp);
+                    assert!(a == b, "w={width} h={height} bpp={bpp}");
+                }
+            }
+        }
     }
 }

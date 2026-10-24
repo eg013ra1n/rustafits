@@ -8,7 +8,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rayon::prelude::*;
 
-use crate::types::{BayerPattern, DataType, ImageMetadata, PixelData};
+use crate::types::{BayerPattern, DataType, FileFormat, HeaderKeyword, ImageHeader, ImageMetadata, PixelData};
 
 const XISF_SIGNATURE: &[u8; 8] = b"XISF0100";
 
@@ -550,6 +550,126 @@ fn convert_normal_to_planar(data: &mut Vec<f32>, width: usize, height: usize, ch
     *data = temp;
 }
 
+/// Validate the signature and return the XML header (reader left after it).
+fn read_xml_header(reader: &mut BufReader<File>) -> Result<String> {
+    // Read and validate signature
+    let mut header = [0u8; 16];
+    reader
+        .read_exact(&mut header)
+        .context("Failed to read XISF header")?;
+
+    if &header[..8] != XISF_SIGNATURE {
+        bail!("Invalid XISF signature");
+    }
+
+    // Bytes 8-11: XML length (little-endian u32)
+    let xml_length =
+        u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+
+    if xml_length == 0 || xml_length > 100 * 1024 * 1024 {
+        bail!("Invalid XISF header length");
+    }
+
+    // Read XML header
+    let mut xml_bytes = vec![0u8; xml_length];
+    reader
+        .read_exact(&mut xml_bytes)
+        .context("Failed to read XISF XML header")?;
+    Ok(String::from_utf8_lossy(&xml_bytes).into_owned())
+}
+
+/// Header-only read: layout of the image `read_xisf_image` would pick, and
+/// every `<FITSKeyword>` and `<Property>` in document order. No pixel data.
+pub fn read_xisf_header_info(path: &Path) -> Result<ImageHeader> {
+    let file = File::open(path).context("Failed to open XISF file")?;
+    let mut reader = BufReader::new(file);
+    let xml = read_xml_header(&mut reader)?;
+    let info = parse_xisf_xml(&xml)?;
+    let sample_type = match info.sample_format {
+        XisfSampleFormat::Uint8 => "u8",
+        XisfSampleFormat::Uint16 => "u16",
+        XisfSampleFormat::Uint32 => "u32",
+        XisfSampleFormat::Float32 => "f32",
+        XisfSampleFormat::Float64 => "f64",
+    };
+    Ok(ImageHeader {
+        format: FileFormat::Xisf,
+        width: info.width,
+        height: info.height,
+        channels: info.channels,
+        sample_type,
+        bayer_pattern: info.bayer_pattern,
+        flip_vertical: info.flip_vertical,
+        keywords: parse_xisf_keywords(&xml)?,
+    })
+}
+
+/// `<FITSKeyword name value comment/>` (value unquoted) and `<Property id
+/// value/>` / `<Property id>text</Property>` → keywords, in document order.
+fn parse_xisf_keywords(xml: &str) -> Result<Vec<HeaderKeyword>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().allow_dangling_amp = true;
+    let mut out = Vec::new();
+    // A `<Property>` whose value is its text content, awaiting that text.
+    let mut open_property: Option<HeaderKeyword> = None;
+    loop {
+        let event = reader.read_event().map_err(|e| anyhow::anyhow!("XML parse error: {e}"))?;
+        match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                let attr = |name: &[u8]| {
+                    e.attributes()
+                        .flatten()
+                        .find(|a| a.key.as_ref() == name)
+                        .and_then(|a| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok())
+                        .map(|v| v.into_owned())
+                };
+                match e.name().as_ref() {
+                    b"FITSKeyword" => {
+                        let value = attr(b"value").unwrap_or_default();
+                        let value = value.trim();
+                        let value = value
+                            .strip_prefix('\'')
+                            .and_then(|v| v.strip_suffix('\''))
+                            .map_or(value.to_string(), |v| v.replace("''", "'").trim_end().to_string());
+                        out.push(HeaderKeyword {
+                            key: attr(b"name").unwrap_or_default(),
+                            value,
+                            comment: attr(b"comment").unwrap_or_default(),
+                        });
+                    }
+                    b"Property" => {
+                        let kw = HeaderKeyword {
+                            key: attr(b"id").unwrap_or_default(),
+                            value: attr(b"value").unwrap_or_default(),
+                            comment: attr(b"comment").unwrap_or_default(),
+                        };
+                        if matches!(event, Event::Start(_)) && kw.value.is_empty() {
+                            open_property = Some(kw);
+                        } else {
+                            out.push(kw);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Text(t) => {
+                if let Some(kw) = open_property.as_mut() {
+                    kw.value.push_str(&t.xml10_content().unwrap_or_default());
+                }
+            }
+            Event::End(e) if e.name().as_ref() == b"Property" => {
+                if let Some(mut kw) = open_property.take() {
+                    kw.value = kw.value.trim().to_string();
+                    out.push(kw);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 /// Convention (M4a Task 1, controller ruling R-M4a-11): every Float32 or
 /// Float64 sample this reader returns is in the u16-like ADU domain —
 /// `bounds`-normalized to `[0, 1]` THEN multiplied by `65535.0` — the same
@@ -584,31 +704,7 @@ fn convert_normal_to_planar(data: &mut Vec<f32>, width: usize, height: usize, ch
 pub fn read_xisf_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     let file = File::open(path).context("Failed to open XISF file")?;
     let mut reader = BufReader::new(file);
-
-    // Read and validate signature
-    let mut header = [0u8; 16];
-    reader
-        .read_exact(&mut header)
-        .context("Failed to read XISF header")?;
-
-    if &header[..8] != XISF_SIGNATURE {
-        bail!("Invalid XISF signature");
-    }
-
-    // Bytes 8-11: XML length (little-endian u32)
-    let xml_length =
-        u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
-
-    if xml_length == 0 || xml_length > 100 * 1024 * 1024 {
-        bail!("Invalid XISF header length");
-    }
-
-    // Read XML header
-    let mut xml_bytes = vec![0u8; xml_length];
-    reader
-        .read_exact(&mut xml_bytes)
-        .context("Failed to read XISF XML header")?;
-    let xml = String::from_utf8_lossy(&xml_bytes);
+    let xml = read_xml_header(&mut reader)?;
 
     // Parse XML
     let info = parse_xisf_xml(&xml)?;
@@ -1040,5 +1136,36 @@ mod tests {
             err.to_string().contains("No <Image> element found"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn xisf_keywords_cover_fits_keywords_and_both_property_forms() {
+        let xml = r#"<xisf><Image geometry="4:3:1" sampleFormat="UInt16">
+            <FITSKeyword name="FILTER" value="'Ha      '" comment="Filter name"/>
+            <FITSKeyword name="EXPTIME" value="300." comment="[s]"/>
+            <Property id="Instrument:Camera:Gain" type="Float32" value="100"/>
+            <Property id="Observation:Object:Name" type="String">M 31</Property>
+        </Image></xisf>"#;
+        let kws = parse_xisf_keywords(xml).unwrap();
+        let get = |k: &str| kws.iter().find(|kw| kw.key == k).map(|kw| kw.value.as_str());
+        assert_eq!(get("FILTER"), Some("Ha"));
+        assert_eq!(get("EXPTIME"), Some("300."));
+        assert_eq!(get("Instrument:Camera:Gain"), Some("100"));
+        assert_eq!(get("Observation:Object:Name"), Some("M 31"));
+        assert_eq!(kws[0].comment, "Filter name");
+    }
+
+    #[test]
+    fn xisf_header_info_agrees_with_the_pixel_reader_on_the_fixture() {
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/test.xisf"));
+        if !path.exists() {
+            return;
+        }
+        let info = read_xisf_header_info(path).unwrap();
+        let (meta, _) = read_xisf_image(path).unwrap();
+        assert_eq!((info.width, info.height, info.channels), (meta.width, meta.height, meta.channels));
+        assert_eq!((info.bayer_pattern, info.flip_vertical), (meta.bayer_pattern, meta.flip_vertical));
+        assert_eq!(info.sample_type, "u16");
+        assert!(!info.keywords.is_empty());
     }
 }

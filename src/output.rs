@@ -3,7 +3,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use image::codecs::png::PngEncoder;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder};
 
 use crate::types::ProcessedImage;
@@ -67,15 +67,121 @@ pub fn encode_jpeg(
     .map_err(|e| anyhow::anyhow!("JPEG encoding failed: {e}"))
 }
 
-pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+/// Output file format, chosen from the output path's extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Jpeg,
+    Png,
+}
 
-    match ext.as_str() {
-        "png" => {
+impl OutputFormat {
+    /// `.png` → PNG; `.jpg`, `.jpeg` or no extension at all → JPEG (case-insensitive).
+    /// Any other extension is an error rather than a JPEG stream under a misleading
+    /// name (`out.tif` used to receive JPEG bytes silently).
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let Some(ext) = path.extension() else {
+            return Ok(OutputFormat::Jpeg);
+        };
+        match ext.to_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("png") => Ok(OutputFormat::Png),
+            Some("jpg") | Some("jpeg") => Ok(OutputFormat::Jpeg),
+            _ => anyhow::bail!(
+                "unsupported output format '.{}' (expected .jpg, .jpeg or .png)",
+                ext.to_string_lossy()
+            ),
+        }
+    }
+}
+
+/// PNG DEFLATE effort. Stretched astro frames are mostly noise, so the levels
+/// differ a lot. Measured on a 6252x4176 RGB render (78 MB raw, 4 cores):
+/// `None` ~0.1 s / 78 MB, `Fast` ~0.27 s / 77 MB, `Balanced` ~8 s / 30 MB,
+/// `High` ~12 s / 28.5 MB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PngCompression {
+    /// Stored, unfiltered: fastest, largest.
+    None,
+    /// The encoder's default (fast DEFLATE, adaptive filter); byte-identical to
+    /// what `save_processed` has always written.
+    #[default]
+    Fast,
+    /// zlib-default DEFLATE with adaptive filtering.
+    Balanced,
+    /// Maximum DEFLATE effort with adaptive filtering.
+    High,
+}
+
+impl PngCompression {
+    fn encoder_settings(self) -> (CompressionType, FilterType) {
+        match self {
+            // Filtering only helps DEFLATE; without it, it is wasted work.
+            PngCompression::None => (CompressionType::Uncompressed, FilterType::NoFilter),
+            PngCompression::Fast => (CompressionType::Fast, FilterType::Adaptive),
+            PngCompression::Balanced => (CompressionType::Default, FilterType::Adaptive),
+            PngCompression::High => (CompressionType::Best, FilterType::Adaptive),
+        }
+    }
+}
+
+impl std::str::FromStr for PngCompression {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(PngCompression::None),
+            "fast" => Ok(PngCompression::Fast),
+            "balanced" => Ok(PngCompression::Balanced),
+            "high" => Ok(PngCompression::High),
+            _ => anyhow::bail!("unknown PNG compression '{s}' (expected none, fast, balanced or high)"),
+        }
+    }
+}
+
+/// Encode an RGB (3 ch) or RGBA (4 ch) buffer to a PNG byte stream, in memory.
+/// Same bytes as [`save_image_with`] writes for the same level.
+pub fn encode_png(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    compression: PngCompression,
+) -> Result<Vec<u8>> {
+    let color_type = match channels {
+        3 => ColorType::Rgb8,
+        4 => ColorType::Rgba8,
+        n => anyhow::bail!("unsupported channel count for PNG encoding: {n}"),
+    };
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(channels))
+        .context("image dimensions overflow")?;
+    if data.len() < expected {
+        anyhow::bail!(
+            "pixel buffer too small: {} bytes, need {expected} for {width}x{height}x{channels}",
+            data.len()
+        );
+    }
+    let mut buf = Vec::new();
+    let (c, f) = compression.encoder_settings();
+    PngEncoder::new_with_quality(&mut buf, c, f)
+        .write_image(&data[..expected], width as u32, height as u32, color_type.into())
+        .context("PNG encoding failed")?;
+    Ok(buf)
+}
+
+pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()> {
+    save_image_with(image, path, quality, PngCompression::default())
+}
+
+/// [`save_image`] with an explicit PNG compression level (ignored for JPEG).
+pub fn save_image_with(
+    image: &ProcessedImage,
+    path: &Path,
+    quality: u8,
+    png_compression: PngCompression,
+) -> Result<()> {
+    match OutputFormat::from_path(path)? {
+        OutputFormat::Png => {
             let file = File::create(path).context("Failed to create output file")?;
             let writer = BufWriter::new(file);
             let color_type = if image.channels == 4 {
@@ -83,7 +189,8 @@ pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()
             } else {
                 ColorType::Rgb8
             };
-            let encoder = PngEncoder::new(writer);
+            let (compression, filter) = png_compression.encoder_settings();
+            let encoder = PngEncoder::new_with_quality(writer, compression, filter);
             encoder
                 .write_image(
                     &image.data,
@@ -93,7 +200,7 @@ pub fn save_image(image: &ProcessedImage, path: &Path, quality: u8) -> Result<()
                 )
                 .context("PNG encoding failed")?;
         }
-        _ => {
+        OutputFormat::Jpeg => {
             // RGBA is handed to the encoder as-is — it reads 4 bytes per pixel
             // and discards alpha itself, so the old de-interleaving Vec
             // allocation (W*H*3 bytes per frame) is gone. Byte-equality of the
@@ -163,6 +270,99 @@ mod tests {
             encode_jpeg(&rgb, 32, 24, 3, 100).unwrap(),
             "quality above 100 should behave as 100"
         );
+    }
+
+    fn encode_png_direct(image: &ProcessedImage, level: Option<PngCompression>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let color = if image.channels == 4 { ColorType::Rgba8 } else { ColorType::Rgb8 };
+        let encoder = match level {
+            None => PngEncoder::new(&mut buf),
+            Some(l) => {
+                let (c, f) = l.encoder_settings();
+                PngEncoder::new_with_quality(&mut buf, c, f)
+            }
+        };
+        encoder
+            .write_image(&image.data, image.width as u32, image.height as u32, color.into())
+            .unwrap();
+        buf
+    }
+
+    fn synth_image(w: usize, h: usize) -> ProcessedImage {
+        ProcessedImage { data: synth_rgb(w, h), width: w, height: h, is_color: true, channels: 3, flip_vertical: false }
+    }
+
+    /// The default level must keep writing exactly what `PngEncoder::new`
+    /// (the pre-option behaviour) writes.
+    #[test]
+    fn default_png_compression_is_the_old_encoder_output() {
+        let img = synth_image(37, 23);
+        assert_eq!(encode_png_direct(&img, Some(PngCompression::default())), encode_png_direct(&img, None));
+    }
+
+    #[test]
+    fn every_png_level_round_trips_the_pixels() {
+        let img = synth_image(37, 23);
+        for level in [PngCompression::None, PngCompression::Fast, PngCompression::Balanced, PngCompression::High] {
+            let png = encode_png_direct(&img, Some(level));
+            let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+            assert_eq!(decoded.into_rgb8().into_raw(), img.data, "{level:?}");
+        }
+    }
+
+    #[test]
+    fn encode_png_matches_the_file_writer() {
+        let img = synth_image(37, 23);
+        let dir = std::env::temp_dir().join(format!("rustafits-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.png");
+        for level in [PngCompression::None, PngCompression::Fast, PngCompression::High] {
+            save_image_with(&img, &path, 95, level).unwrap();
+            let mem = encode_png(&img.data, img.width, img.height, 3, level).unwrap();
+            assert_eq!(mem, std::fs::read(&path).unwrap(), "{level:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(encode_png(&img.data, img.width, img.height, 2, PngCompression::Fast).is_err());
+        assert!(encode_png(&img.data[..10], img.width, img.height, 3, PngCompression::Fast).is_err());
+    }
+
+    #[test]
+    fn png_compression_parses_its_names() {
+        assert_eq!("none".parse::<PngCompression>().unwrap(), PngCompression::None);
+        assert_eq!("FAST".parse::<PngCompression>().unwrap(), PngCompression::Fast);
+        assert_eq!("balanced".parse::<PngCompression>().unwrap(), PngCompression::Balanced);
+        assert_eq!("high".parse::<PngCompression>().unwrap(), PngCompression::High);
+        assert!("best".parse::<PngCompression>().is_err());
+    }
+
+    #[test]
+    fn output_format_follows_the_extension() {
+        let f = |p: &str| OutputFormat::from_path(Path::new(p));
+        assert_eq!(f("a.png").unwrap(), OutputFormat::Png);
+        assert_eq!(f("a.PNG").unwrap(), OutputFormat::Png);
+        assert_eq!(f("a.jpg").unwrap(), OutputFormat::Jpeg);
+        assert_eq!(f("a.JPEG").unwrap(), OutputFormat::Jpeg);
+        assert_eq!(f("dir/a").unwrap(), OutputFormat::Jpeg, "no extension stays JPEG");
+        assert!(f("a.tif").is_err());
+        assert!(f("a.jpg.bak").is_err());
+    }
+
+    #[test]
+    fn save_image_refuses_an_unknown_extension_without_writing() {
+        let dir = std::env::temp_dir().join(format!("rustafits-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.tif");
+        let image = ProcessedImage {
+            data: synth_rgb(8, 8),
+            width: 8,
+            height: 8,
+            is_color: true,
+            channels: 3,
+            flip_vertical: false,
+        };
+        assert!(save_image(&image, &path, 90).is_err());
+        assert!(!path.exists(), "nothing may be written under the wrong name");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

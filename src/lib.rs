@@ -26,5 +26,9 @@ pub use converter::ImageConverter;
 /// In-memory JPEG encoding (baseline, 4:2:0). Accepts RGB (3 ch) or RGBA (4 ch)
 /// — alpha is discarded by the encoder, so callers must not pre-strip it.
 pub use output::encode_jpeg;
+pub use output::{encode_png, OutputFormat, PngCompression};
 pub use rayon::{ThreadPool, ThreadPoolBuilder};
-pub use types::{BayerPattern, DataType, ImageMetadata, PixelData, ProcessedImage};
+pub use types::{
+    BayerPattern, DataType, FileFormat, HeaderKeyword, ImageHeader, ImageMetadata, PixelData,
+    ProcessedImage,
+};

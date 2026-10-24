@@ -4,9 +4,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::formats;
-use crate::output;
+use crate::output::{self, PngCompression};
 use crate::pipeline;
-use crate::types::{ImageMetadata, PixelData, ProcessConfig, ProcessedImage};
+use crate::types::{ImageHeader, ImageMetadata, PixelData, ProcessConfig, ProcessedImage};
 
 pub struct ImageConverter {
     downscale: usize,
@@ -15,6 +15,7 @@ pub struct ImageConverter {
     preview_mode: bool,
     rgba_output: bool,
     vng_debayer: bool,
+    png_compression: PngCompression,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
@@ -27,6 +28,7 @@ impl ImageConverter {
             preview_mode: false,
             rgba_output: false,
             vng_debayer: false,
+            png_compression: PngCompression::Fast,
             thread_pool: None,
         }
     }
@@ -66,6 +68,13 @@ impl ImageConverter {
         self
     }
 
+    /// PNG compression level used by [`convert`](Self::convert) when the
+    /// output is `.png` (default [`PngCompression::Fast`]; ignored for JPEG).
+    pub fn with_png_compression(mut self, level: PngCompression) -> Self {
+        self.png_compression = level;
+        self
+    }
+
     pub fn with_thread_pool(mut self, pool: Arc<rayon::ThreadPool>) -> Self {
         self.thread_pool = Some(pool);
         self
@@ -74,6 +83,13 @@ impl ImageConverter {
     /// Read raw pixel data from a FITS/XISF file without any processing.
     pub fn read_raw<P: AsRef<Path>>(path: P) -> Result<(ImageMetadata, PixelData)> {
         formats::read_image(path.as_ref()).context("Failed to read image")
+    }
+
+    /// Read a FITS/XISF header without its pixel data: dimensions, sample
+    /// type, Bayer pattern, orientation and every keyword. Fast — a few KB of
+    /// I/O — so suitable for listing large sets of files.
+    pub fn read_header<P: AsRef<Path>>(path: P) -> Result<ImageHeader> {
+        formats::read_header(path.as_ref()).context("Failed to read header")
     }
 
     /// Process pre-read image data (skips file I/O).
@@ -126,15 +142,29 @@ impl ImageConverter {
             .context("Image save failed")
     }
 
+    /// [`save_processed`](Self::save_processed) with an explicit PNG
+    /// compression level (ignored for JPEG).
+    pub fn save_processed_with<P: AsRef<Path>>(
+        image: &ProcessedImage,
+        output_path: P,
+        quality: u8,
+        png_compression: PngCompression,
+    ) -> Result<()> {
+        output::save_image_with(image, output_path.as_ref(), quality, png_compression)
+            .context("Image save failed")
+    }
+
     /// Process a FITS/XISF image and save the result as JPEG or PNG.
     pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
         input_path: P,
         output_path: Q,
     ) -> Result<()> {
+        // Reject an unsupported output extension before the (expensive) processing.
+        output::OutputFormat::from_path(output_path.as_ref())?;
         let image = self.process(&input_path)?;
 
-        output::save_image(&image, output_path.as_ref(), self.quality)
+        output::save_image_with(&image, output_path.as_ref(), self.quality, self.png_compression)
             .context("Image save failed")?;
 
         Ok(())

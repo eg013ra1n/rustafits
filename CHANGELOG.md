@@ -5,6 +5,99 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Render-path speed work (same bytes), selectable PNG compression, and fixes.
+One behaviour change: `save_processed` / `convert` refuse an unsupported
+output extension (see Changed), hence a minor bump when released.
+
+### Added
+
+- **A new CLI (clap)** with batch conversion. The classic
+  `rustafits in.fits out.jpg` writes the same bytes as before. New: several
+  inputs and directories (`-r` mirrors the tree under `-o DIR`), output next
+  to the input by default, `-o FILE|DIR|-` (stdout), `-f jpg|png`,
+  `-n/--skip-existing`, `-j/--jobs` (default min(4, cores), 2 with
+  `--annotate`) and `--threads`, a progress bar and summary, `-v` per-file
+  timings, `--quiet`, `--vng`, short flags `-q -d -p -a`. Errors in one file
+  don't stop the batch (exit 1 at the end); bad output names are rejected
+  before any work; writes are atomic (temp file + rename). 9 real 26 MP
+  frames on 4 cores: 0.9 s in one call vs 2.5 s for a shell loop.
+- **`rustafits info`**: header summary without reading pixels (size, type,
+  Bayer, exposure, filter, gain, temperature, date, object; `-k KEY` extra
+  columns, `--all`, `--json`, `--csv`).
+- **`rustafits analyze`**: per-frame stars, FWHM, HFR, eccentricity, SNR,
+  SNR weight, background, noise, trail flag — library defaults, i.e. the same
+  numbers Athenaeum shows. `--sort … --reverse`, `--json`, `--csv`, arcsec
+  with `--focal-length/--pixel-size`, parallel frames, progress bar.
+- **`rustafits completions <shell>`** (bash, zsh, fish, elvish, powershell).
+- **`ImageConverter::read_header`** → `ImageHeader` (layout + every FITS card
+  or XISF FITSKeyword/Property, `get(key)`), without reading pixel data.
+  New public types `ImageHeader`, `HeaderKeyword`, `FileFormat`.
+- **The `cli` feature** (default): clap, clap_complete and indicatif are
+  optional and only the binary needs them — library users can set `default-features = false`.
+- **`encode_png`**: in-memory PNG encoding next to `encode_jpeg`.
+- **`PngCompression`** (`None` / `Fast` / `Balanced` / `High`) with
+  `ImageConverter::with_png_compression`, `ImageConverter::save_processed_with`
+  and the CLI flag `--png-compression`. The default `Fast` writes exactly
+  what `save_processed` always wrote. On a 6252 × 4176 RGB render: none
+  ~0.1 s / 78 MB, fast ~0.27 s / 77 MB, balanced ~7.8 s / 30 MB, high ~12 s /
+  28.5 MB.
+- **`OutputFormat::from_path`**: the extension → format rule, public so a
+  caller can validate an output path before processing.
+
+### Changed
+
+- **Unsupported output extensions are an error.** `.png` → PNG; `.jpg`,
+  `.jpeg` or no extension → JPEG; anything else (e.g. `.tif`) used to receive
+  a JPEG stream silently and now fails before anything is written.
+  `convert()` and the CLI check it before reading the input.
+- **CLI `--log` writes to stderr**, keeping stdout clean; it is now an alias
+  of `-v/--verbose` and prints one line per file with timings instead of the
+  settings banner.
+- **CLI usage errors exit with code 2** (clap's convention); conversion
+  failures still exit 1.
+
+### Changed — same bytes, less time
+
+- **Render passes run in parallel.** Mono: stretch and gray → RGB/RGBA fused
+  into one pass over 32K-pixel chunks, no full-frame gray buffer. Colour: the
+  three planes and alpha interleaved per chunk in parallel. `vertical_flip`
+  swaps row pairs in parallel. Chunks start on multiples of 8 pixels, so the
+  SIMD bodies and scalar tails (which round differently) see exactly the
+  pixels they saw before. `process_data`, 4 cores: mono.fits RGB 101 → 39 ms,
+  RGBA 127 → 51 ms; osc.fits RGB 58 → 43 ms, RGBA 70 → 44 ms.
+- **FITS 16- and 32-bit samples are read straight into the pixel buffer** and
+  converted in place: no 52 MB raw copy for a 26 MP frame; `read_raw` on
+  mono.fits 39.8 → 30.9 ms.
+- End to end (CLI, median of 7): mono.fits → JPEG 379 → 281 ms, osc.fits →
+  JPEG 180 → 138 ms.
+
+### Fixed
+
+- `cargo test` passes on x86_64: the two bit-for-bit fitting pins (recorded
+  on aarch64) failed there since they were added — and with them the AUR
+  PKGBUILD's `check()`. They stay exact on aarch64 and allow
+  1e-12 · max(1, |pin|) per field elsewhere (libm rounding; iteration counts
+  and flags still exact).
+- `rustafits … | head` exits quietly instead of panicking on a closed pipe.
+- CLI help and README gave `--max-stars` a default of 200; the CLI default is
+  500 (the library default stays 200).
+- README claimed `--log` shows stretch parameters; it shows the settings.
+- CLAUDE.md and docs/athenaeum-integration.md now document
+  `with_vng_debayer()` (native-resolution VNG in the render pipeline).
+- `bg_bench` asserts a float32 input instead of panicking out of bounds.
+
+### Tests
+
+- The replaced single-pass render bodies kept as oracles: chunked stretch vs
+  one pass for every kernel the host runs (dispatch, scalar, SSE2, AVX2),
+  sizes 0–17, around the chunk size, RGB and RGBA, NaN; parallel flip vs the
+  serial body; a test that a misaligned split *would* change bytes. PNG:
+  default level pinned to the old encoder output, every level round-trips.
+  Output extension rules. `tests/cli.rs`: the binary end to end on synthetic
+  FITS (classic form vs the library, batch, -r, -n, stdout, failures).
+
 ## [1.5.0] — 2026-10-24
 
 Six commits since 1.4.0, all speed work on the analysis kernels from the
