@@ -5,6 +5,54 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] — 2026-10-24
+
+Six commits since 1.4.0, all speed work on the analysis kernels from the
+star-measurement work in the host application. Every change keeps the output
+bit for bit: the previous bodies are kept as test oracles and the new code is
+pinned against them as bits. Minor, not patch: the crate gains a feature and
+public API under it (`lm-counters`).
+
+### Added
+
+- **The `lm-counters` feature and `analysis::fitting::lm_counters`**:
+  debug-only Moffat solver counters (solves, iterations, accepted and refused
+  steps, Jacobian and cost passes computed and reused, pixels and a window-size
+  histogram, by parameter count); `lm_counters()` reads them and
+  `lm_counters_reset()` clears them. Zero numeric effect; without the feature
+  none of it is compiled.
+- **The `bg_bench` example** (requires `debug-pipeline`): times the background
+  mesh and the multiresolution noise against the previous bodies.
+
+### Changed — same bits, less CPU
+
+- **Background mesh and multiresolution noise.** The B3 smoothers run their
+  interior as contiguous slice passes (the same five-tap f32 add order per
+  pixel); bicubic interpolation takes per-column tables built once; the
+  per-cell MAD median is an integer selection on reusable scratch. Single
+  thread on a 6224 × 4168 mono plane: mesh 0.97 → 0.50 s, noise 0.61 → 0.11 s.
+- **Moffat Levenberg–Marquardt normal equations.** The pass is monomorphized
+  for the two parameter counts the solvers build (7 at a fixed β, 8 at a free
+  one) with fixed-size accumulators in registers — NEON lanes on aarch64
+  (multiply then add, never fused), fixed-size scalar code elsewhere — and a
+  refused step reuses JᵀJ / Jᵀr instead of rebuilding the same bits. Measure on
+  three real frames, single thread: 10.97 → 6.07 s, 4.66 → 3.19 s,
+  16.62 → 10.43 s.
+- **Moffat Jacobian columns on aarch64**: two pixels per NEON step, one lane
+  per pixel, each lane running the scalar expression in the same operand order
+  (`vdivq_f64` is the correctly rounded division, never a reciprocal
+  multiply); an odd last pixel and every other target run the scalar row. A
+  further 3–5 % on the same frames.
+
+### Tests
+
+- The new accumulators and the two-pixel kernel against the scalar code as
+  bits (signed zeros, subnormals, an infinity; every β arm, both θ columns,
+  every window size 12–60), and the whole solver against a verbatim copy of
+  the previous one on every fixture star and arm, the free ln-β arms included.
+  Mutation checks (an FMA, a reciprocal instead of the division, a wrong lane)
+  fail them. The `lm-counters` test is ignored by default.
+
 ## [1.4.0] — 2026-10-12
 
 Seven commits since 1.3.0, all in the analysis Moffat fitter
