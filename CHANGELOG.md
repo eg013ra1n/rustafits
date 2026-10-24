@@ -5,6 +5,64 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Render-path speed work (same bytes), selectable PNG compression, and fixes.
+One behaviour change: `save_processed` / `convert` refuse an unsupported
+output extension (see Changed), hence a minor bump when released.
+
+### Added
+
+- **`PngCompression`** (`None` / `Fast` / `Balanced` / `High`) with
+  `ImageConverter::with_png_compression`, `ImageConverter::save_processed_with`
+  and the CLI flag `--png-compression`. The default `Fast` writes exactly
+  what `save_processed` always wrote. On a 6252 × 4176 RGB render: none
+  ~0.1 s / 78 MB, fast ~0.27 s / 77 MB, balanced ~7.8 s / 30 MB, high ~12 s /
+  28.5 MB.
+- **`OutputFormat::from_path`**: the extension → format rule, public so a
+  caller can validate an output path before processing.
+
+### Changed
+
+- **Unsupported output extensions are an error.** `.png` → PNG; `.jpg`,
+  `.jpeg` or no extension → JPEG; anything else (e.g. `.tif`) used to receive
+  a JPEG stream silently and now fails before anything is written.
+  `convert()` and the CLI check it before reading the input.
+- **CLI `--log` writes to stderr**, keeping stdout clean.
+
+### Changed — same bytes, less time
+
+- **Render passes run in parallel.** Mono: stretch and gray → RGB/RGBA fused
+  into one pass over 32K-pixel chunks, no full-frame gray buffer. Colour: the
+  three planes and alpha interleaved per chunk in parallel. `vertical_flip`
+  swaps row pairs in parallel. Chunks start on multiples of 8 pixels, so the
+  SIMD bodies and scalar tails (which round differently) see exactly the
+  pixels they saw before. `process_data`, 4 cores: mono.fits RGB 101 → 39 ms,
+  RGBA 127 → 51 ms; osc.fits RGB 58 → 43 ms, RGBA 70 → 44 ms.
+- **FITS 16- and 32-bit samples are read straight into the pixel buffer** and
+  converted in place: no 52 MB raw copy for a 26 MP frame; `read_raw` on
+  mono.fits 39.8 → 30.9 ms.
+- End to end (CLI, median of 7): mono.fits → JPEG 379 → 281 ms, osc.fits →
+  JPEG 180 → 138 ms.
+
+### Fixed
+
+- CLI help and README gave `--max-stars` a default of 200; the CLI default is
+  500 (the library default stays 200).
+- README claimed `--log` shows stretch parameters; it shows the settings.
+- CLAUDE.md and docs/athenaeum-integration.md now document
+  `with_vng_debayer()` (native-resolution VNG in the render pipeline).
+- `bg_bench` asserts a float32 input instead of panicking out of bounds.
+
+### Tests
+
+- The replaced single-pass render bodies kept as oracles: chunked stretch vs
+  one pass for every kernel the host runs (dispatch, scalar, SSE2, AVX2),
+  sizes 0–17, around the chunk size, RGB and RGBA, NaN; parallel flip vs the
+  serial body; a test that a misaligned split *would* change bytes. PNG:
+  default level pinned to the old encoder output, every level round-trips.
+  Output extension rules.
+
 ## [1.5.0] — 2026-10-24
 
 Six commits since 1.4.0, all speed work on the analysis kernels from the

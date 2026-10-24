@@ -76,11 +76,16 @@ rustafits <input> <output> [OPTIONS]
                     equals debayer only, --downscale 4 = debayer + 2x
                     extra downscale, etc.
   --quality <Q>     JPEG quality 1-100 (default: 95)
+  --png-compression <L>
+                    PNG compression: none | fast | balanced | high
+                    (default: fast). Astro frames barely compress at
+                    fast; none is ~2.5x faster, balanced ~2.5x smaller
+                    but ~30x slower
   --no-debayer      Disable Bayer debayering
   --preview         2x2 binning for mono images
   --annotate        Overlay star detection ellipses on the output
   --max-stars <N>   Max stars for annotation analysis (default: 500)
-  --log             Show detailed information
+  --log             Show detailed information (on stderr)
 ```
 
 ## Library Usage
@@ -311,7 +316,7 @@ Three API tiers for different integration needs:
 
 **`annotate_image(image, result, config)`** — Calls `compute_annotations()` internally, then draws directly onto the `ProcessedImage.data` buffer (RGB or RGBA). Reads `image.flip_vertical` automatically. Simplest path — one call, image modified in place.
 
-**`ImageConverter::save_processed(image, path, quality)`** — Saves a `ProcessedImage` to disk as JPEG or PNG. Use after `annotate_image()` or any other post-processing on the pixel buffer.
+**`ImageConverter::save_processed(image, path, quality)`** — Saves a `ProcessedImage` to disk as JPEG or PNG. Use after `annotate_image()` or any other post-processing on the pixel buffer. The format follows the extension: `.png` → PNG; `.jpg`, `.jpeg` or none → JPEG; anything else is an error. `save_processed_with(image, path, quality, PngCompression::None)` picks the PNG compression level (`ImageConverter::with_png_compression` does the same for `convert()`).
 
 #### AnnotationConfig fields
 
