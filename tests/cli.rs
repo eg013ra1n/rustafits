@@ -33,11 +33,8 @@ fn write_fits(path: &Path, w: usize, h: usize, bayer: Option<&str>) {
         cards.push(format!("BAYERPAT= '{p}'"));
     }
     cards.push("END".to_string());
-    let mut header: String = cards.iter().map(|c| format!("{c:<80}")).collect();
-    while header.len() % 2880 != 0 {
-        header.push(' ');
-    }
-    let mut bytes = header.into_bytes();
+    let header: String = cards.iter().map(|c| format!("{c:<80}")).collect();
+    let mut bytes = format!("{header:<width$}", width = header.len().next_multiple_of(2880)).into_bytes();
     for y in 0..h {
         for x in 0..w {
             let noise = ((x * 7919 + y * 104_729) % 97) as i64;
@@ -46,9 +43,7 @@ fn write_fits(path: &Path, w: usize, h: usize, bayer: Option<&str>) {
             bytes.extend_from_slice(&((v - 32_768) as i16).to_be_bytes());
         }
     }
-    while bytes.len() % 2880 != 0 {
-        bytes.push(0);
-    }
+    bytes.resize(bytes.len().next_multiple_of(2880), 0);
     std::fs::write(path, bytes).unwrap();
 }
 
