@@ -90,7 +90,7 @@ Pipeline flow for u16 data:
   entry point. JPEG goes through `libjpeg-turbo-rs` (pure Rust, NEON/AVX2, no
   cmake/nasm); PNG through `image`. RGBA is passed to the JPEG encoder
   unchanged — it drops alpha itself, so do NOT de-interleave to RGB first.
-- `formats/` — `fits.rs` (FITS reader), `xisf.rs` (XISF reader with zlib/LZ4/Zstd decompression)
+- `formats/` — `fits.rs` (FITS reader: plain primary-HDU images in place; `.fits.gz`, `.fz` tile-compressed and extension-HDU images via `fitsio-pure`, then the same header parsing and sample conversion), `xisf.rs` (XISF reader with zlib/LZ4/Zstd decompression)
 - `processing/` — `stretch.rs`, `debayer.rs` (super-pixel 2x2 + native-resolution green interpolation), `vng.rs` (full-resolution 8-gradient VNG demosaic, rayon over 64-row bands), `cfa.rs` (green-site mask / `G1 + G2` sum / single green phase, for measuring a raw mosaic without interpolation — Athenaeum's Analysis tab), `binning.rs`, `downscale.rs`, `color.rs`
 - `platesolving/` — quad building and matching (`pattern_matcher.rs`, incl. `build_quads_multi`), `ransac.rs`, `wcs.rs`, `projection.rs` (gnomonic), `proper_motion.rs`, `transform.rs`, `types.rs`. Reference: `docs/platesolving.md`.
 - `analysis/` — `background.rs` (mesh-grid + MRS wavelet), `detection.rs` (DAOFIND), `fitting.rs` (two-pass Moffat-primary PSF calibration, LmResult + fit_residual), `metrics.rs` (fit_residual per star), `snr.rs`, `convolution.rs`, `render.rs`, `mod.rs` (two-stage trail detection, residual-weighted statistics)

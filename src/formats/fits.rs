@@ -1,8 +1,10 @@
-use std::io::{BufReader, Read};
+use std::borrow::Cow;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::fs::File;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use fitsio_pure::hdu::{FitsData, Hdu, HduInfo};
 use rayon::prelude::*;
 
 use crate::types::{BayerPattern, DataType, FileFormat, HeaderKeyword, ImageHeader, ImageMetadata, PixelData};
@@ -60,9 +62,9 @@ fn parse_string_keyword(card: &str, keyword: &str) -> Option<String> {
     Some(s)
 }
 
-/// Read the primary header up to END. With `cards_out`, every card before END
-/// is also collected (as the parser saw it) for [`read_fits_header_info`].
-fn read_fits_header(reader: &mut BufReader<File>, mut cards_out: Option<&mut Vec<String>>) -> Result<FitsHeader> {
+/// Read a header up to END. With `cards_out`, every card before END is also
+/// collected (as the parser saw it) for [`read_fits_header_info`].
+fn read_fits_header<R: Read>(reader: &mut R, mut cards_out: Option<&mut Vec<String>>) -> Result<FitsHeader> {
     let mut hdr = FitsHeader {
         bitpix: 0,
         naxis: 0,
@@ -126,14 +128,34 @@ fn read_fits_header(reader: &mut BufReader<File>, mut cards_out: Option<&mut Vec
     if hdr.bitpix == 0 {
         bail!("Missing BITPIX keyword in FITS header");
     }
+
+    Ok(hdr)
+}
+
+/// The image dimensions a header must carry for the pixel and header readers.
+fn check_dims(hdr: &FitsHeader) -> Result<()> {
     if hdr.naxis < 2 {
         bail!("FITS image must have at least 2 dimensions");
     }
     if hdr.naxis1 == 0 || hdr.naxis2 == 0 {
         bail!("Invalid FITS image dimensions");
     }
+    Ok(())
+}
 
-    Ok(hdr)
+/// The primary header, when the file is plain FITS (not gzip) with its image
+/// in the primary HDU: the in-place reader's case. `None` for everything left
+/// to fitsio-pure ([`image_hdu`]): gzip, and an empty primary (`NAXIS = 0`)
+/// with the image, plain or tile-compressed, in an extension.
+fn plain_primary_header(
+    reader: &mut BufReader<File>,
+    cards_out: Option<&mut Vec<String>>,
+) -> Result<Option<FitsHeader>> {
+    if fitsio_pure::gzip::is_gzip(reader.fill_buf().context("Failed to read FITS file")?) {
+        return Ok(None);
+    }
+    let hdr = read_fits_header(reader, cards_out)?;
+    Ok((hdr.naxis != 0).then_some(hdr))
 }
 
 /// Channels, Bayer pattern and display flip implied by a header — shared by
@@ -210,7 +232,14 @@ pub fn read_fits_header_info(path: &Path) -> Result<ImageHeader> {
     let file = File::open(path).context("Failed to open FITS file")?;
     let mut reader = BufReader::new(file);
     let mut cards = Vec::new();
-    let hdr = read_fits_header(&mut reader, Some(&mut cards))?;
+    let hdr = match plain_primary_header(&mut reader, Some(&mut cards))? {
+        Some(hdr) => hdr,
+        None => {
+            cards.clear();
+            read_fits_header(&mut image_hdu_header(path)?.as_slice(), Some(&mut cards))?
+        }
+    };
+    check_dims(&hdr)?;
     let (channels, bayer_pattern, flip_vertical) = layout(&hdr)?;
     let sample_type = match hdr.bitpix {
         8 => "u8",
@@ -274,13 +303,29 @@ fn parse_card(card: &str) -> Option<HeaderKeyword> {
     Some(HeaderKeyword { key: key.to_string(), value, comment })
 }
 
+/// Read a FITS image. Plain FITS with the image in the primary HDU is read in
+/// place; gzip (`.fits.gz`), tile-compressed (`.fz`) and extension-HDU images
+/// go through fitsio-pure, then the same decoding.
 pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     let file = File::open(path).context("Failed to open FITS file")?;
     let mut reader = BufReader::new(file);
 
-    let hdr = read_fits_header(&mut reader, None)?;
+    match plain_primary_header(&mut reader, None)? {
+        Some(hdr) => read_pixels(path, &hdr, &mut reader),
+        None => {
+            let bytes = read_fits_bytes(path)?;
+            let (header, data) = image_hdu(&bytes)?;
+            let hdr = read_fits_header(&mut header.as_slice(), None)?;
+            read_pixels(path, &hdr, &mut &*data)
+        }
+    }
+}
 
-    let (channels, bayer_pattern, flip_vertical) = layout(&hdr)?;
+/// Decode the data unit `reader` is positioned at (big-endian, as stored in
+/// a plain FITS file) per `hdr`.
+fn read_pixels<R: Read>(path: &Path, hdr: &FitsHeader, reader: &mut R) -> Result<(ImageMetadata, PixelData)> {
+    check_dims(hdr)?;
+    let (channels, bayer_pattern, flip_vertical) = layout(hdr)?;
 
     let num_pixels = hdr.naxis1 * hdr.naxis2 * channels;
     let bytes_per_pixel = (hdr.bitpix.unsigned_abs() as usize) / 8;
@@ -375,7 +420,7 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
             (DataType::Float32, PixelData::Float32(f32_data))
         }
         8 => {
-            let raw_data = read_raw_bytes(&mut reader, data_size)?;
+            let raw_data = read_raw_bytes(reader, data_size)?;
             let mut u16_data = vec![0u16; num_pixels];
             let bzero = hdr.bzero;
             let bscale = hdr.bscale;
@@ -395,7 +440,7 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
             (DataType::Uint16, PixelData::Uint16(u16_data))
         }
         -64 => {
-            let raw_data = read_raw_bytes(&mut reader, data_size)?;
+            let raw_data = read_raw_bytes(reader, data_size)?;
             let mut f32_data = vec![0f32; num_pixels];
             let src = &raw_data;
             let bzero = hdr.bzero;
@@ -434,10 +479,146 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     Ok((meta, pixels))
 }
 
-fn read_raw_bytes(reader: &mut BufReader<File>, len: usize) -> Result<Vec<u8>> {
+fn read_raw_bytes<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u8>> {
     let mut raw = vec![0u8; len];
     reader.read_exact(&mut raw).context("Failed to read FITS data")?;
     Ok(raw)
+}
+
+// Files the in-place reader does not take go through fitsio-pure, which finds
+// the image HDU and, for a tile-compressed image, decompresses it. Its header
+// and its data unit (big-endian, as in a plain file) are then decoded by
+// `read_fits_header` and `read_pixels` — the same code, so the same keyword
+// parsing, BZERO / BSCALE rules and BITPIX → u16 / f32 conversions.
+
+/// The file's bytes, inflated if it is gzip-compressed (`.fits.gz`).
+fn read_fits_bytes(path: &Path) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path).context("Failed to read FITS file")?;
+    if fitsio_pure::gzip::is_gzip(&bytes) {
+        return fitsio_pure::gzip::decompress(&bytes).context("Failed to decompress gzipped FITS file");
+    }
+    Ok(bytes)
+}
+
+/// The HDU holding the image: the primary if it has data axes, else the first
+/// image or tile-compressed image extension.
+fn find_image_hdu(fits: &FitsData) -> Result<&Hdu> {
+    fits.iter()
+        .find(|hdu| match &hdu.info {
+            HduInfo::Primary { naxes, .. } | HduInfo::Image { naxes, .. } => !naxes.is_empty(),
+            HduInfo::CompressedImage { .. } => true,
+            _ => false,
+        })
+        .context("No image HDU in FITS file")
+}
+
+/// The header blocks [`read_fits_header`] reads for `hdu`, given its raw
+/// header bytes: those bytes, or a tile-compressed image's logical header.
+fn image_header(hdu: &Hdu, raw: &[u8]) -> Vec<u8> {
+    if matches!(hdu.info, HduInfo::CompressedImage { .. }) {
+        logical_header(raw)
+    } else {
+        raw.to_vec()
+    }
+}
+
+/// The image HDU of a (gunzipped) FITS file: its header blocks and its data
+/// unit, uncompressed and big-endian.
+fn image_hdu(bytes: &[u8]) -> Result<(Vec<u8>, Cow<'_, [u8]>)> {
+    let fits = fitsio_pure::hdu::parse_fits(bytes).context("Failed to parse FITS file")?;
+    let hdu = find_image_hdu(&fits)?;
+    let header = image_header(hdu, &bytes[hdu.header_start..hdu.data_start]);
+    let data = if matches!(hdu.info, HduInfo::CompressedImage { .. }) {
+        let pixels = fitsio_pure::image::read_image_data(bytes, hdu).context("Failed to decompress FITS image")?;
+        Cow::Owned(fitsio_pure::image::serialize_image(&pixels))
+    } else {
+        Cow::Borrowed(&bytes[hdu.data_start..hdu.data_start + hdu.data_len])
+    };
+    Ok((header, data))
+}
+
+/// [`image_hdu`]'s header alone. Only a gzipped file is read whole; otherwise
+/// just the header blocks are.
+fn image_hdu_header(path: &Path) -> Result<Vec<u8>> {
+    let mut file = File::open(path).context("Failed to open FITS file")?;
+    let mut magic = [0u8; 2];
+    let gzip = file.read_exact(&mut magic).is_ok() && fitsio_pure::gzip::is_gzip(&magic);
+    if gzip {
+        let bytes = read_fits_bytes(path)?;
+        let fits = fitsio_pure::hdu::parse_fits(&bytes).context("Failed to parse FITS file")?;
+        let hdu = find_image_hdu(&fits)?;
+        return Ok(image_header(hdu, &bytes[hdu.header_start..hdu.data_start]));
+    }
+    let len = file.metadata().context("Failed to read FITS file")?.len() as usize;
+    let mut read_at = |offset: usize, buf: &mut [u8]| -> std::io::Result<()> {
+        file.seek(SeekFrom::Start(offset as u64))?;
+        file.read_exact(buf)
+    };
+    let fits = fitsio_pure::hdu::parse_fits_headers(len, |offset, buf| Ok(read_at(offset, buf)?))
+        .context("Failed to parse FITS file")?;
+    let hdu = find_image_hdu(&fits)?;
+    let mut raw = vec![0u8; hdu.data_start - hdu.header_start];
+    read_at(hdu.header_start, &mut raw).context("Failed to read FITS header block")?;
+    Ok(image_header(hdu, &raw))
+}
+
+/// A tile-compressed image's header as the image's own, the way cfitsio and
+/// astropy present it: the `Z` keywords that keep the image's structural
+/// keywords (`ZBITPIX`, `ZNAXISn`, `ZSIMPLE`, …) renamed back and put first in
+/// standard order, the binary table's structure and the compression
+/// parameters dropped, and every other card kept in place.
+fn logical_header(raw: &[u8]) -> Vec<u8> {
+    let mut lead: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut rest: Vec<u8> = Vec::new();
+    for card in raw.as_chunks::<FITS_CARD_SIZE>().0 {
+        let key = std::str::from_utf8(&card[..8]).unwrap_or("").trim_end();
+        if key == "END" {
+            break;
+        }
+        let renamed = |name: &str| {
+            let mut c = card.to_vec();
+            c[..8].copy_from_slice(format!("{name:<8}").as_bytes());
+            c
+        };
+        match key {
+            "ZSIMPLE" => lead.push((0, renamed("SIMPLE"))),
+            "ZTENSION" => lead.push((0, renamed("XTENSION"))),
+            "ZBITPIX" => lead.push((1, renamed("BITPIX"))),
+            "ZNAXIS" => lead.push((2, renamed("NAXIS"))),
+            "ZPCOUNT" => lead.push((4, renamed("PCOUNT"))),
+            "ZGCOUNT" => lead.push((5, renamed("GCOUNT"))),
+            "ZEXTEND" => lead.push((6, renamed("EXTEND"))),
+            "ZHECKSUM" => rest.extend(renamed("CHECKSUM")),
+            "ZDATASUM" => rest.extend(renamed("DATASUM")),
+            _ if indexed(key, "ZNAXIS") => lead.push((3, renamed(&key[1..]))),
+            _ if is_table_or_compression_keyword(key) => {}
+            _ => rest.extend_from_slice(card),
+        }
+    }
+    // Stable: NAXIS1, NAXIS2, … keep their order.
+    lead.sort_by_key(|(rank, _)| *rank);
+    let mut out: Vec<u8> = lead.into_iter().flat_map(|(_, card)| card).collect();
+    out.extend(rest);
+    out.extend(format!("{:<width$}", "END", width = FITS_CARD_SIZE).bytes());
+    out.resize(out.len().div_ceil(FITS_BLOCK_SIZE) * FITS_BLOCK_SIZE, b' ');
+    out
+}
+
+/// `key` is `prefix` followed by an axis / column number.
+fn indexed(key: &str, prefix: &str) -> bool {
+    key.strip_prefix(prefix).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Keywords of a compressed image's binary table, or of its compression, that
+/// describe nothing in the image itself.
+fn is_table_or_compression_keyword(key: &str) -> bool {
+    matches!(
+        key,
+        "XTENSION" | "BITPIX" | "NAXIS" | "PCOUNT" | "GCOUNT" | "TFIELDS" | "THEAP" | "CHECKSUM" | "DATASUM"
+            | "ZIMAGE" | "ZCMPTYPE" | "ZQUANTIZ" | "ZDITHER0" | "ZMASKCMP" | "ZBLANK" | "ZSCALE" | "ZZERO"
+    ) || ["NAXIS", "TTYPE", "TFORM", "TUNIT", "TNULL", "TSCAL", "TZERO", "TDIM", "ZTILE", "ZNAME", "ZVAL"]
+        .iter()
+        .any(|prefix| indexed(key, prefix))
 }
 
 /// Marker for plain sample types that may be filled byte-wise from a file.
@@ -732,5 +913,281 @@ mod tests {
             assert_eq!(out[i], want, "sample {i}");
         }
         assert_eq!(out[3], 0);
+    }
+
+    /// Stored samples of a synthetic image, as a plain FITS data unit holds them.
+    enum Stored {
+        I16(Vec<i16>),
+        F32(Vec<f32>),
+    }
+
+    impl Stored {
+        fn bitpix(&self) -> i32 {
+            match self {
+                Stored::I16(_) => 16,
+                Stored::F32(_) => -32,
+            }
+        }
+
+        fn be_bytes(&self) -> Vec<u8> {
+            match self {
+                Stored::I16(v) => v.iter().flat_map(|s| s.to_be_bytes()).collect(),
+                Stored::F32(v) => v.iter().flat_map(|s| s.to_be_bytes()).collect(),
+            }
+        }
+
+        /// One tile-compressed image extension: RICE_1 for integers, lossless
+        /// GZIP_2 for floats.
+        fn compress(&self, naxes: &[usize], extra: &[fitsio_pure::header::Card]) -> Vec<u8> {
+            use fitsio_pure::compress::{compress_image_hdu, TileCompression};
+            match self {
+                Stored::I16(v) => compress_image_hdu(naxes, v, &TileCompression::rice(), extra),
+                Stored::F32(v) => compress_image_hdu(naxes, v, &TileCompression::gzip2().lossless(), extra),
+            }
+            .expect("tile compression failed")
+        }
+    }
+
+    /// A synthetic image: axes (NAXIS1 first), the cards after the structural
+    /// ones, and the stored samples.
+    struct Synthetic {
+        naxes: Vec<usize>,
+        cards: Vec<String>,
+        stored: Stored,
+    }
+
+    impl Synthetic {
+        /// `first` (SIMPLE or XTENSION), BITPIX, NAXIS, NAXISn.
+        fn structural(&self, first: String) -> Vec<String> {
+            let mut cards = vec![first, make_card("BITPIX", self.stored.bitpix()), make_card("NAXIS", self.naxes.len())];
+            cards.extend(self.naxes.iter().enumerate().map(|(i, n)| make_card(&format!("NAXIS{}", i + 1), n)));
+            cards
+        }
+
+        fn data_unit(&self) -> Vec<u8> {
+            let mut data = self.stored.be_bytes();
+            data.resize(data.len().div_ceil(FITS_BLOCK_SIZE) * FITS_BLOCK_SIZE, 0);
+            data
+        }
+
+        /// The image in the primary HDU: the in-place reader's file.
+        fn plain(&self) -> Vec<u8> {
+            let mut cards = self.structural(make_card("SIMPLE", "T"));
+            cards.extend(self.cards.iter().cloned());
+            let mut bytes = build_header_block(&cards);
+            bytes.extend(self.data_unit());
+            bytes
+        }
+
+        /// The image in an IMAGE extension behind an empty primary.
+        fn in_extension(&self) -> Vec<u8> {
+            let mut cards = self.structural(make_card("XTENSION", "'IMAGE   '"));
+            cards.extend([make_card("PCOUNT", 0), make_card("GCOUNT", 1)]);
+            cards.extend(self.cards.iter().cloned());
+            let mut bytes = empty_primary();
+            bytes.extend(build_header_block(&cards));
+            bytes.extend(self.data_unit());
+            bytes
+        }
+
+        /// The same stored samples and keywords, tile-compressed (`.fz`).
+        fn tile_compressed(&self) -> Vec<u8> {
+            let extra: Vec<_> = self
+                .cards
+                .iter()
+                .map(|c| fitsio_pure::header::parse_card(c.as_bytes().try_into().unwrap()).unwrap())
+                .collect();
+            let mut bytes = empty_primary();
+            bytes.extend(self.stored.compress(&self.naxes, &extra));
+            bytes
+        }
+    }
+
+    fn empty_primary() -> Vec<u8> {
+        build_header_block(&[
+            make_card("SIMPLE", "T"),
+            make_card("BITPIX", 8),
+            make_card("NAXIS", 0),
+            make_card("EXTEND", "T"),
+        ])
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Metadata as a comparable tuple (`ImageMetadata` has no `PartialEq`).
+    fn meta_tuple(m: &ImageMetadata) -> (usize, usize, usize, DataType, BayerPattern, bool) {
+        (m.width, m.height, m.channels, m.dtype, m.bayer_pattern, m.flip_vertical)
+    }
+
+    /// Pixels as bit patterns, so NaN compares equal to itself.
+    fn pixel_bits(p: &PixelData) -> (DataType, Vec<u32>) {
+        match p {
+            PixelData::Uint16(v) => (DataType::Uint16, v.iter().map(|&s| s as u32).collect()),
+            PixelData::Float32(v) => (DataType::Float32, v.iter().map(|s| s.to_bits()).collect()),
+        }
+    }
+
+    /// Keywords minus the ones that differ by HDU kind, not by image. Numbers
+    /// compare by value: fitsio-pure's writer spells `120.0` `1.2…E2`.
+    fn image_keywords(h: &ImageHeader) -> Vec<(String, String)> {
+        h.keywords
+            .iter()
+            .filter(|k| !matches!(k.key.as_str(), "SIMPLE" | "XTENSION" | "PCOUNT" | "GCOUNT"))
+            .map(|k| (k.key.clone(), k.value.parse::<f64>().map_or_else(|_| k.value.clone(), |v| v.to_string())))
+            .collect()
+    }
+
+    /// The gzipped, extension-HDU and tile-compressed (plain and gzipped)
+    /// forms of `img` read exactly as its plain form does through the
+    /// in-place reader: metadata, PixelData variant, every pixel's bits, and
+    /// the header-only read with its keywords.
+    fn assert_other_forms_match_plain(name: &str, img: &Synthetic) -> (ImageMetadata, PixelData) {
+        let dir = std::env::temp_dir();
+        let id = std::process::id();
+        let plain_path = dir.join(format!("rustafits_test_{name}_{id}.fits"));
+        std::fs::write(&plain_path, img.plain()).unwrap();
+        let (want_meta, want_pixels) = read_fits_image(&plain_path).unwrap();
+        let want_info = read_fits_header_info(&plain_path).unwrap();
+        std::fs::remove_file(&plain_path).ok();
+
+        let fz = img.tile_compressed();
+        let forms = [
+            ("fits.gz", gzip(&img.plain())),
+            ("ext.fits", img.in_extension()),
+            ("fz", fz.clone()),
+            ("fz.gz", gzip(&fz)),
+        ];
+        for (suffix, bytes) in forms {
+            let path = dir.join(format!("rustafits_test_{name}_{id}.{suffix}"));
+            std::fs::write(&path, bytes).unwrap();
+            let read = read_fits_image(&path);
+            let info = read_fits_header_info(&path);
+            std::fs::remove_file(&path).ok();
+            let (meta, pixels) = read.unwrap_or_else(|e| panic!("{name}.{suffix}: {e:#}"));
+            let info = info.unwrap_or_else(|e| panic!("{name}.{suffix} header: {e:#}"));
+            assert_eq!(meta_tuple(&meta), meta_tuple(&want_meta), "{name}.{suffix} metadata");
+            assert!(pixel_bits(&pixels) == pixel_bits(&want_pixels), "{name}.{suffix} pixels");
+            assert_eq!(
+                (info.width, info.height, info.channels, info.sample_type, info.bayer_pattern, info.flip_vertical),
+                (
+                    want_info.width,
+                    want_info.height,
+                    want_info.channels,
+                    want_info.sample_type,
+                    want_info.bayer_pattern,
+                    want_info.flip_vertical
+                ),
+                "{name}.{suffix} header layout"
+            );
+            assert_eq!(image_keywords(&info), image_keywords(&want_info), "{name}.{suffix} keywords");
+        }
+        (want_meta, want_pixels)
+    }
+
+    #[test]
+    fn compressed_and_extension_u16_match_plain() {
+        let (w, h) = (37, 23);
+        // Unsigned 16-bit over the whole range, stored with BZERO 32768.
+        let values: Vec<u16> = (0..w * h).map(|i| (i * 7919 % 65536) as u16).collect();
+        let img = Synthetic {
+            naxes: vec![w, h],
+            cards: vec![make_card("BZERO", 32768), make_card("BSCALE", 1), make_card("EXPTIME", "120.0 / seconds")],
+            stored: Stored::I16(values.iter().map(|&v| (v as i32 - 32768) as i16).collect()),
+        };
+        let (meta, pixels) = assert_other_forms_match_plain("u16", &img);
+        assert!(meta.flip_vertical, "no ROWORDER is bottom-up");
+        assert!(matches!(pixels, PixelData::Uint16(ref v) if *v == values));
+    }
+
+    #[test]
+    fn compressed_and_extension_f32_match_plain() {
+        let (w, h) = (19, 11);
+        let mut values: Vec<f32> = (0..w * h).map(|i| (i as f32 - 50.0) * 13.25).collect();
+        values[3] = f32::NAN;
+        values[40] = f32::INFINITY;
+        values[41] = -0.0;
+        values[42] = 1.0e30;
+        let img = Synthetic {
+            naxes: vec![w, h],
+            cards: vec![make_card("BZERO", "100.0"), make_card("BSCALE", "2.0"), make_card("ROWORDER", "'TOP-DOWN'")],
+            stored: Stored::F32(values.clone()),
+        };
+        let (meta, pixels) = assert_other_forms_match_plain("f32", &img);
+        assert!(!meta.flip_vertical);
+        let PixelData::Float32(out) = pixels else { panic!("expected Float32 pixels") };
+        assert!(out[3].is_nan());
+        assert_eq!(out[0], 100.0 + 2.0 * values[0]);
+    }
+
+    #[test]
+    fn compressed_and_extension_osc_match_plain() {
+        let (w, h) = (32, 16);
+        let img = Synthetic {
+            naxes: vec![w, h],
+            cards: vec![
+                make_card("BZERO", 32768),
+                make_card("BAYERPAT", "'RGGB'"),
+                make_card("XBAYROFF", 1),
+                make_card("YBAYROFF", 0),
+                make_card("ROWORDER", "'TOP-DOWN'"),
+            ],
+            stored: Stored::I16((0..w * h).map(|i| (i as i32 * 97 % 60000 - 30000) as i16).collect()),
+        };
+        let (meta, _) = assert_other_forms_match_plain("osc", &img);
+        assert_eq!(meta.bayer_pattern, BayerPattern::Grbg, "odd XBAYROFF folds RGGB to GRBG");
+    }
+
+    #[test]
+    fn compressed_and_extension_rgb_match_plain() {
+        let naxes = vec![8, 6, 3];
+        let img = Synthetic {
+            naxes: naxes.clone(),
+            cards: vec![make_card("BZERO", 32768)],
+            stored: Stored::I16((0..8 * 6 * 3).map(|i| (i * 1201 - 32768) as i16).collect()),
+        };
+        let (meta, _) = assert_other_forms_match_plain("rgb", &img);
+        assert_eq!(meta.channels, 3);
+    }
+
+    #[test]
+    fn compressed_and_extension_bitpix16_bzero0_match_plain() {
+        // No BZERO and mostly negative samples: the offset-data rule applies alike.
+        let img = Synthetic {
+            naxes: vec![100, 10],
+            cards: vec![],
+            stored: Stored::I16((0..1000).map(|i| -30000 + i as i16).collect()),
+        };
+        let (_, pixels) = assert_other_forms_match_plain("b16z0", &img);
+        assert!(matches!(pixels, PixelData::Uint16(ref v) if v[0] == 2768));
+    }
+
+    #[test]
+    fn tile_compressed_header_is_the_images() {
+        let img = Synthetic {
+            naxes: vec![16, 4],
+            cards: vec![make_card("BZERO", 32768), make_card("FILTER", "'Ha'")],
+            stored: Stored::I16(vec![0; 64]),
+        };
+        let path = std::env::temp_dir().join(format!("rustafits_test_fz_header_{}.fz", std::process::id()));
+        std::fs::write(&path, img.tile_compressed()).unwrap();
+        let info = read_fits_header_info(&path);
+        std::fs::remove_file(&path).ok();
+        let keys: Vec<String> = info.unwrap().keywords.into_iter().map(|k| k.key).collect();
+        assert_eq!(keys, ["BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "BZERO", "FILTER"]);
+    }
+
+    #[test]
+    fn empty_primary_without_an_image_is_an_error() {
+        let path = std::env::temp_dir().join(format!("rustafits_test_no_image_{}.fits", std::process::id()));
+        std::fs::write(&path, empty_primary()).unwrap();
+        let read = read_fits_image(&path);
+        let info = read_fits_header_info(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(read.is_err() && info.is_err());
     }
 }

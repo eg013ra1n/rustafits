@@ -64,6 +64,7 @@ clap_complete = { version = "4.6", optional = true }
 indicatif = { version = "0.18", optional = true }
 # Already in the tree via indicatif; the CLI uses it to restore default SIGPIPE.
 libc = { version = "0.2", optional = true }
+fitsio-pure = { version = "0.22.0", default-features = false, features = ["parallel"] }
 
 [dev-dependencies]
 # Independent decoder for tests/jpeg_encoder.rs. Deliberately NOT the encoder's

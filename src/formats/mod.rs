@@ -63,10 +63,12 @@ fn is_fits(path: &Path) -> bool {
             return true;
         }
     }
-    // Check magic bytes: "SIMPLE  ="
+    // Check magic bytes: "SIMPLE  =" (plain or tile-compressed `.fz`), or
+    // gzip (`.fits.gz`)
     if let Ok(mut f) = File::open(path) {
         let mut buf = [0u8; 9];
-        if f.read_exact(&mut buf).is_ok() && &buf == b"SIMPLE  =" {
+        let n = f.read(&mut buf).unwrap_or(0);
+        if &buf[..n] == b"SIMPLE  =" || fitsio_pure::gzip::is_gzip(&buf[..n]) {
             return true;
         }
     }
