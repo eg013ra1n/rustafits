@@ -16,6 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the G1 sample of every cell, a half-resolution plane of real samples for
   sky / noise statistics). Odd last row / column left out; `BayerPattern::None`
   gives an empty result. Parallel (rayon).
+- **FITS: gzipped, tile-compressed and extension-HDU images** — `.fits.gz`
+  (gzip magic bytes), `.fz` tile-compressed images (RICE_1, GZIP_1, GZIP_2,
+  HCOMPRESS_1, PLIO_1, lossless or quantized floats) and an image in the first
+  image extension behind an empty primary (`NAXIS = 0`) are read through
+  [`fitsio-pure`](https://crates.io/crates/fitsio-pure) (pure Rust, its
+  `parallel` feature on the rayon already in the tree). Its uncompressed
+  header and big-endian data unit then go through the plain reader's own
+  keyword parsing and BZERO / BSCALE / BITPIX conversions, so metadata
+  (channels, Bayer pattern incl. `XBAYROFF` / `YBAYROFF`, flip) and pixels
+  equal those of the same image stored plain. `read_header` / `rustafits info`
+  list the image HDU's cards; for a tile-compressed image that is the image's
+  logical header (`ZBITPIX`, `ZNAXISn`, … as `BITPIX`, `NAXISn`, …; table and
+  compression keywords dropped). Directory inputs pick up `.fz`. Plain FITS
+  with the image in the primary HDU is read in place exactly as before
+  (same bytes, same speed). 26 MP 16-bit frame (64-core x86_64): plain 46 ms,
+  `.fz` RICE_1 ~120 ms, `.fits.gz` ~310 ms.
 
 ### Fixed
 

@@ -21,7 +21,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 
 | Format | Extensions | Data Types |
 |--------|-----------|------------|
-| FITS | `.fits`, `.fit` | 8/16/32-bit int, 32/64-bit float |
+| FITS | `.fits`, `.fit`, `.fts`; gzipped `.fits.gz`; tile-compressed `.fz` (RICE_1, GZIP_1, GZIP_2, HCOMPRESS_1, PLIO_1) | 8/16/32-bit int, 32/64-bit float |
 | XISF | `.xisf` | All sample formats, zlib/LZ4/Zstd compression |
 
 ## Installation
@@ -77,7 +77,8 @@ rustafits image.fits annotated.jpg -a -v
 rustafits osc.fits full.jpg --vng
 ```
 
-Inputs are `.fits` `.fit` `.fts` `.xisf` files or directories. With exactly
+Inputs are `.fits` `.fit` `.fts` `.fz` `.xisf` files or directories (a `.fits.gz`
+is read when named, not picked up from a directory). With exactly
 two paths, the second is the output if it is `-`, ends in `.jpg`/`.jpeg`/`.png`,
 or does not exist yet. A batch shows a progress bar and a summary on stderr; a
 failing file is reported and the others carry on (exit code 1 if any failed).
