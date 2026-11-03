@@ -1,7 +1,7 @@
 # Port Athenaeum's `star_measure` into rustafits — Plan
 
-> **Status:** draft for the owner's review, nothing started. The decisions marked **D-n** are the owner's; each
-> carries a recommendation. Facts below were read on 2026-11-03 at Athenaeum `main` 0b6fb183, rustafits `main`
+> **Status:** approved, implementation not started. The owner took decisions D-1…D-9 on 2026-11-03, every one as
+> recommended (section 4). Facts below were read on 2026-11-03 at Athenaeum `main` 0b6fb183, rustafits `main`
 > 66b97b1 (Athenaeum's submodule pin) and solvemyastro `main`.
 
 ## Background
@@ -142,45 +142,46 @@ proposals. After the port, Athenaeum has:
 
 ## 4. Owner decisions
 
-- **D-1 Scope.** The options:
-  - (a) the module only (phases 0–3);
-  - (b) the module plus the Analysis-mode entry and the CLI switch (phases 0–5).
+Taken by the owner on 2026-11-03, every one as recommended.
 
-  *Recommended: (b).* (a) alone does not give the CLI Athenaeum's numbers.
-- **D-2 Home after the port.** *Recommended:*
+- **D-1 Scope: (b)**, the module plus the Analysis-mode entry and the CLI switch (phases 0–5). The alternative was
+  (a), the module only (phases 0–3); it would not give the CLI Athenaeum's numbers.
+- **D-2 Home after the port.**
   - rustafits is the only home: changes to `star_measure` land as rustafits PRs, and Athenaeum bumps the submodule;
   - `MEASURE_VERSION` moves with the code, and its policy moves into rustafits' CLAUDE.md ("one bump per merged
     plan that changes what a fit accepts or measures"); Athenaeum's cache keys keep reading the constant;
   - the truth lab stays in athenaeum-lab and stays the referee.
 - **D-3 API surface.** The module's surface is shaped by one consumer: every `MeasureOptions` field is public, plus
-  the 14 helpers. *Recommended:*
+  the 14 helpers. Therefore:
   - `pub mod star_measure`, always compiled (the CLI needs it from phase 5);
   - the helpers re-exported from a `#[doc(hidden)] pub mod adapter` and documented as outside semver;
   - `StarFit::test_at` behind a `test-support` feature that Athenaeum enables for its tests only;
   - the stable, semver-covered entry is `analysis_mode`.
-- **D-4 serde.** 24 types derive `Serialize` / `Deserialize`. Some are on Athenaeum's wire: `PsfModel` camelCase
-  in the stacking config, and the pass-1 / `.athf` artifacts. *Recommended:* a `serde` feature, off by default,
-  enabled by Athenaeum, with every derive and every `#[serde(...)]` attribute under `cfg_attr`. Athenaeum's
-  round-trip tests pin the wire.
-- **D-5 `ts_rs::TS` on `PsfModel`.** Athenaeum cannot derive a foreign trait on what becomes a foreign type.
-  *Recommended:* Athenaeum keeps a wire enum of its own, with `From` both ways, instead of a `ts-rs` feature here.
-  Regenerating the TS contract must leave `src/types` unchanged.
-- **D-6 The legacy `ImageAnalyzer::analyze*`.** *Recommended:*
-  - keep it through 1.x, marked `#[deprecated]` after phase 5;
-  - remove it in 2.0, once the lab retires `legacy-analysis` and Athenaeum retires `SeedOverride::Full`;
+- **D-4 serde.** 24 types derive `Serialize` / `Deserialize`; some are on Athenaeum's wire (`PsfModel` camelCase in
+  the stacking config, the pass-1 / `.athf` artifacts). They get a `serde` feature, off by default and enabled by
+  Athenaeum, with every derive and every `#[serde(...)]` attribute under `cfg_attr`. Athenaeum's round-trip tests
+  pin the wire.
+- **D-5 `ts_rs::TS` on `PsfModel`.** Athenaeum cannot derive a foreign trait on what becomes a foreign type, so it
+  keeps a wire enum of its own, with `From` both ways; rustafits gets no `ts-rs` feature. Regenerating the TS
+  contract must leave `src/types` unchanged.
+- **D-6 The legacy `ImageAnalyzer::analyze*`.**
+  - kept through 1.x, marked `#[deprecated]` after phase 5;
+  - removed in 2.0 (phase 6), once the lab retires `legacy-analysis` and Athenaeum retires `SeedOverride::Full`;
   - `detect_fast*` and `FastStar` stay in every case.
 - **D-7 CLI `analyze` output.** Today: STARS FWHM HFR ECC SNR WEIGHT BG NOISE TRAIL. Analysis mode adds
   `stars_refused`, `frame_verdict`, `measure_version`, `psf_signal`, `frame_snr` (a ratio, PC-11) and `median_beta`
-  (NULL under Moffat 4, PC-9). *Recommended:*
+  (NULL under Moffat 4, PC-9). Therefore:
   - VERDICT replaces TRAIL in the table (PC-15's rule);
   - JSON / CSV carry every field;
   - `--max-stars` becomes the budget (default 500);
   - new `--detection-threshold` (σ, default 6.0, range 2–20) and `--psf-model moffat4|auto`.
-- **D-8 Version.** Phases 1–2 are additive: 1.7.0. Phase 5 changes the CLI's numbers: 1.8.0 with a **Changed**
-  entry, or 2.0 if D-6's removal ships in the same release.
-- **D-9 History.** *Recommended:* copy the files at a fixed Athenaeum sha named in the commit message, rather than
-  importing them with history. Athenaeum's history stays the record, and its plans and rulings cite Athenaeum shas
-  anyway.
+- **D-8 Version.**
+  - 1.7.0: phases 1–2, additive;
+  - 1.8.0: phase 5, with a **Changed** entry for the CLI's numbers. Phase 4's rustafits additions ride with it,
+    unless Athenaeum needs them first; then they get a minor release of their own;
+  - 2.0: phase 6, the removal under D-6.
+- **D-9 History.** The files are copied at a fixed Athenaeum sha, named in the commit message, rather than imported
+  with history. Athenaeum's history stays the record, and its plans and rulings cite Athenaeum shas anyway.
 
 ## 5. Gates
 
