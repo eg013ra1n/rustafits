@@ -35,7 +35,7 @@ cargo clippy
 
 ### Crate Structure
 
-The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public. The default `cli` feature carries the `rustafits` binary's only extra deps (clap, clap_complete, indicatif, libc); the binary requires it, and library users (Athenaeum) can build with `default-features = false`. The binary lives in `src/bin/rustafits/`: `main.rs` (clap; conversion is the default command, plus `info`, `analyze`, `completions`), `batch.rs` (input collection, shared pool, worker loop, progress bar), `convert.rs`, `info.rs`, `analyze.rs`, `report.rs` (table/JSON/CSV). `analyze` must keep `ImageAnalyzer`'s library defaults — Athenaeum uses them, and `tests/cli.rs` pins the CLI's numbers to `ImageAnalyzer::new().analyze()`. `tests/cli.rs` drives the binary end to end on synthetic FITS.
+The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public. The default `cli` feature carries the `rustafits` binary's only extra deps (clap, clap_complete, indicatif, libc); the binary requires it, and library users (Athenaeum) can build with `default-features = false`. The binary lives in `src/bin/rustafits/`: `main.rs` (clap; conversion is the default command, plus `info`, `analyze`, `completions`), `batch.rs` (input collection, shared pool, worker loop, progress bar), `convert.rs`, `info.rs`, `analyze.rs`, `report.rs` (table/JSON/CSV). `analyze` runs `ImageAnalyzer` with its library defaults, and `tests/cli.rs` pins the CLI's numbers to `ImageAnalyzer::new().analyze()`. These are no longer the numbers Athenaeum shows: its Analysis tab moved to its own `star_measure` module (see Downstream Users). `tests/cli.rs` drives the binary end to end on synthetic FITS.
 
 ### Processing Pipeline
 
@@ -68,7 +68,8 @@ Pipeline flow for u16 data:
   `<Image>` headers resolve to the largest image, ties to the first. This
   is a PRODUCTION CONTRACT, not just a rendering convenience —
   `athenaeum-core`'s `integration::banded::spill_via_read_raw` (master
-  builds, light calibration) and `analysis::analyzer::analyze_frame` both
+  builds, light calibration) and `analysis::input::read_raw_frame` (the
+  Analysis tab's reader, behind `analysis::analyzer::analyze_frame`) both
   take `PixelData::Float32` straight into ADU-domain code with no rescale
   of their own, so removing this scale silently breaks them (a 65535×-too-
   small master; a detector that finds nothing) even though
@@ -95,6 +96,21 @@ Pipeline flow for u16 data:
 - `platesolving/` — quad building and matching (`pattern_matcher.rs`, incl. `build_quads_multi`), `ransac.rs`, `wcs.rs`, `projection.rs` (gnomonic), `proper_motion.rs`, `transform.rs`, `types.rs`. Reference: `docs/platesolving.md`.
 - `analysis/` — `background.rs` (mesh-grid + MRS wavelet), `detection.rs` (DAOFIND), `fitting.rs` (two-pass Moffat-primary PSF calibration, LmResult + fit_residual), `metrics.rs` (fit_residual per star), `snr.rs`, `convolution.rs`, `render.rs`, `mod.rs` (two-stage trail detection, residual-weighted statistics)
 - `annotate.rs` — 3-tier annotation API (raw geometry / RGBA layer / burn-in)
+
+### Downstream Users
+
+**Athenaeum** (`athenaeum-core`, through its `rustafits` submodule): `default-features = false, features = ["debug-pipeline"]`, plus `lm-counters` when its own optional `lm-counters` feature is on (for its probe). It uses:
+- the readers (`ImageConverter::read_raw` throughout);
+- the render pipeline and `encode_jpeg`;
+- `processing::vng` (calibrated-lights export) and `processing::cfa` (the Analysis tab's green-site path);
+- the `platesolving` types (`WcsSolution`, `SipCoefficients`, `SolveHints`, `ProperMotionCorrector`);
+- `ImageAnalyzer::detect_fast_data`, for its registration detector and its `Peak` seed source.
+
+Its own `star_measure` module measures stars for stacking, LN and, since its Plan C (2026-10-24), the Analysis tab, Blink and the plate-solve gate. It is built on `analysis::fitting` (`fit_moffat_2d_fixed_beta_conditioned`, `fit_moffat_2d_bounded`, `Moffat2DResult`, `PixelSample`) and `analysis::background` (`estimate_background_mesh`, `estimate_noise_mrs`). Those functions are therefore a de facto public API even though `analysis` is private without `debug-pipeline`: a change that moves one bit of their output moves Athenaeum's stacking weights and Analysis numbers (its `MEASURE_VERSION` cache key). That is what the bit pins in `analysis::fitting`'s tests guard.
+
+The full `ImageAnalyzer::analyze*` is no longer called by the app, only by Athenaeum's lab (`star_probe`'s `legacy-analysis` arm) and a probe-only stacking arm. The plan to move `star_measure` into this crate is `docs/superpowers/plans/2026-11-03-star-measure-port.md`.
+
+**solvemyastro** (the plate solver Athenaeum uses; path dependency, default features) uses rustafits only to decode frames and to detect stars: `ImageAnalyzer::detect_fast` and `FastStar`.
 
 ### SIMD Strategy
 

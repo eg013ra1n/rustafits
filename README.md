@@ -133,9 +133,12 @@ XISF property ids as fallback (`Instrument:ExposureTime`, …).
 
 ### Star metrics: `rustafits analyze`
 
-Per-frame quality for culling subs. The analyzer runs with the library
-defaults — the same settings Athenaeum uses — so the numbers match Athenaeum's
-for the same file.
+Per-frame quality for culling subs. The analyzer (`ImageAnalyzer`) runs with
+the library defaults, so the numbers match what the library reports for the
+same file. Athenaeum's Analysis tab has measured with its own star-measurement
+module since late October 2026, so its numbers differ from these. Moving that
+module into rustafits is planned in
+`docs/superpowers/plans/2026-11-03-star-measure-port.md`.
 
 ```bash
 $ rustafits analyze tests/ --sort fwhm

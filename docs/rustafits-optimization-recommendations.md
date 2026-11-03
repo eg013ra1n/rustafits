@@ -1,5 +1,9 @@
 # Rustafits Optimization Recommendations for Athenaeum
 
+> **Historical (2026-03-27).** Athenaeum's batch analysis and Blink no longer call
+> `ImageAnalyzer`: since its Plan C (2026-10-24) they measure with Athenaeum's own
+> `star_measure` module. The measurements below describe the pipeline as it was.
+
 **Date**: 2026-03-27
 **From**: Athenaeum development analysis
 **Context**: Batch analysis of 2000+ astronomical frames (6252x4176 mono, QHY268M) and on-demand blink viewer analysis

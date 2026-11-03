@@ -4,7 +4,10 @@
 carries no star catalogue, does no catalogue I/O, and has no orchestration loop:
 you bring detected image stars and catalogue stars, and this module gives you
 quad matching, outlier rejection, transform fitting and a WCS you can write to a
-FITS header. Athenaeum drives it from `solvemyastro`.
+FITS header. Athenaeum's solver, `solvemyastro`, does its own matching and uses
+rustafits only to decode frames and detect stars (`ImageAnalyzer::detect_fast`).
+Athenaeum itself uses this module's types (`WcsSolution`, `SipCoefficients`,
+`SolveHints`, `ProperMotionCorrector`).
 
 Everything here is `f64`. RA/Dec are degrees; tangent-plane coordinates (xi, eta)
 are radians; pixel coordinates are pixels.

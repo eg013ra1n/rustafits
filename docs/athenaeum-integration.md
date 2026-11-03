@@ -1,5 +1,27 @@
 # Athenaeum Integration Guide
 
+> **Status (2026-11-03).** Much of this guide describes an integration Athenaeum no
+> longer has.
+>
+> - **Not used by Athenaeum any more:**
+>   - **§2 Image Analysis, §4 Trail Detection, §6 Batch Analysis, §7 Full Integration
+>     Example, §8 Recommendations.** Athenaeum's Analysis tab, Blink and plate-solve
+>     input gate stopped calling `ImageAnalyzer` with its Plan C (2026-10-24). They now
+>     measure with Athenaeum's own `star_measure` module, which is built on rustafits'
+>     `analysis::fitting` and `analysis::background` kernels. These sections still
+>     describe `ImageAnalyzer` correctly for its remaining callers: the
+>     `rustafits analyze` CLI and `--annotate`.
+>   - **§3 Star Annotation.** Athenaeum draws its own overlay; it mirrors
+>     `compute_annotations()`'s geometry but does not call these functions.
+> - **Historical:** §10–§12, the migrations from v0.6 to v0.8. The Athenaeum file paths
+>   in them refer to its code at the time.
+> - **Current:** §1 Image Conversion and §5 Thread Pool. §9 lists only part of the
+>   crate root; `src/lib.rs` is authoritative.
+>
+> What Athenaeum uses today, and the contract that comes with it, is in CLAUDE.md under
+> "Downstream Users". The plan to move `star_measure` into rustafits is
+> `docs/superpowers/plans/2026-11-03-star-measure-port.md`.
+
 ## Overview
 
 rustafits provides three pipelines that Athenaeum can use independently or together:
