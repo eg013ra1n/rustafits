@@ -2,8 +2,9 @@
 
 #[cfg(feature = "debug-pipeline")]
 pub mod background;
+// `pub(crate)`: `star_measure` runs on it.
 #[cfg(not(feature = "debug-pipeline"))]
-mod background;
+pub(crate) mod background;
 
 #[cfg(feature = "debug-pipeline")]
 pub mod convolution;
@@ -23,8 +24,9 @@ mod detection;
 
 #[cfg(feature = "debug-pipeline")]
 pub mod fitting;
+// `pub(crate)`: `star_measure` runs on it.
 #[cfg(not(feature = "debug-pipeline"))]
-mod fitting;
+pub(crate) mod fitting;
 
 #[cfg(feature = "debug-pipeline")]
 pub mod metrics;

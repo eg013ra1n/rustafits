@@ -32,10 +32,15 @@ required-features = ["debug-pipeline"]
 default = ["cli"]
 # The `rustafits` binary: argument parsing and the batch progress bar. Library
 # users (Athenaeum) can set `default-features = false` to skip these deps.
-cli = ["dep:clap", "dep:clap_complete", "dep:indicatif", "dep:libc"]
+cli = ["dep:clap", "dep:clap_complete", "dep:indicatif"]
 debug-pipeline = []
 # Debug-only Moffat LM solve counters (iterations, refused steps, Jacobian / cost passes, pixels), zero numeric effect.
 lm-counters = []
+# `Serialize` / `Deserialize` on the `star_measure` and `stats` types (Athenaeum stores some of them: stacking config,
+# pass-1 artifacts). Off by default.
+serde = ["dep:serde"]
+# `star_measure::StarFit::test_at`, a fixture for downstream tests (Athenaeum's). Not semver-covered.
+test-support = []
 
 [dependencies]
 anyhow = "1.0"
@@ -59,16 +64,23 @@ base64 = "0.23"
 rayon = "1.10"
 nalgebra = "0.35"
 tracing = "0.1"
+serde = { version = "1", features = ["derive"], optional = true }
 clap = { version = "4.6", features = ["derive"], optional = true }
 clap_complete = { version = "4.6", optional = true }
 indicatif = { version = "0.18", optional = true }
-# Already in the tree via indicatif; the CLI uses it to restore default SIGPIPE.
-libc = { version = "0.2", optional = true }
+# `star_measure::substeps` reads the thread CPU clock with it (unix); the CLI restores default SIGPIPE with it.
+libc = "0.2"
 
 [dev-dependencies]
 # Independent decoder for tests/jpeg_encoder.rs. Deliberately NOT the encoder's
 # own decode side: a symmetric bug there would pass a self-round-trip.
 jpeg-decoder = { version = "0.3", default-features = false }
+# `star_measure`'s tests: log capture, and the serde names under `--features serde`.
+tracing-subscriber = "0.3"
+serde_json = "1"
+# The first-pass artifact's encoding pin (Athenaeum stores `PlanePrep` as postcard).
+postcard = { version = "1", features = ["use-std"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [profile.release]
 lto = true
