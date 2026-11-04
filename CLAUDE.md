@@ -16,6 +16,7 @@ cargo build --release
 # Run tests
 cargo test
 cargo test <test_name>          # run a single test
+cargo test --features serde     # + star_measure's serde names and pass-1 encoding pins
 
 # Build debug binary (exposes analysis internals)
 cargo build --features debug-pipeline
@@ -35,7 +36,7 @@ cargo clippy
 
 ### Crate Structure
 
-The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public. The default `cli` feature carries the `rustafits` binary's only extra deps (clap, clap_complete, indicatif, libc); the binary requires it, and library users (Athenaeum) can build with `default-features = false`. The binary lives in `src/bin/rustafits/`: `main.rs` (clap; conversion is the default command, plus `info`, `analyze`, `completions`), `batch.rs` (input collection, shared pool, worker loop, progress bar), `convert.rs`, `info.rs`, `analyze.rs`, `report.rs` (table/JSON/CSV). `analyze` runs `ImageAnalyzer` with its library defaults, and `tests/cli.rs` pins the CLI's numbers to `ImageAnalyzer::new().analyze()`. These are no longer the numbers Athenaeum shows: its Analysis tab moved to its own `star_measure` module (see Downstream Users). `tests/cli.rs` drives the binary end to end on synthetic FITS.
+The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public. The default `cli` feature carries the `rustafits` binary's only extra deps (clap, clap_complete, indicatif); the binary requires it, and library users (Athenaeum) can build with `default-features = false`. `serde` (off by default) derives `Serialize` / `Deserialize` on the `star_measure` and `stats` types; `test-support` exposes `star_measure::StarFit::test_at` for downstream tests; `lm-counters` adds the debug-only LM solve counters, re-exported as `astroimage::lm_counters`. The binary lives in `src/bin/rustafits/`: `main.rs` (clap; conversion is the default command, plus `info`, `analyze`, `completions`), `batch.rs` (input collection, shared pool, worker loop, progress bar), `convert.rs`, `info.rs`, `analyze.rs`, `report.rs` (table/JSON/CSV). `analyze` runs `ImageAnalyzer` with its library defaults, and `tests/cli.rs` pins the CLI's numbers to `ImageAnalyzer::new().analyze()`. These are no longer the numbers Athenaeum shows: its Analysis tab moved to its own `star_measure` module (see Downstream Users). `tests/cli.rs` drives the binary end to end on synthetic FITS.
 
 ### Processing Pipeline
 
@@ -96,6 +97,9 @@ Pipeline flow for u16 data:
 - `platesolving/` — quad building and matching (`pattern_matcher.rs`, incl. `build_quads_multi`), `ransac.rs`, `wcs.rs`, `projection.rs` (gnomonic), `proper_motion.rs`, `transform.rs`, `types.rs`. Reference: `docs/platesolving.md`.
 - `analysis/` — `background.rs` (mesh-grid + MRS wavelet), `detection.rs` (DAOFIND), `fitting.rs` (two-pass Moffat-primary PSF calibration, LmResult + fit_residual), `metrics.rs` (fit_residual per star), `snr.rs`, `convolution.rs`, `render.rs`, `mod.rs` (two-stage trail detection, residual-weighted statistics)
 - `annotate.rs` — 3-tier annotation API (raw geometry / RGBA layer / burn-in)
+- `star_measure/` — Athenaeum's one star-measurement path (per-star Moffat fit, per-frame β, frame aggregates, sky, noise, the Analysis budget, trail / defocus verdicts), copied from `athenaeum-core` at 0b6fb183 (port plan phase 2) with paths, serde gates and visibility changed, nothing else. `adapter` lists the `#[doc(hidden)]` helpers Athenaeum's stacking calls (outside semver); `testing` holds `StarFit::test_at`. Its docs cite Athenaeum's specs, rulings and modules.
+- `stats.rs` — robust statistics (median / MAD / BWMV, the 1/16 stratified sample, noise-scale factors) from Athenaeum's `integration::stats`, which re-exports them.
+- `geometry/` (crate-private) — the kd-tree `star_measure` marks blends with, and the test RNG; `test_support.rs` (tests only) — Athenaeum's fixture fields and log captures, byte-identical.
 
 ### Downstream Users
 
@@ -108,7 +112,9 @@ Pipeline flow for u16 data:
 
 Its own `star_measure` module measures stars for stacking, LN and, since its Plan C (2026-10-24), the Analysis tab, Blink and the plate-solve gate. It is built on `analysis::fitting` (`fit_moffat_2d_fixed_beta_conditioned`, `fit_moffat_2d_bounded`, `Moffat2DResult`, `PixelSample`) and `analysis::background` (`estimate_background_mesh`, `estimate_noise_mrs`). Those functions are therefore a de facto public API even though `analysis` is private without `debug-pipeline`: a change that moves one bit of their output moves Athenaeum's stacking weights and Analysis numbers (its `MEASURE_VERSION` cache key). That is what the bit pins in `analysis::fitting`'s tests guard.
 
-The full `ImageAnalyzer::analyze*` is no longer called by the app, only by Athenaeum's lab (`star_probe`'s `legacy-analysis` arm) and a probe-only stacking arm. The plan to move `star_measure` into this crate is `docs/superpowers/plans/2026-11-03-star-measure-port.md`.
+This crate now holds a copy of that module (`star_measure`, `stats`). Until Athenaeum switches to it (port plan phase 3), Athenaeum's own copy is frozen and the two must stay identical: a change to one goes into both in one pair of commits. After the switch this copy is the only one, and `MEASURE_VERSION`'s policy applies here: one bump per merged plan that changes what a fit accepts or measures, never one per commit; a change that moves no number keeps it. Athenaeum's truth lab (athenaeum-lab `star_probe` scorecard) stays the referee for any change to these numbers.
+
+The full `ImageAnalyzer::analyze*` is no longer called by the app, only by Athenaeum's lab (`star_probe`'s `legacy-analysis` arm) and a probe-only stacking arm. The plan for moving `star_measure` here and switching Athenaeum and the CLI to it is `docs/superpowers/plans/2026-11-03-star-measure-port.md`.
 
 **solvemyastro** (the plate solver Athenaeum uses; path dependency, default features) uses rustafits only to decode frames and to detect stars: `ImageAnalyzer::detect_fast` and `FastStar`.
 
