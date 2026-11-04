@@ -23,10 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   come from `BAYERPAT` alone, so a file with an odd offset was debayered with
   the wrong phase — red and blue exchanged (odd X and Y), or green and magenta
   (one of them) — by both the super-pixel and the VNG render, and with one odd
-  offset the analysis' green interpolation took red / blue sites for green. An odd `XBAYROFF` swaps the 2×2 cell's columns
-  (RGGB → GRBG), an odd `YBAYROFF` its rows (RGGB → GBRG). `read_header` reports
-  the same folded pattern. Files without the keywords, or with even offsets,
-  read and render exactly as before.
+  offset the analysis' green interpolation took red / blue sites for green. An
+  odd `XBAYROFF` swaps the 2×2 cell's columns (RGGB → GRBG), an odd `YBAYROFF`
+  its rows (RGGB → GBRG). `read_header` reports the same folded pattern. Files
+  without the keywords, or with even offsets, read and render exactly as before.
+- Docs:
+  - README and CLAUDE.md no longer claim that `rustafits analyze` shows
+    Athenaeum's numbers: Athenaeum's Analysis tab has measured with its own
+    `star_measure` module since 2026-10-24.
+  - CLAUDE.md lists what Athenaeum and solvemyastro use from rustafits, including
+    the `analysis::fitting` / `analysis::background` functions behind Athenaeum's
+    stacking numbers.
+  - `docs/platesolving.md` no longer says solvemyastro drives `platesolving`.
+  - The Athenaeum integration guide marks which of its sections still apply.
+  - The plan to move `star_measure` into rustafits is
+    `docs/superpowers/plans/2026-11-03-star-measure-port.md`.
 
 ## [1.6.0] — 2026-10-24
 

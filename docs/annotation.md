@@ -234,7 +234,7 @@ Numeric values are available via `AnalysisResult` fields or `--log` in the CLI.
 
 ## Integration Examples
 
-### Athenaeum / Desktop App — Toggleable Layer
+### Desktop App — Toggleable Layer
 
 ```rust
 use astroimage::{
