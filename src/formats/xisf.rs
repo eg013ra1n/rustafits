@@ -724,14 +724,15 @@ fn parse_xisf_keywords(xml: &str) -> Result<Vec<HeaderKeyword>> {
 /// PRODUCTION CONTRACT, not just a rendering convenience: `athenaeum-core`'s
 /// `integration::banded::spill_via_read_raw` (master builds, light
 /// calibration) spills `PixelData::Float32` straight into its ADU-domain
-/// band scratch, and `analysis::analyzer::analyze_frame` hands it straight
-/// to a detector whose thresholds (`star_levels`, `saturation_limit`) are
-/// ADU-domain by construction — either consumer fed a native-`[0, 1]` XISF
-/// float would be silently wrong (a 65535×-too-small master; a detector
-/// that finds nothing). A one-time attempt to remove this scale (M4a Task 1,
-/// commit `b7d1d306`) broke nothing in THIS crate's own tests — its
-/// `pipeline.rs`'s auto-stretch is provably invariant to a uniform rescale
-/// of its float input (see `processing/stretch.rs`'s
+/// band scratch, and `star_measure::raw::read_raw_frame` (this crate's
+/// Analysis-mode input) hands it straight to a measurement whose domain
+/// (`Domain::RawAdu`: `clip`, `full_scale`, the saturation test and the
+/// shot-noise term) is the file's ADU by construction — either consumer fed a
+/// native-`[0, 1]` XISF float would be silently wrong (a 65535×-too-small
+/// master; a detector that finds nothing). A one-time attempt to remove this
+/// scale (M4a Task 1, commit `b7d1d306`) broke nothing in THIS crate's own
+/// tests — its `pipeline.rs`'s auto-stretch is provably invariant to a
+/// uniform rescale of its float input (see `processing/stretch.rs`'s
 /// `unit_range_floats_stretch_like_u16` test) — but was wrong at the
 /// `athenaeum-core` call sites above, so it was reverted; DO NOT remove it
 /// again without auditing every `ImageConverter::read_raw`/`read_xisf_image`

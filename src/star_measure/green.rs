@@ -13,6 +13,9 @@
 //! **In rustafits** (port plan phase 4, `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md`): copied from
 //! Athenaeum's `analysis/cfa.rs` at e6344ddd, paths only. The rulings the docs cite (`PC-…`, `R-PC-…`) are Athenaeum's.
 
+// Athenaeum's test helper `site` as copied (port plan G-3): the clippy style lint it trips is allowed, not "fixed".
+#![allow(clippy::manual_is_multiple_of)]
+
 use std::sync::Arc;
 
 use crate::processing::cfa::{green_mask, green_phase, green_sum};

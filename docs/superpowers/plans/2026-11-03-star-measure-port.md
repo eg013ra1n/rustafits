@@ -1,7 +1,8 @@
 # Port Athenaeum's `star_measure` into rustafits — Plan
 
 > **Status:** approved; phases 1–3 implemented, and phase 3 passed the owner's-Mac gates on 2026-11-04 (section 6);
-> next is the integration merge into `main` (D-10). The owner took decisions
+> its integration merge into `main` (D-10) is done (1.7.0). Phase 4 is in progress (2026-11-05): its task plan is
+> `2026-11-04-star-measure-port-phase-4.md`, and section 6's phase 4 says where it stands. The owner took decisions
 > D-1…D-9 on 2026-11-03, every one as recommended, and D-10 on 2026-11-04 (section 4). Facts below were read on
 > 2026-11-03 at Athenaeum `main` 0b6fb183, rustafits `main` 66b97b1 (Athenaeum's submodule pin) and solvemyastro
 > `main`.
@@ -350,19 +351,25 @@ R-OSP-19 in its `docs/stacking/README.md`).
 
 ### Phase 4: the Analysis-mode entry (rustafits, then Athenaeum)
 
-- [ ] 4.1 The XISF reader folds `XBAYROFF` / `YBAYROFF` from its FITS keywords, as #7 did for FITS. Athenaeum's own
+The task plan is `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md`; each item below names its task.
+Status (2026-11-05): T1–T5 (items 4.1–4.4 and the docs) are written on the rustafits branch `feat/star-measure-phase-4`;
+T6 (4.5), T7, the lab harness change (L1) and the gates (its section 4: G-1a … G-1h, G-3) are pending. The results are
+added here after the gates, as phase 3's were.
+
+- [ ] 4.1 (T1) The XISF reader folds `XBAYROFF` / `YBAYROFF` from its FITS keywords, as #7 did for FITS. Athenaeum's own
   XISF fold must go in the same submodule bump: two folds would cancel on an odd offset.
-- [ ] 4.2 `star_measure::raw` from `input.rs`. Header facts come from `ImageConverter::read_header`; the domain
+- [ ] 4.2 (T2) `star_measure::raw` from `input.rs`. Header facts come from `ImageConverter::read_header`; the domain
   rules (PC-2, R-PC-2) and the tests are unchanged.
-- [ ] 4.3 `star_measure::green` and `star_measure::trail` from `cfa.rs` and `trail.rs`.
-- [ ] 4.4 `star_measure::analysis_mode`:
+- [ ] 4.3 (T3) `star_measure::green` and `star_measure::trail` from `cfa.rs` and `trail.rs`.
+- [ ] 4.4 (T4) `star_measure::analysis_mode`:
   - `FrameOptions { detection_threshold: 6.0, psf_model: Moffat4, max_stars: 500 }`;
   - `measure_raw_frame(_with)`;
   - `FrameSummary` with `map_measurement`'s frame arithmetic (2.3).
-- [ ] 4.5 Athenaeum: `analysis/` keeps `config.rs` and the mapping from `FrameSummary` to `FrameAnalysis` /
+- [ ] 4.5 (T6) Athenaeum: `analysis/` keeps `config.rs` and the mapping from `FrameSummary` to `FrameAnalysis` /
   `StarMetric`; `input.rs`, `cfa.rs` and `trail.rs` go.
 - Verify: G-1 on the analysis-mode arm (every row of the corpus identical, verdicts included), and Athenaeum's
-  `analysis` tests.
+  `analysis` tests. The phase's gates and their bars are section 4 of its task plan; `scripts/star_measure_port/mac_check.sh`
+  takes `MAC_CHECK_BRANCH=star-measure-port-phase-4` and `MAC_CHECK_MAIN=e6344ddd` for G-1a.
 
 ### Phase 5: rustafits' own consumers
 

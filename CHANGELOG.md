@@ -7,22 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The Analysis-mode entry of Athenaeum's star measurement moves here (port plan
+phase 4): the raw-frame input, the measurement with the frame figures its
+Analysis tab shows, and the two helpers under them, copied from Athenaeum's
+`analysis/` at e6344ddd, the float code unchanged. Athenaeum's Analysis tab,
+Blink and plate-solve gate call them. Plus the XISF `XBAYROFF` / `YBAYROFF`
+fix (see Fixed): the raw input leaves the offsets to the readers. Additive for
+existing callers, bar that fix.
+
 ### Added
 
-- `star_measure::raw`: `read_raw_frame` reads a FITS / XISF file as a
+- **`star_measure::raw`**: `read_raw_frame` reads a FITS / XISF file as a
   `RawFrame` (mono, a Bayer mosaic or RGB planes, in the file's ADU) with the
   facts the measurement needs: full scale, the clip from `DATAMAX`, the gain
-  from `EGAIN`. Copied from Athenaeum's Analysis input at e6344ddd; the header
-  facts come from `ImageConverter::read_header`, and the Bayer pattern is the
-  readers' own (both fold `XBAYROFF` / `YBAYROFF`).
-- `star_measure::green` (a Bayer mosaic measured on its green sites) and
-  `star_measure::trail` (trail R²: the Rayleigh statistic of the measured
-  stars' angles), copied from Athenaeum's Analysis at e6344ddd.
-- `star_measure::analysis_mode`: `FrameOptions` (6.0 σ, Moffat 4, 500 stars,
-  Athenaeum's Analysis defaults), `measure_raw_frame` and `FrameSummary` (the
-  frame figures Athenaeum's Analysis tab shows: medians, frame SNR, SNR weight,
-  trail R², refusals, verdict), copied from Athenaeum's `analyzer.rs` at
-  e6344ddd. Together with `raw`, the stable entry of `star_measure`.
+  from `EGAIN`. The header facts come from `ImageConverter::read_header`, and
+  the Bayer pattern is the readers' own (both fold `XBAYROFF` / `YBAYROFF`).
+- **`star_measure::analysis_mode`**: `FrameOptions` (6.0 σ, Moffat 4, 500
+  stars: Athenaeum's Analysis defaults), `measure_raw_frame` and
+  `FrameSummary` (the frame figures the Analysis tab shows: medians, frame
+  SNR, SNR weight, PSF signal, background and noise, trail R², refusals,
+  verdict). Together with `raw`, the stable entry of `star_measure`;
+  `FrameOptions` and `FrameSummary` are `#[non_exhaustive]`, so fields can be
+  added in 1.x.
+- **`star_measure::green`** (a Bayer mosaic measured on its green sites) and
+  **`star_measure::trail`** (trail R²: the Rayleigh statistic of the measured
+  stars' angles): the two helpers `analysis_mode` calls, public like the rest
+  of `star_measure`'s submodules, outside the stable entry.
 
 ### Fixed
 
@@ -36,8 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `rustafits info` report the folded pattern. An XISF offset is read as a
   number and rounded (`0.6` counts as 1), unlike the FITS reader's integer
   prefix, so that the XISF figures of Athenaeum's Analysis tab, which always
-  read it this way, do not move. Files without the keywords, or with even
-  offsets, read and render exactly as before.
+  read it this way, do not move. The offsets are folded onto whatever pattern
+  the file declares (`BAYERPAT` or `<ColorFilterArray>`), as that tab always
+  did: a file whose `<ColorFilterArray>` already includes its odd offset has it
+  counted twice. Files without the keywords, or with even offsets, read and
+  render exactly as before.
 
 ## [1.7.0] — 2026-11-04
 
