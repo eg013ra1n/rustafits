@@ -1,8 +1,10 @@
 # Port Athenaeum's `star_measure` into rustafits — Plan
 
-> **Status:** approved, implementation not started. The owner took decisions D-1…D-9 on 2026-11-03, every one as
-> recommended (section 4). Facts below were read on 2026-11-03 at Athenaeum `main` 0b6fb183, rustafits `main`
-> 66b97b1 (Athenaeum's submodule pin) and solvemyastro `main`.
+> **Status:** approved; phases 1–3 implemented, and phase 3 passed the owner's-Mac gates on 2026-11-04 (section 6);
+> next is the integration merge into `main` (D-10). The owner took decisions
+> D-1…D-9 on 2026-11-03, every one as recommended, and D-10 on 2026-11-04 (section 4). Facts below were read on
+> 2026-11-03 at Athenaeum `main` 0b6fb183, rustafits `main` 66b97b1 (Athenaeum's submodule pin) and solvemyastro
+> `main`.
 
 ## Background
 
@@ -290,22 +292,61 @@ Source sha: Athenaeum `main` 0b6fb183 (owner, 2026-11-04; the freeze of G-2 runs
 
 ### Phase 3: Athenaeum switches the module (Athenaeum branch)
 
-- [ ] 3.1 Bump the submodule to `star-measure-port` with `default-features = false, features = ["serde"]`, plus
+Athenaeum branch `star-measure-port-phase-3` (from `main` 0b6fb183), commits c05bf33 (code) and ca21e19 (docs:
+R-OSP-19 in its `docs/stacking/README.md`).
+
+- [x] 3.1 Bump the submodule to `star-measure-port` with `default-features = false, features = ["serde"]`, plus
   `test-support` for its tests. Athenaeum's `main` takes the bump only after `star-measure-port` has been merged
-  into rustafits' `main` (D-10), so the pinned commit is reachable from rustafits' `main`.
-- [ ] 3.2 Code moves:
+  into rustafits' `main` (D-10), so the pinned commit is reachable from rustafits' `main`. Done: the submodule at
+  0025614; `test-support` through a dev-dependency on rustafits. `Cargo.lock` gains only rustafits' own new
+  dependencies, no new versions.
+- [x] 3.2 Code moves:
   - `pub use astroimage::star_measure;` in `lib.rs`;
   - delete `src/star_measure/`;
-  - move the two adapter-identity tests into `stacking::measure`.
-- [ ] 3.3 `integration::stats` re-exports the moved primitives. The normalization code stays.
-- [ ] 3.4 The `PsfModel` wire enum (D-5); TS contract unchanged.
-- [ ] 3.5 Logging. `star_measure` events now carry the target `astroimage::star_measure::…` instead of
+  - move the two adapter-identity tests into `stacking::measure`. Done in a test module of their own,
+    `stacking/star_measure_identity.rs`, with the third (`robust` vs `integration::combine`) and the two test helpers
+    they need (`working`, `gaussian`); bodies unchanged. Nothing in rustafits had to change for them: everything
+    they call is public.
+- [x] 3.3 `integration::stats` re-exports the moved primitives. The normalization code stays. Its 8 primitive tests
+  are removed there (they run here); five `test_support` fixtures only the module's tests used are removed too.
+- [x] 3.4 The `PsfModel` wire enum (D-5); TS contract unchanged. Done lighter than "From both ways": the runtime types
+  stay rustafits' own, and TS-only mirrors (`stacking::psf_signal::PsfModelTs`, `integration::stats::ScaleEstimatorTs`,
+  exported under the original names) are named by `#[ts(as = …)]` on the four config fields that hold one.
+  `ts_contract` passes: `src/types` byte-identical.
+- [x] 3.5 Logging. `star_measure` events now carry the target `astroimage::star_measure::…` instead of
   `athenaeum_core::star_measure::…`. Check:
   - the logging field dictionary (`docs/logging/README.md`), log-mcp queries, and every test that asserts a target;
   - that the sub-step timers still switch on. `substeps.rs` keys them on
     `tracing::enabled!(target: "athenaeum_core::stacking::measure", …)`, the adapter's target, on purpose.
-- [ ] 3.6 Drop `debug-pipeline` if nothing but `lm_counters` needed it (2.5).
-- Verify: G-1.
+
+  Nothing keyed on the old target (no test, no log-mcp query, no filter); the timers' key is an explicit target
+  string, unchanged by the move. `docs/logging/README.md` notes the new target.
+- [x] 3.6 Drop `debug-pipeline` if nothing but `lm_counters` needed it (2.5). Dropped: `star_probe` reads
+  `astroimage::lm_counters`.
+- Verify: G-1. Cloud (x86_64, toolchain 1.96.1), against Athenaeum's own run at 0b6fb183 on the same machine:
+  - `cargo test -p athenaeum-core --lib` (network suites skipped as on its runner): 4074 passed / 6 failed / 8
+    ignored, every test with the same outcome as before (4369 / 6 / 9, minus the module's 290 + 1 ignored and the 8
+    `stats` tests, plus the 3 moved). The 6 failures are the same environment-bound ones (unwritable folders, as root);
+  - `ts_contract` ok; `--no-default-features` and `athenaeum-web` build;
+  - the port digest through the re-export is byte-identical to the one of Athenaeum's own copy (`4f907cab…`).
+
+  The owner's Mac (aarch64, 2026-11-04), Athenaeum `main` 0b6fb183 against the branch at ca21e19:
+  - `scripts/star_measure_port/mac_check.sh <athenaeum checkout>`:
+    - the digest is byte-identical, `main` against the branch (sha256 `a07688d0…`, 31 MB). The two `port_digest`
+      builds differ, so neither ran the other's stale artefacts;
+    - `cargo test -p rustafits --features serde`: 513 passed / 0 failed / 2 ignored;
+    - `cargo test -p athenaeum-core --all-targets`: 4575 / 0 / 16 with no pin edited. That is `main`'s 4870, minus
+      the module's 290 and the 8 `stats` tests, plus the 3 moved;
+  - the lab item: athenaeum-lab `harness/acceptance/smport.sh` ran `star_probe` (release), built at both shas, on every
+    star-test corpus image (m42 77, m101 30, singles 38, trails 7) in both arms, the stacking Measure (all stars) and
+    the Analysis mode (the budget), with `--diagnostics`:
+    - all 304 image-arms are byte-identical once the run-time keys (`…Ms`, `analyzed_at`) are dropped, which is
+      stricter than the scorecard's 0 moved;
+    - 4 294 797 JSONL lines were compared; the 5 XISF singles fail the Measure arm on both sides alike (its FITS front
+      end);
+    - results in athenaeum-lab `star-lab/results/star-measure-port/` (4f7043f).
+
+  Then `star-measure-port` merges into `main` (D-10), Athenaeum's PR re-pins to that merge and merges.
 
 ### Phase 4: the Analysis-mode entry (rustafits, then Athenaeum)
 
