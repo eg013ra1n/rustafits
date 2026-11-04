@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `star_measure::green` (a Bayer mosaic measured on its green sites) and
   `star_measure::trail` (trail R²: the Rayleigh statistic of the measured
   stars' angles), copied from Athenaeum's Analysis at e6344ddd.
+- `star_measure::analysis_mode`: `FrameOptions` (6.0 σ, Moffat 4, 500 stars,
+  Athenaeum's Analysis defaults), `measure_raw_frame` and `FrameSummary` (the
+  frame figures Athenaeum's Analysis tab shows: medians, frame SNR, SNR weight,
+  trail R², refusals, verdict), copied from Athenaeum's `analyzer.rs` at
+  e6344ddd. Together with `raw`, the stable entry of `star_measure`.
 
 ### Fixed
 

@@ -11,6 +11,11 @@
 //! Athenaeum's `athenaeum-core` at 0b6fb183 with paths, serde gates (feature `serde`) and the visibility of the
 //! [`adapter`] helpers changed, nothing else. Its numbers are Athenaeum's stacking and Analysis numbers. The specs,
 //! plans, rulings and modules the docs cite (`stacking::…`, `analysis::…`, `R-…`, `PC-…`) are Athenaeum's.
+//!
+//! Phase 4 of that plan adds the Analysis tab's entry: [`raw`] (a FITS / XISF file read as a raw frame), [`green`] (a
+//! Bayer mosaic measured on its green sites), [`trail`] (trail R²) and [`analysis_mode`] (the measurement and the frame
+//! figures), copied from Athenaeum's `analysis/{input,cfa,trail,analyzer}.rs` at e6344ddd. `raw` and `analysis_mode` are
+//! the stable entry.
 
 // Athenaeum's code as copied (port plan G-3): the clippy style lints it trips are allowed, never "fixed" in a way
 // that could move a bit.
@@ -39,6 +44,7 @@ use rayon::prelude::*;
 
 use crate::stats::ScaleEstimator;
 
+pub mod analysis_mode;
 pub mod beta;
 pub mod budget;
 pub mod diagnostics;
