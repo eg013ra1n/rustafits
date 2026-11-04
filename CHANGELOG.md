@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from `EGAIN`. Copied from Athenaeum's Analysis input at e6344ddd; the header
   facts come from `ImageConverter::read_header`, and the Bayer pattern is the
   readers' own (both fold `XBAYROFF` / `YBAYROFF`).
+- `star_measure::green` (a Bayer mosaic measured on its green sites) and
+  `star_measure::trail` (trail R²: the Rayleigh statistic of the measured
+  stars' angles), copied from Athenaeum's Analysis at e6344ddd.
 
 ### Fixed
 
