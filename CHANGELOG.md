@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- XISF: `XBAYROFF` / `YBAYROFF` (`<FITSKeyword>`) are folded into the Bayer
+  pattern, as they are for FITS since 1.7.0: an odd `XBAYROFF` swaps the 2×2
+  cell's columns (RGGB → GRBG), an odd `YBAYROFF` its rows (RGGB → GBRG). A
+  mosaic with an odd offset was debayered with the wrong phase by the
+  super-pixel and the VNG render (red and blue exchanged, or green and
+  magenta), and with one odd offset `ImageAnalyzer`'s green interpolation
+  (`analyze*`, `detect_fast*`) took red / blue sites for green. `read_header`
+  and `rustafits info` report the folded pattern. An XISF offset is read as a
+  number and rounded (`0.6` counts as 1), unlike the FITS reader's integer
+  prefix, so that the XISF figures of Athenaeum's Analysis tab, which always
+  read it this way, do not move. Files without the keywords, or with even
+  offsets, read and render exactly as before.
+
 ## [1.7.0] — 2026-11-04
 
 Athenaeum's star-measurement path moves here (`star_measure`, `stats`),
