@@ -14,6 +14,9 @@
 #
 # The work dir (default ~/.athenaeum-acc/star-measure-port) holds two worktrees and one cargo target; give it a
 # REGISTRY.tsv row and remove it when done (`git -C <athenaeum> worktree remove …`, then the directory).
+#
+# The branches come from the remote MAC_CHECK_REMOTE (default `origin`). In the owner's checkout `origin` is GitLab:
+# push the branch there first, or set MAC_CHECK_REMOTE=github.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -26,15 +29,16 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 RUSTAFITS=$(cd "$HERE/../.." && pwd)
 FRAMES=$RUSTAFITS/tests
 BRANCH=star-measure-port-phase-3
+REMOTE=${MAC_CHECK_REMOTE:-origin}
 
 mkdir -p "$WORK"
 export CARGO_TARGET_DIR=$WORK/target
-git -C "$ATH" fetch -q origin main "$BRANCH"
+git -C "$ATH" fetch -q "$REMOTE" main "$BRANCH"
 
 for side in main "$BRANCH"; do
     wt=$WORK/$side
     if [ ! -d "$wt" ]; then
-        git -C "$ATH" worktree add -q --detach "$wt" "origin/$side"
+        git -C "$ATH" worktree add -q --detach "$wt" "$REMOTE/$side"
     fi
     git -C "$wt" submodule update -q --init rustafits solvemyastro
     sed 's/use SM_PATH as sm;/use athenaeum_core::star_measure as sm;/' "$HERE/port_digest.rs" \

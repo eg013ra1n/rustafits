@@ -1,6 +1,7 @@
 # Port Athenaeum's `star_measure` into rustafits — Plan
 
-> **Status:** approved; phases 1–3 implemented, phase 3 awaiting the owner's-Mac gates. The owner took decisions
+> **Status:** approved; phases 1–3 implemented, and phase 3 passed the owner's-Mac gates on 2026-11-04 (section 6);
+> next is the integration merge into `main` (D-10). The owner took decisions
 > D-1…D-9 on 2026-11-03, every one as recommended, and D-10 on 2026-11-04 (section 4). Facts below were read on
 > 2026-11-03 at Athenaeum `main` 0b6fb183, rustafits `main` 66b97b1 (Athenaeum's submodule pin) and solvemyastro
 > `main`.
@@ -329,9 +330,23 @@ R-OSP-19 in its `docs/stacking/README.md`).
   - `ts_contract` ok; `--no-default-features` and `athenaeum-web` build;
   - the port digest through the re-export is byte-identical to the one of Athenaeum's own copy (`4f907cab…`).
 
-  The owner's Mac (aarch64): `scripts/star_measure_port/mac_check.sh <athenaeum checkout>` runs the digest of
-  `main` against the branch and both suites with the exact pins; the lab scorecard (0 moved) runs with the lab's
-  harness. Then `star-measure-port` merges into `main` (D-10), Athenaeum's PR re-pins to that merge and merges.
+  The owner's Mac (aarch64, 2026-11-04), Athenaeum `main` 0b6fb183 against the branch at ca21e19:
+  - `scripts/star_measure_port/mac_check.sh <athenaeum checkout>`:
+    - the digest is byte-identical, `main` against the branch (sha256 `a07688d0…`, 31 MB). The two `port_digest`
+      builds differ, so neither ran the other's stale artefacts;
+    - `cargo test -p rustafits --features serde`: 513 passed / 0 failed / 2 ignored;
+    - `cargo test -p athenaeum-core --all-targets`: 4575 / 0 / 16 with no pin edited. That is `main`'s 4870, minus
+      the module's 290 and the 8 `stats` tests, plus the 3 moved;
+  - the lab item: athenaeum-lab `harness/acceptance/smport.sh` ran `star_probe` (release), built at both shas, on every
+    star-test corpus image (m42 77, m101 30, singles 38, trails 7) in both arms, the stacking Measure (all stars) and
+    the Analysis mode (the budget), with `--diagnostics`:
+    - all 304 image-arms are byte-identical once the run-time keys (`…Ms`, `analyzed_at`) are dropped, which is
+      stricter than the scorecard's 0 moved;
+    - 4 294 797 JSONL lines were compared; the 5 XISF singles fail the Measure arm on both sides alike (its FITS front
+      end);
+    - results in athenaeum-lab `star-lab/results/star-measure-port/` (4f7043f).
+
+  Then `star-measure-port` merges into `main` (D-10), Athenaeum's PR re-pins to that merge and merges.
 
 ### Phase 4: the Analysis-mode entry (rustafits, then Athenaeum)
 
