@@ -45,7 +45,8 @@ re-run), and every Analysis row of the star-test corpus is byte-identical (G-1, 
 input, malformed header values included, because of ruling **R-P4-C1** (controller, 2026-11-05): the header-value
 rules of Athenaeum's Analysis tab are ported verbatim into rustafits as the crate-private `formats::stored_keys`, and
 the XISF reader's fold and `raw`'s header facts read through them (section 1.1). The only differences left are
-named there: they change a file's read from an error to a success, never a number.
+named there: they change a file's read from an error to a success, never a number, except one residual: a key spelled
+by the file's path and not by its header (section 1.1).
 
 ## 1. Facts (the brief's questions 1–8, with evidence)
 
@@ -100,17 +101,27 @@ The XISF `<FITSKeyword>` written as a start/end pair is therefore no longer a di
 elements only, as Athenaeum's does (the earlier note of an odd offset moving a fold is withdrawn). `<Property>` elements
 are not keywords for either (`ImageHeader::get` matches them; the facts do not).
 
-What is still different, all of it from an error to a success or a changed error text, never a number:
+An XISF header whose keyword pass hits an XML error is no difference either: the ported pass is Athenaeum's and keeps
+the same partial result. If the whole header fails to parse, the old `read_raw` and the new `read_header` both fail
+(the layout pass bails on XML errors, `xisf.rs:283`); if only the `<?xml` … `</xisf>` section fails (a `</xisf>` inside a
+comment, say), both succeed with the same partial map. The ERROR line of that abort carries the file's `path` when the
+caller has it (`read_xisf_stored_keys`; the reader's Bayer-offset fold has none).
+
+What is still different, all of it from an error to a success or a changed error text, never a number, bar the last
+item:
 - Athenaeum's reader returned an error for an XISF header with no `<?xml` or no `</xisf>`, and for a header of 64–100 MB
   (`fits_parser/mod.rs:23, :202-209`); the XISF reader here reads both (a string without the markers is read whole). XISF
   bytes under another name read as XISF (`header.format`; Athenaeum's FITS header parse failed on them). `value="'"`
   panicked in Athenaeum's loop (`value[1..0]`); the ported loop treats a lone quote as no pair, and the line rule then
   skips the value;
-- an XISF header whose keyword pass hits an XML error: Athenaeum kept a partial result (`fits_parser/mod.rs:263`);
-  `read_header` fails first here (`xisf.rs:616`). The layout pass bails on XML errors too (`xisf.rs:283`), so `read_raw`
-  failed on such a file before as well;
 - the error text for an unreadable header changes (it reaches the Analysis tab as `"{path}: {error}"`,
-  `ATH/…/api/analysis.rs:338`).
+  `ATH/…/api/analysis.rs:338`);
+- the one residual, which can change a number: Athenaeum's `extract_xisf_header` wrote a fallback line naming the file's
+  *path* into the text of a header with no `<FITSKeyword>` (`fits_parser/mod.rs:272-275`), and `stored_header.rs:72-85`
+  read keys from it. A path that spells a key (a newline then `EGAIN = 2`, or a `<FITSKeyword …>` element) gave
+  Athenaeum that key (`DATAMAX`, `EGAIN` or an odd offset) from the path; the ported pass writes no such line and reads
+  nothing. It is a key spelled by the file's path and not by its header, so it is named here and in the module doc
+  and not kept in code.
 
 Header-only parity check (done for this plan, scratch script, not committed): each corpus FITS header parsed the
 Athenaeum way and the `parse_card` + `get` way, for BITPIX, BZERO, BSCALE, DATAMAX, EGAIN, XBAYROFF, YBAYROFF and
@@ -133,8 +144,9 @@ covers it anyway: the analysis-mode arm prints `clip`, `fullScale` and `gainEPer
   absent or unparsable is 0; odd is `rem_euclid(2) == 1`. It is the rule whose results the Analysis tab shows today, so
   no Analysis number moves, on any input. The FITS reader's integer-prefix rule (`src/formats/fits.rs:36-44`) stays as
   it is, so the two readers disagree on a non-integer value (FITS `0.6` → 0, XISF `0.6` → 1), a quoted value (FITS `'1'`
-  → 0, XISF 1), a repeated keyword (FITS the last card, XISF the first non-empty value) and the name's case (FITS upper
-  case only). That is deliberate, for the Analysis tab's numbers (P4-3), and is said in `odd_bayer_offsets`' doc and in
+  → 0, XISF 1), a repeated keyword (FITS the last card, XISF the first non-empty value), the name's case (FITS upper
+  case only) and blanks around the name (XISF trims them; FITS needs the keyword at column 1), among others. That is
+  deliberate, for the Analysis tab's numbers (P4-3), and is said in `odd_bayer_offsets`' doc and in
   the CHANGELOG entry below.
 - **The fold is unconditional** (decided by the owner, 2026-11-04, «Сдвигать всегда», "always fold"; Q-2, P4-8): the XISF
   reader folds `XBAYROFF` / `YBAYROFF` onto whatever pattern it finds, as Athenaeum's analysis does today (R-PC-4) and as
@@ -806,7 +818,9 @@ the port plan's phase 4 and in R-OSP-19, with the G-1h smoke.
   tripwire tests and G-1c.
 - **R-P4-2 Header-fact semantics.** Athenaeum's own header-value rules are ported (R-P4-C1, section 1.1), so a
   standard, `D`-exponent or malformed value reads as it did. G-1b's options line proves the facts on the corpus.
-- **R-P4-3 An XISF whose keyword pass errors** now fails `read_raw_frame` (section 1.1). Low; recorded.
+- **R-P4-3 An XISF whose keyword pass errors** reads as it did: the ported pass is Athenaeum's and keeps the same
+  partial result, and a header that fails to parse as a whole failed `read_raw` before and fails `read_header` now
+  (section 1.1). No change; recorded.
 - **R-P4-4 Intended render change downstream** (odd-offset XISF): Athenaeum's previews, solvemyastro's detection, the
   CLI. A Fixed entry; no corpus file; the open-items smoke. It includes the render-side regression case: a writer that
   already shifted `<ColorFilterArray>` for a ROI and kept the camera's `XBAYROFF` renders right at 8ecca88 and wrong

@@ -51,7 +51,9 @@ existing callers, bar that fix.
   (`0.6` counts as 1), the first non-empty value of the keyword, unlike the FITS
   reader's integer prefix of the last card, so that the XISF figures of
   Athenaeum's Analysis tab, which always read it this way, do not move on any
-  input. The offsets are folded onto whatever pattern
+  input (the keyword list of `read_header` and `rustafits info` still shows
+  `XBAYROFF` by `ImageHeader`'s own rule, so on an unusual value it can differ
+  from the folded pattern). The offsets are folded onto whatever pattern
   the file declares (`BAYERPAT` or `<ColorFilterArray>`), as that tab always
   did: a file whose `<ColorFilterArray>` already includes its odd offset has it
   counted twice. Files without the keywords, or with even offsets, read and

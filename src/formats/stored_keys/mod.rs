@@ -20,14 +20,18 @@
 //!   values through [`xisf_stored_keys`].
 //!
 //! The functions are Athenaeum's code. What is not copied: Athenaeum's file reading (the callers hand over the XML
-//! string their reader already read), and the "no keywords found" fallback line of `xisf_header_text` (it names the
-//! path; the map read from it is empty, as the map read from the banner alone is). Differences in the code:
+//! string their reader already read), and the "no keywords found" fallback line of `xisf_header_text`, which wrote the
+//! file's path into the text (the map read from the banner alone is empty). That is the one residual: for a header with
+//! no `<FITSKeyword>`, Athenaeum read a key from a file path that spells one (a newline then `EGAIN = 2`, or a
+//! `<FITSKeyword …>` element) and the copy reads nothing. So a number never differs, except through a key spelled by
+//! the file's path and not by its header. Differences in the code:
 //!
 //! - a header text is cut to the `<?xml` … `</xisf>` section of the string as Athenaeum cuts its bytes, but a string
 //!   without either marker is read whole, where Athenaeum's reader returned an error;
 //! - `value="'"` (one lone quote) is not a pair of quotes: Athenaeum's loop sliced `value[1..0]` and panicked; here
 //!   the value stays `'`, which the line rule then skips as an unclosed quote;
-//! - the parse-abort log lines carry no path (this crate's functions have none to hand).
+//! - the parse-abort log line carries the file's `path` field when the caller has one ([`xisf_stored_keys`] takes an
+//!   optional path: `read_xisf_stored_keys` passes it, the XISF reader's Bayer-offset fold has none to hand).
 //!
 //! The pinned inputs are in the tests: `xisf_rule_pins_athenaeums_results` and `fits_rule_pins_athenaeums_results`
 //! list what the rules return on each unusual shape, and the XISF reader's and `star_measure::raw`'s own tests pin it
@@ -37,6 +41,7 @@
 #![allow(clippy::manual_flatten)]
 
 use std::collections::HashMap;
+use std::path::Path;
 
 mod fits_header_reader;
 
@@ -44,8 +49,9 @@ pub(crate) use fits_header_reader::FitsHeader;
 
 /// The `NAME = value` text of an XISF header's `<FITSKeyword>` elements: Athenaeum's `fits_parser::xisf_header_text`
 /// loop (banner, then one line per Empty `<FITSKeyword>` with a non-empty `name`, the raw `value` attribute with one
-/// pair of quotes removed). `xml` is the header string the XISF reader read.
-pub(crate) fn xisf_keyword_text(xml: &str) -> String {
+/// pair of quotes removed). `xml` is the header string the XISF reader read; `path` is the file it came from, if the
+/// caller knows it, and goes on the log line of a parse abort as Athenaeum's does.
+pub(crate) fn xisf_keyword_text(xml: &str, path: Option<&Path>) -> String {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
@@ -100,6 +106,7 @@ pub(crate) fn xisf_keyword_text(xml: &str) -> String {
             Ok(Event::Eof) => break,
             Err(e) => {
                 tracing::error!(
+                    path = path.map(|p| tracing::field::display(p.display())),
                     position = reader.buffer_position(),
                     error = %e,
                     "error parsing XISF XML header; using partial result"
@@ -130,9 +137,9 @@ pub(crate) fn parse_stored_xisf_keys(header_text: &str) -> HashMap<String, Strin
 
 /// The stored-header keys of the XISF header string `xml`, read the way Athenaeum reads an XISF file's header: the
 /// XML turned into `NAME = value` text, then the text into upper-cased keys, the first non-empty value of a name
-/// winning.
-pub(crate) fn xisf_stored_keys(xml: &str) -> HashMap<String, String> {
-    parse_stored_xisf_keys(&xisf_keyword_text(xml))
+/// winning. `path` is the file `xml` came from, if known (see [`xisf_keyword_text`]).
+pub(crate) fn xisf_stored_keys(xml: &str, path: Option<&Path>) -> HashMap<String, String> {
+    parse_stored_xisf_keys(&xisf_keyword_text(xml, path))
 }
 
 /// Parse a plain "KEY = value" header dump (one keyword per line, banner /
@@ -303,9 +310,12 @@ mod tests {
 
     /// An XISF header holding `children` (the `<FITSKeyword>`s), read as Athenaeum reads an XISF file's header.
     fn xisf_keys(children: &str) -> HashMap<String, String> {
-        xisf_stored_keys(&format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0"><Image geometry="2:2:1">{children}</Image></xisf>"#
-        ))
+        xisf_stored_keys(
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0"><Image geometry="2:2:1">{children}</Image></xisf>"#
+            ),
+            None,
+        )
     }
 
     fn kw(name: &str, value: &str) -> String {
@@ -344,6 +354,18 @@ mod tests {
         assert_eq!(get(r#"<Property id="XBAYROFF" type="Int32" value="1"/>"#.into()), None);
         // A lone quote is no pair of quotes (Athenaeum's slice panicked here); the line rule skips it.
         assert_eq!(get(kw("XBAYROFF", "'")), None);
+        // One pair of quotes is stripped from the raw attribute before the line rule reads the line, so `'1'0'` is the
+        // line `XBAYROFF = 1'0`: unreadable, so the offset is 0 (without the strip the line rule reads `'1'` as 1).
+        assert_eq!(get(kw("XBAYROFF", "'1'0'")), Some("1'0".into()));
+        let keys = xisf_keys(&kw("XBAYROFF", "'1'0'"));
+        assert_eq!(num(&keys, "XBAYROFF"), None);
+        assert_eq!(offset(num(&keys, "XBAYROFF")), 0);
+        // The header is cut at the first `<?xml`: a keyword in front of it is not read (read whole: 1).
+        let before_the_cut = format!(
+            r#"{}<?xml version="1.0"?><xisf><Image geometry="2:2:1"/></xisf>"#,
+            kw("XBAYROFF", "1")
+        );
+        assert_eq!(xisf_stored_keys(&before_the_cut, None).get("XBAYROFF"), None);
     }
 
     #[test]
@@ -368,8 +390,8 @@ mod tests {
     #[test]
     fn an_xisf_without_keywords_reads_no_keys() {
         assert!(xisf_keys("").is_empty());
-        assert!(xisf_stored_keys("").is_empty());
-        assert!(xisf_stored_keys("not xml at all").is_empty());
+        assert!(xisf_stored_keys("", None).is_empty());
+        assert!(xisf_stored_keys("not xml at all", None).is_empty());
     }
 
     /// The `<?xml` … `</xisf>` cut: a keyword after the closing tag is not read, as in Athenaeum's reader.
@@ -380,9 +402,28 @@ mod tests {
             kw("EGAIN", "1.5"),
             kw("DATAMAX", "9")
         );
-        let keys = xisf_stored_keys(&xml);
+        let keys = xisf_stored_keys(&xml, None);
         assert_eq!(keys.get("EGAIN").map(String::as_str), Some("1.5"));
         assert_eq!(keys.get("DATAMAX"), None);
+    }
+
+    /// The keyword pass's parse-abort ERROR line names the file when the caller has it (Athenaeum's `path` field),
+    /// and has no `path` field when it has not. A `</xisf>` inside a comment ends the cut section in the comment.
+    #[test]
+    fn the_parse_abort_log_line_carries_the_path_when_given() {
+        let xml = format!(
+            r#"<?xml version="1.0"?><xisf><!-- </xisf> -->{}</xisf>"#,
+            kw("EGAIN", "2")
+        );
+        let path = Path::new("/data/a_frame.xisf");
+        let mut keys = HashMap::new();
+        let with = crate::test_support::captured_logs(|| keys = xisf_stored_keys(&xml, Some(path)));
+        assert!(with.contains("error parsing XISF XML header; using partial result"), "{with}");
+        assert!(with.contains("path=/data/a_frame.xisf"), "{with}");
+        assert_eq!(keys.get("EGAIN"), None, "the keyword is past the cut: the partial result is empty");
+        let without = crate::test_support::captured_logs(|| keys = xisf_stored_keys(&xml, None));
+        assert!(without.contains("error parsing XISF XML header; using partial result"), "{without}");
+        assert!(!without.contains("path="), "{without}");
     }
 
     /// A header whose keyword text itself holds a `<FITSKeyword …/>` element reads as XML first (Athenaeum's
