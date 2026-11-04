@@ -910,7 +910,8 @@ mod tests {
     }
 
     /// A unique scratch path per test process (mirrors `formats/fits.rs`'s
-    /// existing test pattern — no `tempfile` dependency in this crate).
+    /// existing test pattern: these tests keep their own scratch paths;
+    /// `tempfile` is a dev-dependency for `star_measure::raw`'s tests only).
     fn scratch_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "rustafits_test_{name}_{}_{}.xisf",

@@ -47,6 +47,7 @@ pub mod fit;
 pub mod frame;
 pub mod photometry;
 pub mod population;
+pub mod raw;
 pub mod robust;
 pub mod seeds;
 pub mod substeps;

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `star_measure::raw`: `read_raw_frame` reads a FITS / XISF file as a
+  `RawFrame` (mono, a Bayer mosaic or RGB planes, in the file's ADU) with the
+  facts the measurement needs: full scale, the clip from `DATAMAX`, the gain
+  from `EGAIN`. Copied from Athenaeum's Analysis input at e6344ddd; the header
+  facts come from `ImageConverter::read_header`, and the Bayer pattern is the
+  readers' own (both fold `XBAYROFF` / `YBAYROFF`).
+
 ### Fixed
 
 - XISF: `XBAYROFF` / `YBAYROFF` (`<FITSKeyword>`) are folded into the Bayer
