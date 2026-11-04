@@ -1,6 +1,7 @@
 # star_measure port, phase 4: the Analysis-mode entry — task plan
 
-> **Status:** draft r1 (2026-11-04), for review before implementation. It details items 4.1–4.5 of the port plan
+> **Status:** draft r2 (2026-11-04): plan review r1 folded, every question of section 6 decided (Q-2 by the owner).
+> It details items 4.1–4.5 of the port plan
 > `docs/superpowers/plans/2026-11-03-star-measure-port.md` (section 6), under its decisions D-1…D-10 and gates G-1…G-6.
 > Facts were read at rustafits 8ecca88 (v1.7.0, branch `feat/star-measure-phase-4`) and Athenaeum `main` e6344ddd
 > (branch `star-measure-port-phase-4`). The four Athenaeum files to move are unchanged since the G-2 freeze sha
@@ -17,9 +18,9 @@
 > Athenaeum's `ATH/…/analysis/` files, and `fits_header_reader.rs`, `stored_header.rs` are under `ATH/…/fits_parser/`.
 > In the command blocks, paths are relative to `ATH` (so rustafits files are `rustafits/…`).
 >
-> **Commits:** author `eg013ra1n <vilen.sharifov@gmail.com>`, trailer `Co-Authored-By: Claude Opus 5.5
-> <noreply@anthropic.com>`. Phase 3's cloud commits were authored "Claude" (Athenaeum c05bf332, ca21e19c): check
-> `git log -1 --format=%an` after every commit.
+> **Commits:** author `eg013ra1n <vilen.sharifov@gmail.com>`, and the harness's trailer (the user rule is "the harness's
+> attribution trailers", whichever model commits; the plan quotes none). Phase 3's cloud commits were authored "Claude"
+> (Athenaeum c05bf332, ca21e19c): check `git log -1 --format=%an` after every commit.
 
 ## 0. Summary
 
@@ -32,12 +33,16 @@
 | measurement + frame arithmetic | `analysis/analyzer.rs:24-92, :130-189` | `src/star_measure/analysis_mode.rs` | `AnalysisConfig` → `FrameOptions`; the arithmetic returns a `FrameSummary` |
 | `AnalysisConfig`, the row mapping, ids, `config_hash`, `analyzed_at` | `analysis/{config,analyzer}.rs` | stay in Athenaeum | `map_measurement` reads `FrameSummary` |
 
-Order: T1 → T2 → T3 → T4 → T5 in rustafits, then T6 → T7 in Athenaeum, L1 in athenaeum-lab, then the gates (section 4).
+Order: T1 → T2 → T3 → T4 → T5 in rustafits, the push of that branch, then T6 → T7 in Athenaeum, L1 in athenaeum-lab,
+then the gates; section 4 gives the whole sequence, pushes and PRs included.
 **T6 is one Athenaeum commit:** the submodule bump to the rustafits phase-4 tip and the deletion of `input.rs` land
 together, never apart (section 1.2).
 
 No number moves: `MEASURE_VERSION` stays 8, `AnalysisConfig::config_hash` is unchanged (so no stored analysis is
-re-run), and every Analysis row of the star-test corpus is byte-identical (G-1, section 4).
+re-run), and every Analysis row of the star-test corpus is byte-identical (G-1, section 4). One residual is a fold
+difference, named here so that the claim stays exact: an odd `XBAYROFF` / `YBAYROFF` written as a start/end
+`<FITSKeyword>` pair is skipped by Athenaeum's reader today (0 folds) and read by rustafits after (1 fold); no corpus
+file has it (section 1.1).
 
 ## 1. Facts (the brief's questions 1–8, with evidence)
 
@@ -75,7 +80,9 @@ corpus FITS headers):
   facts agree with the decode; today they can disagree;
 - a non-UTF-8 card: rustafits drops it (`src/formats/fits.rs:90`), Athenaeum reads it lossily;
 - an XISF `<FITSKeyword>` written as a start/end pair: Athenaeum reads empty elements only (`fits_parser/mod.rs:231`),
-  rustafits both (`xisf.rs:618`);
+  rustafits both (`xisf.rs:618`). For `XBAYROFF` / `YBAYROFF` this is the one residual that is a fold difference, not a
+  fact difference: an odd offset written that way is 0 folds in Athenaeum's Analysis today and 1 after, so that file's
+  Analysis row can move. It is outside "no number moves" (section 0) by name; no corpus file has it;
 - an XISF header whose keyword pass hits an XML error: Athenaeum keeps a partial result (`fits_parser/mod.rs:263`),
   `read_header` fails (`xisf.rs:616`). The layout pass bails on XML errors too (`xisf.rs:283`), so `read_raw` most
   likely fails on such a file today;
@@ -100,7 +107,16 @@ covers it anyway: the analysis-mode arm prints `clip`, `fullScale` and `gainEPer
 - **The offsets' rule** is Athenaeum's (`input.rs:76-79, :111-114`): the first `<FITSKeyword>` named `XBAYROFF` /
   `YBAYROFF` (case-insensitive), quotes trimmed, parsed as `f64`, finite, rounded; absent or unparsable is 0; odd is
   `rem_euclid(2) == 1`. It is the rule whose results the Analysis tab shows today, so no Analysis number moves, even
-  for a non-integer offset. (The FITS reader's integer-prefix rule, `src/formats/fits.rs:36-44`, stays as it is.)
+  for a non-integer offset (bar the start/end-pair residual of section 1.1). The FITS reader's integer-prefix rule
+  (`src/formats/fits.rs:36-44`) stays as it is, so the two readers now disagree on a non-integer offset: FITS `0.6` → 0,
+  XISF `0.6` → 1. That is deliberate, for the Analysis tab's numbers (P4-3), and is said in `bayer_offset`'s doc and in
+  the CHANGELOG entry below.
+- **The fold is unconditional** (decided by the owner, 2026-11-04, «Сдвигать всегда», "always fold"; Q-2, P4-8): the XISF
+  reader folds `XBAYROFF` / `YBAYROFF` onto whatever pattern it finds, as Athenaeum's analysis does today (R-PC-4) and as
+  FITS does since 1.7.0. The pattern scan (`xml.contains`, `xisf.rs:312-321`) reads the whole document and cannot tell a
+  `BAYERPAT` keyword from a `<ColorFilterArray pattern>` element, which by the XISF specification describes the image as
+  stored. Consequence (R-P4-4, R-P4-5): a writer that already shifted `<ColorFilterArray>` for a ROI and kept the
+  camera's `XBAYROFF` renders right at 8ecca88 and wrong after T1; its Analysis numbers do not change.
 - **Exactly one fold, every path, every commit:**
 
   | read | Athenaeum e6344ddd + rustafits 8ecca88 | rustafits T1…T5 commits (Athenaeum's committed pin still 8ecca88) | Athenaeum T6 + the rustafits tip |
@@ -132,6 +148,9 @@ covers it anyway: the analysis-mode arm prints `clip`, `fullScale` and `gainEPer
     show the right colours, after a restart for an already viewed file (the preview cache is in memory,
     `ATH/…/cache/mod.rs:14-21`). Athenaeum's calibration and stacking are unaffected: they read `BAYERPAT` /
     `XBAYROFF` from the catalog (`ATH/…/calibration_library/light_cal.rs:726-756`), not from the reader.
+  - a file whose `<ColorFilterArray>` already includes its offset (R-P4-5) is in every item above too, and for it the
+    change is a regression: the render, `rustafits info`, `detect_fast`, Athenaeum's previews and solvemyastro all go from
+    right to wrong;
   - Corpus: no image carries an odd offset (5 XISF, 147 FITS; only `singles/test.xisf` has the keywords, both 0).
 - **CHANGELOG `[Unreleased]`, Fixed** (T1 writes it):
 
@@ -140,7 +159,9 @@ covers it anyway: the analysis-mode arm prints `clip`, `fullScale` and `gainEPer
   >   A mosaic with an odd offset was debayered with the wrong phase by the super-pixel and the VNG render (red and
   >   blue exchanged, or green and magenta), and with one odd offset `ImageAnalyzer`'s green interpolation
   >   (`analyze*`, `detect_fast*`) took red / blue sites for green. `read_header` and `rustafits info` report the
-  >   folded pattern. Files without the keywords, or with even offsets, read and render exactly as before.
+  >   folded pattern. An XISF offset is read as a number and rounded (`0.6` counts as 1), unlike the FITS reader's
+  >   integer prefix, so that the XISF figures of Athenaeum's Analysis tab, which always read it this way, do not move.
+  >   Files without the keywords, or with even offsets, read and render exactly as before.
 
 ### 1.3 `analyzer.rs`'s split
 
@@ -339,7 +360,9 @@ Moved events (fields unchanged):
   pattern passes through. (Alternative: keep the XISF arm at 0 / 0 as the FITS arm is, `input.rs:138-141`, which keeps
   `bayer_offsets_fold_into_the_pattern` verbatim but leaves a no-op fold and an unused `offset` in a semver-covered
   module.)
-- **P4-3 The XISF reader's offset rule is Athenaeum's** (section 1.2), not the FITS reader's integer prefix.
+- **P4-3 The XISF reader's offset rule is Athenaeum's** (section 1.2), not the FITS reader's integer prefix. The two
+  readers therefore disagree on a non-integer offset (FITS `0.6` → 0, XISF `0.6` → 1); the asymmetry is documented in
+  `bayer_offset`'s doc and in the CHANGELOG entry, with its reason (the Analysis tab's numbers).
 - **P4-4 `#[non_exhaustive]` on `FrameOptions` and `FrameSummary`**: fields can be added in 1.x. `RawFrame`, `RawPlanes`
   and `Verdict` stay exhaustive: Athenaeum's kept tests build `RawFrame` literals (`analyzer.rs:265-272`), `star_probe`
   matches `RawPlanes` exhaustively (`star_probe.rs:1215-1219`), and a new verdict should break Athenaeum's mapping at
@@ -352,6 +375,9 @@ Moved events (fields unchanged):
 - **P4-7 No copy script.** Phase 2's `port_star_measure.py` regenerated 12k lines; here three small files are copied by
   hand and reviewed with `git diff --no-index --word-diff` against the originals (each task lists the allowed
   differences).
+- **P4-8 The XISF fold is unconditional** (the owner, 2026-11-04, «Сдвигать всегда»): the reader folds the offsets onto
+  whatever pattern it found, `BAYERPAT` or `<ColorFilterArray>` alike (section 1.2). Accepted consequence: R-P4-4 /
+  R-P4-5.
 
 ## 3. Tasks
 
@@ -361,14 +387,18 @@ Moved events (fields unchanged):
 
 **Approach.**
 - Move `shift_bayer_pattern` (`src/formats/fits.rs:179-206`, with its doc) to `src/formats/mod.rs` as `pub(crate)`;
-  `layout` calls `super::shift_bayer_pattern`. Nothing else in `fits.rs` changes.
+  `layout` calls `super::shift_bayer_pattern`. Nothing else in `fits.rs` changes. Move that function and its own doc
+  only: `fits.rs`'s orientation comment (`fits.rs:165-174`) names other programs, so none of its text or wording goes
+  into `formats/mod.rs`, into `bayer_offset`'s comment or doc, or into a test.
 - In `parse_xisf_xml`'s event loop (`xisf.rs:261-286`) add one arm for `Event::Empty` / `Event::Start` named
   `FITSKeyword`: keep the first `value` of a `name` equal (ignoring case) to `XBAYROFF`, and of `YBAYROFF`. After the
   pattern scan (`xisf.rs:312-321`): `info.bayer_pattern = shift_bayer_pattern(info.bayer_pattern, odd(x), odd(y))`
   with `fn bayer_offset(v: Option<&str>) -> i64` = Athenaeum's `offset(num(..))` (`input.rs:76-79, :111-114`: trim,
   trim `'`, trim, `parse::<f64>()`, finite, `round() as i64`, else 0) and odd = `rem_euclid(2) == 1`. Comment the
-  rule's origin (the rule the Analysis tab applied to XISF before the port, so its numbers do not move). Attribute
-  values through `normalized_value(XmlVersion::Implicit1_0)`, as `parse_image_attrs` does (`xisf.rs:189-191`).
+  rule's origin (the rule the Analysis tab applied to XISF before the port, so its numbers do not move). Its doc says
+  the rule (a number, rounded) and why, and that the FITS reader takes the integer prefix instead (`0.6` → 0 there, 1
+  here: P4-3). Attribute values through `normalized_value(XmlVersion::Implicit1_0)`, as `parse_image_attrs` does
+  (`xisf.rs:189-191`). The fold is unconditional (P4-8): no check of where the pattern came from.
 - The pattern scan itself (`xml.contains`, `xisf.rs:312-321`) does not change.
 - CHANGELOG `[Unreleased]` → `### Fixed`: the entry of section 1.2.
 
@@ -388,6 +418,10 @@ cargo test -p rustafits --test analysis --test cli   # test.xisf has XBAYROFF / 
 cargo check -p athenaeum-core --all-targets      # Athenaeum compiles against T1 (its XISF tripwire test fails: section 1.2)
 ```
 Commit: `fix(formats): XISF folds XBAYROFF / YBAYROFF into the Bayer pattern (port plan 4.1)`.
+
+**Athenaeum tree, T1–T5: no Athenaeum commit, no evidence from it.** From T1 on, Athenaeum's submodule is this working
+copy and Athenaeum's own XISF fold doubles (section 1.2): make no Athenaeum commit before T6, and take no evidence (a
+test result, a probe, a preview) from that tree. It is used for `cargo check` only.
 
 ### T2 (rustafits) — 4.2: `star_measure::raw`
 
@@ -423,7 +457,10 @@ full-scale helpers and their logs) is verbatim.
 - new: `a_fits_mosaic_with_an_odd_xbayroff_reads_folded` (`input.rs:638-656` unchanged as its body);
   `an_xisf_mosaic_reads_its_bayer_offsets_folded_once` (a hand-written monolithic UInt16 XISF built as the UInt16 half
   of `input.rs:506-522` does, with `<FITSKeyword name="BAYERPAT" value="'RGGB'"/>` and `XBAYROFF` 1 → GRBG, and with
-  `YBAYROFF` 1 as well → BGGR); `xisf_planes_read_at_full_scale_65535` (that UInt16 file, asserts of `input.rs:524-525`;
+  `YBAYROFF` 1 as well → BGGR; plus one case with `<ColorFilterArray pattern="RGGB" width="2" height="2"/>` and no
+  `BAYERPAT` keyword, `XBAYROFF` 1 → GRBG: the pattern comes from the element and the offsets from the keywords, which
+  pins the unconditional fold of P4-8, R-PC-4's rule);
+  `xisf_planes_read_at_full_scale_65535` (that UInt16 file, asserts of `input.rs:524-525`;
   plus a hand-written Float32 XISF with `DATAMAX` 0.9 and `EGAIN` 1.5: sample 1.0 → 65535, full scale 65535, gain 1.5,
   clip 0.9 × 65535 within 1e-6, the asserts of `input.rs:501-504`); `an_xisfs_fits_layout_keywords_are_ignored` (the
   Float32 file with `BITPIX` 16, `BZERO` 32768, `BSCALE` 1 keywords, as the corpus' `Light_Pane` XISF carry, reads
@@ -444,6 +481,10 @@ cargo check -p athenaeum-core --all-targets
 uncommitted; T6 commits it. Commit: `feat(star_measure): raw, the Analysis tab's raw frame input, from Athenaeum
 e6344ddd (port plan 4.2)`.
 
+**Athenaeum tree, T1–T5: no Athenaeum commit, no evidence from it** (the `Cargo.lock` above is the one change it holds
+until T6). Its submodule is this working copy and its XISF fold is doubled (section 1.2): take no test result, probe or
+preview from it; `cargo check` only.
+
 ### T3 (rustafits) — 4.3: `star_measure::green` and `star_measure::trail`
 
 **Files:** `src/star_measure/green.rs`, `src/star_measure/trail.rs` (new), `src/star_measure/mod.rs`, `CHANGELOG.md`.
@@ -463,6 +504,9 @@ git diff --no-index --word-diff crates/athenaeum-core/src/analysis/trail.rs rust
 cargo check -p athenaeum-core --all-targets
 ```
 Commit: `feat(star_measure): green and trail from Athenaeum e6344ddd (port plan 4.3)`.
+
+**Athenaeum tree, T1–T5: no Athenaeum commit, no evidence from it.** Its submodule is this working copy and its XISF
+fold is doubled (section 1.2): take no test result, probe or preview from it; `cargo check` only.
 
 ### T4 (rustafits) — 4.4: `star_measure::analysis_mode`
 
@@ -489,15 +533,20 @@ the originals' minus those on row-only fields):
 **Acceptance.**
 ```bash
 cargo test -p rustafits --lib -- star_measure::analysis_mode::    # 9 passed
-cargo test -p rustafits --features serde                          # aarch64: 556 passed, 0 failed, 3 ignored
+cargo test -p rustafits --features serde                          # aarch64: 556 passed, 0 failed, 3 ignored, summed over the test binaries
 cargo test -p rustafits --features debug-pipeline
 cargo build -p rustafits --no-default-features
 cargo clippy -p rustafits --all-targets --message-format=short 2>&1 | grep -E "src/(star_measure|formats)/"   # empty
 cargo check -p athenaeum-core --all-targets
 ```
 556 = 513 at 8ecca88 (port plan l.337: the code is 0025614's, `git diff --stat 0025614 8ecca88` touches no source)
-+ 26 moved + 17 new; 3 ignored = 2 + `dsc5767`. Commit: `feat(star_measure): analysis_mode, FrameOptions /
-measure_raw_frame / FrameSummary (port plan 4.4)`.
++ 26 moved + 17 new; 3 ignored = 2 + `dsc5767`. 556 and 513 are SUMS over the binaries' `test result` lines (the lib, the
+`tests/` binaries): `mac_check.sh` prints those lines and sums nothing, so the controller adds them. All 43 new tests
+(26 + 17) land in the lib binary, whose own line therefore grows by 43. Commit: `feat(star_measure): analysis_mode,
+FrameOptions / measure_raw_frame / FrameSummary (port plan 4.4)`.
+
+**Athenaeum tree, T1–T5: no Athenaeum commit, no evidence from it.** Its submodule is this working copy and its XISF
+fold is doubled (section 1.2): take no test result, probe or preview from it; `cargo check` only.
 
 ### T5 (rustafits) — docs
 
@@ -510,7 +559,11 @@ measure_raw_frame / FrameSummary (port plan 4.4)`.
   `analysis_mode` (the entry); Downstream Users: Athenaeum builds with `features = ["serde"]` (stale since phase 3) and
   its Analysis tab, Blink and plate-solve gate measure through `analysis_mode`. The rest of that section is phase 5.3's.
 - `xisf.rs:680-681`: the same contract wording (`star_measure::raw`).
-- `mac_check.sh`: `BRANCH=${MAC_CHECK_BRANCH:-star-measure-port-phase-3}` (and its usage text), so phase 4 reuses it.
+- `mac_check.sh`: `BRANCH=${MAC_CHECK_BRANCH:-star-measure-port-phase-3}` (and its usage text), so phase 4 reuses it;
+  and `MAIN=${MAC_CHECK_MAIN:-main}` (default `main`, i.e. the fetched `$REMOTE/main`; a sha is allowed and used as
+  given): the `main` side's worktree is `git worktree add --detach "$WORK/main" "$MAIN"`, and the usage text says so.
+  G-1a passes `MAC_CHECK_MAIN=e6344ddd`, so a `main` that has moved does not change the "before" of the digest (the
+  4575 / 152-identical figures are e6344ddd's).
 - the port plan: phase 4's items point to this plan; results are added by the controller after the gates.
 - `CHANGELOG.md` `[Unreleased]` `### Added` (T2–T4 wrote their lines; T5 checks it reads as one entry):
 
@@ -526,9 +579,16 @@ measure_raw_frame / FrameSummary (port plan 4.4)`.
 ```bash
 grep -n "analysis::input\|analysis::analyzer" rustafits/CLAUDE.md rustafits/src/formats/xisf.rs   # empty
 bash -n rustafits/scripts/star_measure_port/mac_check.sh
+grep -n "MAC_CHECK_MAIN" rustafits/scripts/star_measure_port/mac_check.sh      # in the usage text and in the worktree line
 git -C rustafits diff --stat HEAD~1      # only the files above
 ```
 Commit: `docs: star_measure's Analysis-mode entry (port plan phase 4)`.
+
+T5 is the last rustafits commit and the sha T6 pins: **the controller pushes the branch to rustafits `origin` right after
+its gate** (section 4, step 2).
+
+**Athenaeum tree, T1–T5: no Athenaeum commit, no evidence from it.** Its submodule is this working copy and its XISF
+fold is doubled (section 1.2): take no test result, probe or preview from it; `cargo check` only.
 
 ### T6 (Athenaeum) — 4.5: the switch, in ONE commit
 
@@ -564,7 +624,8 @@ Commit: `docs: star_measure's Analysis-mode entry (port plan phase 4)`.
   (`analyzer::frame_options(&AnalysisConfig::default()) == FrameOptions::default()`).
 - `examples/star_probe.rs:158` → `use athenaeum_core::star_measure::raw::{read_raw_frame, RawPlanes};`.
 - The submodule: `git -C rustafits checkout <T5 sha>`, `git add rustafits Cargo.lock`. The bump and the deletion of
-  `input.rs` are the same commit (section 1.2); never commit the bump alone.
+  `input.rs` are the same commit (section 1.2); never commit the bump alone. T6 starts only once the T5 sha is on
+  rustafits `origin` (section 4, step 2): `mac_check.sh`'s fresh worktrees fetch the submodule from there.
 
 **Tests.** `analyzer.rs`'s 10 and `config.rs`'s 5 unchanged; `raw_seam.rs` 2 moved + 1 new.
 
@@ -575,11 +636,13 @@ cargo test -p athenaeum-core --test ts_contract && git status --porcelain src/ty
 cargo check -p athenaeum-core --no-default-features
 cargo check -p athenaeum-web
 grep -rn 'analysis::\(input\|cfa\|trail\)\|fold_bayer_offsets' crates     # empty
-cargo test -p athenaeum-core --all-targets        # aarch64: 4549 passed, 0 failed, 15 ignored, no pin edited
+cargo test -p athenaeum-core --all-targets        # aarch64: 4549 passed, 0 failed, 15 ignored (summed over the test binaries), no pin edited
 ```
 4549 = 4575 at e6344ddd (port plan l.338, measured at ca21e19c; `git diff --stat ca21e19c e6344ddd` touches no source,
 and its submodule move 0025614 → 8ecca88 touches none either) − 12
-(`input.rs`, moved) − 10 (`cfa.rs`) − 5 (`trail.rs`) + 1 (the parity test); 15 ignored = 16 − `dsc5767`.
+(`input.rs`, moved) − 10 (`cfa.rs`) − 5 (`trail.rs`) + 1 (the parity test); 15 ignored = 16 − `dsc5767`. Like phase 3's
+figures, 4575 and 4549 are sums over the binaries' `test result` lines (`mac_check.sh` prints them and sums nothing);
+the change itself is all in the lib binary.
 Commit: `refactor(analysis): measure through rustafits' star_measure::analysis_mode (port plan 4.5)`, naming the
 submodule sha.
 
@@ -591,10 +654,14 @@ submodule sha.
 - logging README l.179 and the spec's l.64: the emitter is rustafits' `star_measure::raw::read_raw_frame` (target
   `astroimage::star_measure::raw`), the CFA error is `star_measure::green`'s; fields unchanged;
 - `docs/stacking/README.md`: under R-OSP-19, a phase-4 sub-entry (the four files, what stays, `FrameSummary`, the
-  fold in the reader, the gates and their results); R-PC-4's evidence line (l.4414-4415) gains "phase 4: the XISF fold
-  is the rustafits XISF reader's, `star_measure::raw` folds nothing";
+  fold in the reader and its owner ruling "always fold", 2026-11-04, the gates and their results, the app smoke G-1h);
+  R-PC-4's evidence line (l.4414-4415) gains "phase 4: the XISF fold is the rustafits XISF reader's,
+  `star_measure::raw` folds nothing";
 - open-items: an owed smoke, "an XISF mosaic with an odd XBAYROFF / YBAYROFF (none in the star-test corpus): its
-  preview shows the right colours, and its Analysis row equals the pre-phase-4 one" (deleted once it passes);
+  preview shows the right colours, and its Analysis row equals the pre-phase-4 one; and the same from a writer that
+  already shifts `<ColorFilterArray>` for a ROI and keeps the camera's offsets: before phase 4 its preview was right,
+  after it the preview is wrong by the owner's ruling (always fold, R-P4-5), its Analysis row unchanged; record what
+  such a writer produces" (deleted once it passes);
 - `CLAUDE.md` needs no change: no rule, command surface or path it names changed.
 
 **Acceptance:** `grep -rn "analysis::input\|analysis/input.rs" docs/logging docs/superpowers/specs/2026-07-03-logging-overhaul-design.md`
@@ -606,21 +673,41 @@ port phase 4)`.
 `harness/acceptance/smport.sh` hard-codes its arms and its results folder. Three defaults, so phase 3's call is
 unchanged: `ARMS=(${=SMPORT_ARMS:-measure analysis-mode})`,
 `RES="$LAB/star-lab/results/star-measure-port${SMPORT_TAG:+/$SMPORT_TAG}"`, and the build target
-`${SMPORT_TARGET:-$WORK/target}`. Usage text updated. Acceptance: `zsh -n harness/acceptance/smport.sh`; with no
-variable set it prints the same usage. Committed in athenaeum-lab.
+`${SMPORT_TARGET:-$WORK/target}`. Usage text updated, including the cache rule: the JSONL cache is keyed on
+`<side>/<arm>/<set>/<basename>` under `<work>/lab` and an existing `.gz` is reused, so two runs over different corpora
+need different work dirs (third argument) and copies of one file need distinct basenames. Acceptance: `zsh -n
+harness/acceptance/smport.sh`; with no variable set the arms, the results folder and the target are phase 3's.
+Committed in athenaeum-lab.
 
 ## 4. Gates (the controller, on the owner's Mac, after T7)
 
-Work dir `~/.athenaeum-acc/star-measure-port-p4/` with a `REGISTRY.tsv` row (job, the controller, start, end = the day
-the results are committed); it holds the worktrees, the harness target, the JSONL and the fold copies, and is removed
-once the results are committed (`git worktree remove`, then the folder).
+Work dir `~/.athenaeum-acc/star-measure-port-p4/` (`<work>` below) with a `REGISTRY.tsv` row (job, the controller,
+start, end = the day the results are committed); it holds the worktrees, the harness target, the JSONL, the fold copies
+and the fold run's own work dir `<work>/fold`, and is removed once the results are committed (`git worktree remove`,
+then the folder).
+
+**The sequence** (it orders what section 7 calls part of the phase; the gates depend on it):
+1. T1–T5 on rustafits `feat/star-measure-phase-4`, each re-gated by the controller.
+2. **Push that branch to rustafits `origin` (GitHub).** `mac_check.sh` makes fresh Athenaeum worktrees and runs `git
+   submodule update --init rustafits` in them (`mac_check.sh:38-44`), while this worktree's submodule git dir is private
+   (`.git/worktrees/smport-p4/modules/rustafits`): the T5 sha is reachable for them only from `origin`, and stays there
+   only until Athenaeum re-pins (a squash merge that deletes the branch orphans it, R-P4-7).
+3. T6 (pins the T5 sha), then T7; L1 in athenaeum-lab.
+4. Push the Athenaeum branch `star-measure-port-phase-4` to its `origin` (GitLab).
+5. The gates below (G-1a … G-1h, G-3).
+6. The rustafits PR into `star-measure-port`, squash-merged (D-10); re-pin Athenaeum to the squash commit with `git diff
+   --stat <T5 sha> <squash>` empty (R-P4-7).
+7. The owner (Q-1: the merge into `main`, the second re-pin the same way).
+The rustafits branch is deleted only after the re-pin of step 6.
 
 - **G-1a Suites, exact aarch64 pins** (`mac_check.sh`, T5): `MAC_CHECK_BRANCH=star-measure-port-phase-4
-  rustafits/scripts/star_measure_port/mac_check.sh <athenaeum checkout> ~/.athenaeum-acc/star-measure-port-p4`. It
-  fetches `main` and the branch from the checkout's `origin` (push the branch there first, or set `MAC_CHECK_REMOTE`;
-  `main` must be e6344ddd) and makes the two worktrees `<work>/main` and `<work>/star-measure-port-phase-4`. Bars: the
+  MAC_CHECK_MAIN=e6344ddd rustafits/scripts/star_measure_port/mac_check.sh <athenaeum checkout> <work>`. It fetches the
+  branch from the checkout's `origin` (pushed in step 4, or set `MAC_CHECK_REMOTE`) and makes the two worktrees
+  `<work>/main`, detached at e6344ddd whatever `main` has become (the "before" of every count and digest below is
+  e6344ddd's), and `<work>/star-measure-port-phase-4`; the branch worktree's submodule update needs step 2. Bars: the
   digest is byte-identical `main` against the branch (the module did not change); `cargo test -p rustafits --features
-  serde` 556 / 0 / 3; `cargo test -p athenaeum-core --all-targets` 4549 / 0 / 15, no pin edited.
+  serde` 556 / 0 / 3; `cargo test -p athenaeum-core --all-targets` 4549 / 0 / 15, no pin edited. Counts are summed over
+  the test binaries (the script prints the per-binary `test result` lines and sums nothing; the controller adds them).
 - **G-1b The corpus, analysis-mode arm** (the brief's item 9): `star_probe` (release) built at Athenaeum `main` e6344ddd
   and at the phase-4 branch, on every image of `~/Pictures/star test/{m42,m101,singles,trails}` (77 + 30 + 38 + 7 = 152),
   `measure <img> --paths analysis-mode --diagnostics`. From the athenaeum-lab checkout, after L1:
@@ -641,13 +728,19 @@ once the results are committed (`git worktree remove`, then the folder).
   that.
 - **G-1c Positive control of the one fold.** Three copies of `singles/test.xisf` (the corpus copy is identical to
   `tests/test.xisf`; it carries `<FITSKeyword name="XBAYROFF" value="0" …/>` and `YBAYROFF` 0) with the header patched
-  in place, one byte each, so the XML length and the attachment offsets do not move: X 1; Y 1; X 1 and Y 1. Put them in
+  in place, one byte each, so the XML length and the attachment offsets do not move: X 1; Y 1; X 1 and Y 1. They are
+  named `test_x1.xisf`, `test_y1.xisf` and `test_xy1.xisf`, never `test.xisf`, and the fold run has its own work dir
+  (third argument `<work>/fold`): the harness keys its JSONL cache on `<side>/<arm>/<set>/<basename>` under
+  `<work>/lab` and skips an existing `.gz`, and rewrites `probe-{before,after}`, so three copies of one name could not
+  coexist and a copy named like a corpus file would reuse the corpus run's JSONL. Put the copies in
   `<work>/fold-corpus/singles/` (empty `m42`, `m101`, `trails` beside it) and run
-  `SMPORT_CORPUS=<work>/fold-corpus SMPORT_ARMS=analysis-mode SMPORT_TAG=phase-4-fold zsh harness/acceptance/smport.sh …`.
-  Bars: PASS, 3 identical (one fold on each side). Against the unpatched file's after-JSONL (G-1b): the X-only and
-  Y-only copies differ (their green sites move: GRBG / GBRG put green where RGGB has red and blue), and the X-and-Y copy
-  is equal (BGGR and RGGB share their green sites, and the analysis-mode arm reads green only). Then `rustafits info
-  --json` on the copies: RGGB before (8ecca88), GRBG / GBRG / BGGR after.
+  `SMPORT_CORPUS=<work>/fold-corpus SMPORT_ARMS=analysis-mode SMPORT_TAG=phase-4-fold SMPORT_TARGET=<work>/target zsh
+  harness/acceptance/smport.sh <work>/main <work>/star-measure-port-phase-4 <work>/fold` (`SMPORT_TARGET` reuses G-1b's
+  build instead of a third release build).
+  Bars: PASS, 3 identical (one fold on each side). Against the unpatched `test.xisf`'s after-JSONL (G-1b, in
+  `<work>/lab`): the X-only and Y-only copies differ (their green sites move: GRBG / GBRG put green where RGGB has red
+  and blue), and the X-and-Y copy is equal (BGGR and RGGB share their green sites, and the analysis-mode arm reads green
+  only). Then `rustafits info --json` on the copies: RGGB before (8ecca88), GRBG / GBRG / BGGR after.
 - **G-1d rustafits renders unchanged** (G-3): build `rustafits` (debug) in both worktrees, one after the other into the
   harness target, copy each binary out; run `rustafits <f> <out>.jpg`, `rustafits info --json` and `rustafits analyze
   --json` on `tests/mono.fits`, `tests/osc.fits`, `tests/test.xisf`. Bar: every output byte-identical (offsets 0
@@ -657,11 +750,16 @@ once the results are committed (`git worktree remove`, then the folder).
 - **G-1f `ts_contract`, headless, web:** in T6's acceptance, re-run on the final commit.
 - **G-1g Release binary size** (R-7): `cargo build --release -p rustafits` in both worktrees, one after the other; note
   the size change in the port plan.
+- **G-1h App smoke (the wiring, which no number above exercises):** after T6, about 5 minutes of `npm run tauri dev` on
+  the real dev DB, on the phase-4 branch: the Analysis tab on one FITS and one XISF frame (the row appears, the figures
+  are those of `main`), Blink's star overlay on one frame, and the new error text for an unreadable header
+  (`ImageConverter::read_header`'s `Failed to read header` context now precedes the cause in the tab's
+  `"{path}: {error}"`, `ATH/…/api/analysis.rs:338`), on a truncated copy of one FITS. The result is noted in R-OSP-19.
 - **G-3 rustafits:** `cargo test -p rustafits` (default), `--features serde`, `--features debug-pipeline`, `cargo
   build -p rustafits --no-default-features`, clippy with no new warning in `src/{star_measure,formats}/` (T4).
 
 Results: `star-lab/results/star-measure-port/phase-4/` and `…/phase-4-fold/` in athenaeum-lab (committed), the counts in
-the port plan's phase 4 and in R-OSP-19.
+the port plan's phase 4 and in R-OSP-19, with the G-1h smoke.
 
 ## 5. Risks
 
@@ -671,47 +769,71 @@ the port plan's phase 4 and in R-OSP-19.
   card-layout cases (section 1.1) appear in no corpus file. G-1b's options line proves the facts on the corpus.
 - **R-P4-3 An XISF whose keyword pass errors** now fails `read_raw_frame` (section 1.1). Low; recorded.
 - **R-P4-4 Intended render change downstream** (odd-offset XISF): Athenaeum's previews, solvemyastro's detection, the
-  CLI. A Fixed entry; no corpus file; the open-items smoke.
-- **R-P4-5 An XISF whose `<ColorFilterArray>` already includes its offset** would be folded twice by the reader's rule.
-  This is the rule Athenaeum's Analysis already applies to XISF (R-PC-4), so the Analysis numbers keep their meaning;
-  the corpus cannot tell (its one CFA XISF has offsets 0). Owner question Q-2.
+  CLI. A Fixed entry; no corpus file; the open-items smoke. It includes the render-side regression case: a writer that
+  already shifted `<ColorFilterArray>` for a ROI and kept the camera's `XBAYROFF` renders right at 8ecca88 and wrong
+  after T1 (the render, `rustafits info`, `detect_fast`, Athenaeum's previews, solvemyastro), while its Analysis numbers
+  do not change (R-PC-4 already folds). Accepted by the owner, 2026-11-04 (Q-2, P4-8); the T7 smoke includes such a
+  writer.
+- **R-P4-5 An XISF whose `<ColorFilterArray>` already includes its offset** is folded twice by the reader's rule: the
+  pattern scan cannot tell the element from a `BAYERPAT` keyword (section 1.2). This is the rule Athenaeum's Analysis
+  already applies to XISF (R-PC-4), so the Analysis numbers keep their meaning; the corpus cannot tell (its one CFA XISF
+  has offsets 0); the render-side consequence is R-P4-4's. Decided by the owner, 2026-11-04, «Сдвигать всегда» (Q-2).
 - **R-P4-6 Semver** (R-3): `analysis_mode` / `raw` become the covered entry; `#[non_exhaustive]` on the two option /
   summary structs (P4-4).
 - **R-P4-7 The squash merge** into `star-measure-port` (D-10) orphans the T1–T5 commits Athenaeum's T6 pins. Athenaeum
   re-pins to the squash commit, and later to `main`'s merge, each time with `git diff --stat <old> <new>` empty
-  (identical trees need no gate re-run), as phase 3 did.
+  (identical trees need no gate re-run), as phase 3 did. Until the first re-pin the T5 sha lives only on the pushed
+  `feat/star-measure-phase-4`: the sequence of section 4 pushes it before T6 and deletes the branch after the re-pin.
 - **R-P4-8 The Athenaeum worktree double-folds between T1 and T6** (its submodule is the rustafits working copy):
-  Athenaeum's tests are not run as a gate before T6.
+  Athenaeum's tests are not run as a gate before T6, no Athenaeum commit is made from that tree before T6, and nothing
+  measured in it is evidence (said again in T1–T5).
 - **R-P4-9 Disk and memory:** the gate builds a release `star_probe` twice and runs the suites; one compile at a time,
   the work dir registered and removed (CLAUDE.md disk rule).
 - **R-6 Platform pins** (port plan): the counts above are aarch64's; elsewhere `assert_bits_pinned` tolerances apply,
   and Windows failures are checked against open-items' 2026-10-18 entry first.
 
-## 6. Open questions (each with a recommended answer)
+## 6. Questions: all decided
 
-- **Q-1 When does phase 4 reach rustafits `main`?** Recommended: merge `star-measure-port` into `main` (merge commit,
-  D-10) once phase 4's gates pass, with no tag (D-8: its additions ride with 1.8.0 in phase 5); Athenaeum's PR re-pins
-  to that merge and merges on the owner's word. The alternative, holding Athenaeum's phase 4 until phase 5, keeps
-  `analysis/` frozen (G-2) for longer.
-- **Q-2 The XISF fold rule** (R-P4-5): fold the `<FITSKeyword>` offsets onto whatever pattern the reader found, as
-  R-PC-4 does today? Recommended: yes, and if the owner has a real XISF mosaic with an odd offset, check its preview by
-  eye (the open-items smoke).
-- **Q-3 `#[non_exhaustive]` on `FrameOptions` and `FrameSummary`** (P4-4)? Recommended: yes; Athenaeum builds
-  `FrameOptions` from `Default` plus field assignments.
-- **Q-4 `raw` folds nothing (P4-2), so `bayer_offsets_fold_into_the_pattern` is split** rather than moved verbatim?
-  Recommended: yes; a no-op fold in the semver-covered module is worse than one rewritten test whose table the reader's
-  own tests already cover.
-- **Q-5 `tempfile` as a rustafits dev-dependency** (P4-5)? Recommended: yes (3.27.0 is already in Athenaeum's lock).
-- **Q-6 The lab harness change** (L1) in athenaeum-lab? Recommended: yes, defaults unchanged.
-- **Q-7 The XISF offset rule** (P4-3): Athenaeum's `f64` + round, not the FITS reader's integer prefix? Recommended:
-  yes; the two differ only on non-integer offsets, where the Analysis tab's numbers must not move.
+No question is open. Q-2 was decided by the owner; Q-1 and Q-3 … Q-7 were decided as their recommendations (controller,
+2026-11-04, with the plan reviewer's agreement, review r1).
+
+- **Q-1 When does phase 4 reach rustafits `main`?** Decided (controller, 2026-11-04): merge `star-measure-port` into
+  `main` (merge commit, D-10) once phase 4's gates pass, with no tag (D-8: its additions ride with 1.8.0 in phase 5);
+  Athenaeum's PR re-pins to that merge and merges on the owner's word, in the order of section 4. (The alternative,
+  holding Athenaeum's phase 4 until phase 5, would keep `analysis/` frozen (G-2) for longer.)
+- **Q-2 The XISF fold rule** (R-P4-5). Decided by the owner, 2026-11-04: «Сдвигать всегда» ("always fold"). The XISF
+  reader folds `XBAYROFF` / `YBAYROFF` onto whatever pattern it finds, as Athenaeum's analysis does today (R-PC-4) and
+  as FITS does since 1.7.0 (P4-8, section 1.2). The render-side case is accepted and named in R-P4-4: a writer that
+  already shifted `<ColorFilterArray>` for a ROI and kept the camera's `XBAYROFF` renders right today and wrong after
+  T1, while the Analysis numbers do not change. T2 pins the rule with a `<ColorFilterArray>`-only case, T7's owed smoke
+  includes such a writer.
+- **Q-3 `#[non_exhaustive]` on `FrameOptions` and `FrameSummary`** (P4-4). Decided (controller, 2026-11-04): yes.
+  Athenaeum builds `FrameOptions` from `Default` plus field assignments and reads `FrameSummary` fields only.
+- **Q-4 `raw` folds nothing (P4-2), so `bayer_offsets_fold_into_the_pattern` is split** rather than moved verbatim.
+  Decided (controller, 2026-11-04): yes; a no-op fold in the semver-covered module is worse than one rewritten test.
+  The table half is covered by `formats::fits::tests::bayer_offsets_fold_into_the_pattern` (`src/formats/fits.rs:595`)
+  and T1's XISF twin.
+- **Q-5 `tempfile` as a rustafits dev-dependency** (P4-5). Decided (controller, 2026-11-04): yes (3.27.0 is already in
+  Athenaeum's lock). rustafits tracks no `Cargo.lock`, so only Athenaeum's moves, and T6 commits it.
+- **Q-6 The lab harness change** (L1) in athenaeum-lab. Decided (controller, 2026-11-04): yes, defaults unchanged; the
+  usage text carries the naming / work-dir rule of G-1c.
+- **Q-7 The XISF offset rule** (P4-3): Athenaeum's `f64` + round, not the FITS reader's integer prefix. Decided
+  (controller, 2026-11-04): yes; the two differ only on non-integer offsets, where the Analysis tab's numbers must not
+  move. The FITS / XISF asymmetry is documented in `bayer_offset`'s doc and in the CHANGELOG entry (section 1.2).
+
+**Phase-5 note** (an idea, not decided, not phase 4): the whole-document pattern scan (`xml.contains`, `xisf.rs:312-321`)
+is pre-existing, and Q-2's answer depends on it. A precedence rule, the `<ColorFilterArray>` element over the
+`BAYERPAT` keyword, would let the reader tell which of the two it found and could remove the double fold of R-P4-5.
+It would move the Analysis rows and renders of such files, so it needs its own gates and the owner's word.
 
 ## 7. Commits, PRs, merges
 
 - rustafits: T1–T5 on `feat/star-measure-phase-4`; PR into `star-measure-port`, squash-merged (D-10). Pushing the
-  branch and opening the PR are part of the approved phase; the merge into `main` waits for the owner (Q-1).
-- Athenaeum: T6, T7 on `star-measure-port-phase-4`; PR into `main`; T6 pins the T5 commit, re-pinned as R-P4-7 says.
-  The merge waits for the owner.
+  branch and opening the PR are part of the approved phase, in the order of section 4 (the branch is pushed after T5,
+  before T6; the PR is squash-merged after the gates; the branch is deleted only after Athenaeum's re-pin); the merge
+  into `main` waits for the owner (Q-1).
+- Athenaeum: T6, T7 on `star-measure-port-phase-4` (pushed to GitLab `origin` after T7, before the gates); PR into
+  `main`; T6 pins the T5 commit, re-pinned as R-P4-7 says. The merge waits for the owner.
 - athenaeum-lab: L1 and the results commit.
 - No release (D-8). The G-2 freeze of `analysis/{input,cfa,trail,analyzer}.rs` holds until Athenaeum's phase-4 PR
   merges; a change that cannot wait goes into both copies.
