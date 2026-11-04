@@ -20,8 +20,11 @@ existing callers, bar that fix.
 - **`star_measure::raw`**: `read_raw_frame` reads a FITS / XISF file as a
   `RawFrame` (mono, a Bayer mosaic or RGB planes, in the file's ADU) with the
   facts the measurement needs: full scale, the clip from `DATAMAX`, the gain
-  from `EGAIN`. The header facts come from `ImageConverter::read_header`, and
-  the Bayer pattern is the readers' own (both fold `XBAYROFF` / `YBAYROFF`).
+  from `EGAIN`. The header facts are read by Athenaeum's own header-value
+  rules, copied into the crate (not by `ImageConverter::read_header`'s
+  parsing), so that the Analysis numbers do not move on any input, malformed
+  header values included; the Bayer pattern is the readers' own (both fold
+  `XBAYROFF` / `YBAYROFF`).
 - **`star_measure::analysis_mode`**: `FrameOptions` (6.0 σ, Moffat 4, 500
   stars: Athenaeum's Analysis defaults), `measure_raw_frame` and
   `FrameSummary` (the frame figures the Analysis tab shows: medians, frame
@@ -43,10 +46,12 @@ existing callers, bar that fix.
   super-pixel and the VNG render (red and blue exchanged, or green and
   magenta), and with one odd offset `ImageAnalyzer`'s green interpolation
   (`analyze*`, `detect_fast*`) took red / blue sites for green. `read_header`
-  and `rustafits info` report the folded pattern. An XISF offset is read as a
-  number and rounded (`0.6` counts as 1), unlike the FITS reader's integer
-  prefix, so that the XISF figures of Athenaeum's Analysis tab, which always
-  read it this way, do not move. The offsets are folded onto whatever pattern
+  and `rustafits info` report the folded pattern. An XISF offset is read by
+  Athenaeum's rule for header values, copied into the crate: a number, rounded
+  (`0.6` counts as 1), the first non-empty value of the keyword, unlike the FITS
+  reader's integer prefix of the last card, so that the XISF figures of
+  Athenaeum's Analysis tab, which always read it this way, do not move on any
+  input. The offsets are folded onto whatever pattern
   the file declares (`BAYERPAT` or `<ColorFilterArray>`), as that tab always
   did: a file whose `<ColorFilterArray>` already includes its odd offset has it
   counted twice. Files without the keywords, or with even offsets, read and

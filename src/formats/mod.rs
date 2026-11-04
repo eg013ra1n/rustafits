@@ -1,4 +1,5 @@
 pub mod fits;
+pub(crate) mod stored_keys;
 pub mod xisf;
 
 use std::fs::File;

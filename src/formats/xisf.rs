@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -8,6 +9,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rayon::prelude::*;
 
+use super::stored_keys;
 use crate::types::{BayerPattern, DataType, FileFormat, HeaderKeyword, ImageHeader, ImageMetadata, PixelData};
 
 const XISF_SIGNATURE: &[u8; 8] = b"XISF0100";
@@ -258,32 +260,8 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
     // element is fine; skip it and remember the first error only in case
     // nothing usable turns up at all.
     let mut first_err: Option<anyhow::Error> = None;
-    // The first `<FITSKeyword>` named XBAYROFF / YBAYROFF (any case) and its
-    // `value`, empty when the attribute is absent.
-    let mut x_offset: Option<String> = None;
-    let mut y_offset: Option<String> = None;
     loop {
         match reader.read_event() {
-            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.name().as_ref() == b"FITSKeyword" => {
-                let mut name = String::new();
-                let mut value = String::new();
-                for attr in e.attributes().flatten() {
-                    // Same XML 1.0 normalization as `parse_image_attrs`.
-                    let val = attr
-                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                        .unwrap_or_default();
-                    match attr.key.as_ref() {
-                        b"name" => name = val.into_owned(),
-                        b"value" => value = val.into_owned(),
-                        _ => {}
-                    }
-                }
-                if name.eq_ignore_ascii_case("XBAYROFF") {
-                    x_offset.get_or_insert(value);
-                } else if name.eq_ignore_ascii_case("YBAYROFF") {
-                    y_offset.get_or_insert(value);
-                }
-            }
             Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.name().as_ref() == b"Image" => {
                 let candidate = match parse_image_attrs(e) {
                     Ok(c) => c,
@@ -345,29 +323,42 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
     }
 
     // Fold the offsets in, whatever the scan above found, so the pattern
-    // addresses pixel (0, 0) of the stored frame — as `formats::fits` does.
-    info.bayer_pattern = super::shift_bayer_pattern(
-        info.bayer_pattern,
-        bayer_offset(x_offset.as_deref()).rem_euclid(2) == 1,
-        bayer_offset(y_offset.as_deref()).rem_euclid(2) == 1,
-    );
+    // addresses pixel (0, 0) of the stored frame — as `formats::fits` does. A
+    // file without a pattern has nothing to shift and skips the keyword pass.
+    if info.bayer_pattern != BayerPattern::None {
+        let (odd_x, odd_y) = odd_bayer_offsets(xml);
+        info.bayer_pattern = super::shift_bayer_pattern(info.bayer_pattern, odd_x, odd_y);
+    }
 
     Ok(info)
 }
 
-/// A `<FITSKeyword>` `XBAYROFF` / `YBAYROFF` value as a whole number of
-/// sites: quotes and spaces trimmed, read as a number, rounded; absent,
-/// unreadable or non-finite is 0.
+/// Whether the XISF header `xml` has an odd `XBAYROFF` and an odd `YBAYROFF`.
 ///
-/// This is the rule Athenaeum's Analysis tab applied to XISF files before the
-/// star measurement moved into this crate, kept so that its XISF figures do
-/// not move. The FITS reader takes the integer prefix of the card instead, so
-/// the two readers differ on a non-integer offset only: `0.6` is 0 for FITS
-/// and 1 here.
-fn bayer_offset(v: Option<&str>) -> i64 {
-    v.and_then(|v| v.trim().trim_matches('\'').trim().parse::<f64>().ok())
-        .filter(|x| x.is_finite())
-        .map_or(0, |x| x.round() as i64)
+/// The offsets are read by Athenaeum's own header-value rule, `formats::stored_keys` (port plan phase 4, ruling
+/// R-P4-C1), the rule its Analysis tab applied to XISF files before the star measurement moved into this crate, so
+/// that its XISF figures do not move on any input: the XML is turned into `NAME = value` lines (empty `<FITSKeyword>`
+/// elements only, the raw attribute, one pair of quotes stripped) and the lines are read as keys; the first non-empty
+/// value of a name (upper-cased) wins, and a value is read as a number — quotes and blanks trimmed, `f64`, rounded,
+/// non-finite or unreadable counts as 0 — whose parity is the offset's.
+///
+/// The FITS reader reads its offsets by its own card rule instead, and the two readers differ on these inputs: a
+/// non-integer value (`0.6` is 0 for FITS, which takes the integer prefix of the card, and 1 here), a quoted value
+/// (`'1'` is 0 for FITS and 1 here), a keyword repeated (the last card for FITS, the first non-empty value here) and
+/// the keyword's case (FITS matches upper case only, XISF any case).
+fn odd_bayer_offsets(xml: &str) -> (bool, bool) {
+    let keys = stored_keys::xisf_stored_keys(xml);
+    let odd = |key: &str| stored_keys::offset(stored_keys::num(&keys, key)).rem_euclid(2) == 1;
+    (odd("XBAYROFF"), odd("YBAYROFF"))
+}
+
+/// The stored-header keys of the XISF file at `path`, read by Athenaeum's rule (`formats::stored_keys`): the keys
+/// `star_measure::raw` reads its `DATAMAX` and `EGAIN` from. Reads the XML header only.
+pub(crate) fn read_xisf_stored_keys(path: &Path) -> Result<HashMap<String, String>> {
+    let file = File::open(path).context("Failed to open XISF file")?;
+    let mut reader = BufReader::new(file);
+    let xml = read_xml_header(&mut reader)?;
+    Ok(stored_keys::xisf_stored_keys(&xml))
 }
 
 fn unshuffle_bytes(data: &mut [u8], item_size: usize) {
@@ -1229,15 +1220,26 @@ mod tests {
         keywords: &[(&str, &str)],
         data: &[u16],
     ) {
-        assert_eq!(data.len(), width * height);
-        let pos: u64 = 4096;
-        let size = (data.len() * 2) as u64;
         let mut keyword_tags = format!(r#"<FITSKeyword name="BAYERPAT" value="'{bayerpat}'" comment=""/>"#);
         for (name, value) in keywords {
             keyword_tags.push_str(&format!(r#"<FITSKeyword name="{name}" value="{value}" comment=""/>"#));
         }
+        write_cfa_xisf_children(path, width, height, &keyword_tags, data);
+    }
+
+    /// Writes a UInt16 mosaic whose `<Image>` element holds `children` as written (any element shape).
+    fn write_cfa_xisf_children(
+        path: &std::path::Path,
+        width: usize,
+        height: usize,
+        children: &str,
+        data: &[u16],
+    ) {
+        assert_eq!(data.len(), width * height);
+        let pos: u64 = 4096;
+        let size = (data.len() * 2) as u64;
         let tags = vec![format!(
-            r#"<Image geometry="{width}:{height}:1" sampleFormat="UInt16" colorSpace="Gray" location="attachment:{pos}:{size}">{keyword_tags}</Image>"#
+            r#"<Image geometry="{width}:{height}:1" sampleFormat="UInt16" colorSpace="Gray" location="attachment:{pos}:{size}">{children}</Image>"#
         )];
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         write_xisf_header_and_attachments(path, &tags, &[(pos, &bytes)]);
@@ -1288,8 +1290,8 @@ mod tests {
     }
 
     /// The offset rule is the one Athenaeum's Analysis tab applied to XISF
-    /// before the port: a number, quotes trimmed, rounded; the first keyword
-    /// of a name wins, whatever its case.
+    /// before the port (`formats::stored_keys`): a number, quotes trimmed,
+    /// rounded; the first non-empty value of a name wins, whatever its case.
     #[test]
     fn xisf_bayer_offset_values_read_as_athenaeum_reads_them() {
         let path = scratch_path("bayroff_values");
@@ -1311,10 +1313,60 @@ mod tests {
         assert_eq!(read(&[]), BayerPattern::Rggb, "no offset keywords");
         // YBAYROFF swaps the rows, by the same rule.
         assert_eq!(read(&[("YBAYROFF", "0.6")]), BayerPattern::Gbrg);
-        // The name matches in any case, and the first keyword of a name wins.
+        // The name matches in any case, and the first non-empty value of a name wins.
         assert_eq!(read(&[("xbayroff", "1")]), BayerPattern::Grbg);
         assert_eq!(read(&[("XBAYROFF", "1"), ("XBAYROFF", "0")]), BayerPattern::Grbg);
         assert_eq!(read(&[("XBAYROFF", "0"), ("XBAYROFF", "1")]), BayerPattern::Rggb);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// R-P4-C1: on unusual or malformed values the reader folds exactly as Athenaeum's Analysis tab did, because both
+    /// run the same rule (`formats::stored_keys`). Every case below reads a different pattern under the plain rule
+    /// "the first `<FITSKeyword>` of the name, XML-normalized, as a number" (the commented result), which the first
+    /// version of this fold used. RGGB base: an odd XBAYROFF reads GRBG, an odd YBAYROFF GBRG.
+    #[test]
+    fn xisf_bayer_offsets_follow_athenaeums_rule_on_unusual_values() {
+        use BayerPattern::{Gbrg, Grbg, Rggb};
+        let path = scratch_path("bayroff_parity");
+        let kw = |name: &str, value: &str| format!(r#"<FITSKeyword name="{name}" value="{value}" comment=""/>"#);
+        let read = |children: String| {
+            write_cfa_xisf_children(&path, 4, 2, &format!("{}{children}", kw("BAYERPAT", "'RGGB'")), &[0; 8]);
+            let info = read_xisf_header_info(&path).unwrap();
+            let (meta, _) = read_xisf_image(&path).unwrap();
+            assert_eq!(info.bayer_pattern, meta.bayer_pattern, "header-only read");
+            meta.bayer_pattern
+        };
+        let cases: Vec<(&str, String, BayerPattern)> = vec![
+            // An empty value is skipped and a later keyword of the name wins (plain rule: the empty one, Rggb).
+            ("empty, then 1", format!("{}{}", kw("XBAYROFF", ""), kw("XBAYROFF", "1")), Grbg),
+            ("quote pair only, then 1", format!("{}{}", kw("XBAYROFF", "''"), kw("XBAYROFF", "1")), Grbg),
+            (
+                "no value attribute, then 1",
+                format!(r#"<FITSKeyword name="XBAYROFF"/>{}"#, kw("XBAYROFF", "1")),
+                Grbg,
+            ),
+            // The value stops at " / " or at the closing quote (plain rule: unreadable, Rggb).
+            ("1 / off", kw("XBAYROFF", "1 / off"), Grbg),
+            ("'1' / off", kw("XBAYROFF", "'1' / off"), Grbg),
+            ("YBAYROFF 1 / off", kw("YBAYROFF", "1 / off"), Gbrg),
+            // An unclosed quote drops the line (plain rule: 1, Grbg).
+            ("unclosed quote", kw("XBAYROFF", "'1"), Rggb),
+            // A lone quote is no pair (Athenaeum's own loop panicked here; the line is dropped).
+            ("lone quote", kw("XBAYROFF", "'"), Rggb),
+            // The name is trimmed (plain rule: no match, Rggb).
+            ("leading blank in the name", kw(" XBAYROFF", "1"), Grbg),
+            // The raw attribute is read, a character reference stays text (plain rule: 1, Grbg).
+            ("character reference", kw("XBAYROFF", "&#49;"), Rggb),
+            // Empty elements only (plain rule: the pair is read, Grbg).
+            (
+                "start and end tag",
+                r#"<FITSKeyword name="XBAYROFF" value="1"></FITSKeyword>"#.to_string(),
+                Rggb,
+            ),
+        ];
+        for (label, children, want) in cases {
+            assert_eq!(read(children), want, "{label}");
+        }
         std::fs::remove_file(&path).ok();
     }
 

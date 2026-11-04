@@ -9,16 +9,20 @@
 //! only picks the full scale of the plane it is handed.
 //!
 //! **In rustafits** (port plan phase 4, `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md`): copied from
-//! Athenaeum's `analysis/input.rs` at e6344ddd. The header facts come from [`ImageConverter::read_header`] (Athenaeum's
-//! numeric rules for them are kept), and the Bayer offsets are not folded here: both rustafits readers fold
-//! `XBAYROFF` / `YBAYROFF` into the pattern they report. The rulings the docs cite (`PC-…`, `R-PC-…`) are Athenaeum's.
+//! Athenaeum's `analysis/input.rs` at e6344ddd. The header facts are read with Athenaeum's own header-value rules,
+//! ported as `formats::stored_keys` (ruling R-P4-C1: the Analysis numbers must not move on any input, malformed header
+//! values included); `ImageConverter::read_header` only says which format the file is. The Bayer offsets are not
+//! folded here: both rustafits readers fold `XBAYROFF` / `YBAYROFF` into the pattern they report. The rulings the docs
+//! cite (`PC-…`, `R-PC-…`) are Athenaeum's.
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
+use crate::formats::stored_keys::{self, FitsHeader};
+use crate::formats::xisf::read_xisf_stored_keys;
 use crate::star_measure::Domain;
-use crate::{BayerPattern, FileFormat, ImageConverter, ImageHeader, PixelData};
+use crate::{BayerPattern, FileFormat, ImageConverter, PixelData};
 
 /// ADU scale of a unit-range float file and of the XISF reader's float contract.
 const UNIT_SCALE: f32 = 65535.0;
@@ -72,54 +76,30 @@ struct HeaderFacts {
     egain: Option<f64>,
 }
 
-/// An XISF `<FITSKeyword>` value as a number: quotes and spaces trimmed, then `f64`.
-fn num(v: Option<&str>) -> Option<f64> {
-    v.and_then(|v| v.trim().trim_matches('\'').trim().parse::<f64>().ok())
-}
-
-/// A FITS float card value, Fortran `D` exponents allowed: Athenaeum's `FitsHeader::get_f64` over its
-/// `parse_fits_f64` (`fits_parser/fits_header_reader.rs`), copied so that no stored number moves with the source of the
-/// header text.
-fn fits_f64(v: &str) -> Option<f64> {
-    let s = v.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // Replace Fortran D/d exponent notation with E/e
-    let normalized = s.replace('D', "E").replace('d', "e");
-    normalized.trim().parse::<f64>().ok()
-}
-
-/// A FITS integer card value: Athenaeum's `FitsHeader::get_i32` (`fits_parser/fits_header_reader.rs`), copied.
-fn fits_i32(v: &str) -> Option<i32> {
-    let s = v.trim();
-    // Try i64 first (handles large values), then truncate to i32
-    s.parse::<i64>()
-        .ok()
-        .map(|n| n as i32)
-        .or_else(|| fits_f64(s).map(|f| f as i32))
-}
-
-/// The facts from the header `ImageConverter::read_header` returned. A FITS file reads `BITPIX` / `BZERO` / `BSCALE` /
-/// `DATAMAX` / `EGAIN`; an XISF file reads `DATAMAX` / `EGAIN` only, its `BITPIX` / `BZERO` / `BSCALE` keywords (some
-/// writers copy a FITS layout into the XISF header) say nothing about the XISF samples.
-fn header_facts(header: &ImageHeader) -> HeaderFacts {
-    if header.format == FileFormat::Xisf {
-        HeaderFacts {
+/// The header facts of `path`, read by Athenaeum's own rules (`formats::stored_keys`, R-P4-C1). A FITS file reads
+/// `BITPIX` / `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN`; an XISF file reads `DATAMAX` / `EGAIN` only, its `BITPIX` /
+/// `BZERO` / `BSCALE` keywords (some writers copy a FITS layout into the XISF header) say nothing about the XISF
+/// samples.
+fn header_facts(path: &Path, xisf: bool) -> Result<HeaderFacts> {
+    if xisf {
+        let map = read_xisf_stored_keys(path)
+            .with_context(|| format!("XISF header: {}", path.display()))?;
+        Ok(HeaderFacts {
             bitpix: None,
             bzero: 0.0,
             bscale: 1.0,
-            datamax: num(header.get("DATAMAX")),
-            egain: num(header.get("EGAIN")),
-        }
+            datamax: stored_keys::num(&map, "DATAMAX"),
+            egain: stored_keys::num(&map, "EGAIN"),
+        })
     } else {
-        HeaderFacts {
-            bitpix: header.get("BITPIX").and_then(fits_i32),
-            bzero: header.get("BZERO").and_then(fits_f64).unwrap_or(0.0),
-            bscale: header.get("BSCALE").and_then(fits_f64).unwrap_or(1.0),
-            datamax: header.get("DATAMAX").and_then(fits_f64),
-            egain: header.get("EGAIN").and_then(fits_f64),
-        }
+        let h = FitsHeader::from_path(path)?;
+        Ok(HeaderFacts {
+            bitpix: h.get_i32("BITPIX"),
+            bzero: h.get_f64("BZERO").unwrap_or(0.0),
+            bscale: h.get_f64("BSCALE").unwrap_or(1.0),
+            datamax: h.get_f64("DATAMAX"),
+            egain: h.get_f64("EGAIN"),
+        })
     }
 }
 
@@ -135,7 +115,7 @@ fn read_inner(path: &Path) -> Result<RawFrame> {
     let header = ImageConverter::read_header(path)
         .map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))?;
     let xisf = header.format == FileFormat::Xisf;
-    let facts = header_facts(&header);
+    let facts = header_facts(path, xisf)?;
     let (meta, pixels) =
         ImageConverter::read_raw(path).map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))?;
     let (w, h, channels) = (meta.width, meta.height, meta.channels);
@@ -686,6 +666,11 @@ mod tests {
 
     /// An XISF's `BITPIX` / `BZERO` / `BSCALE` keywords (the corpus' `Light_Pane` files carry a FITS layout) say
     /// nothing about its samples: the file reads exactly like the one without them.
+    ///
+    /// What this pins, and what it cannot: the XISF reader returns Float32 samples only, and `read_inner` tests `xisf`
+    /// before it looks at `bitpix`, so a regression in the XISF arm of `header_facts` alone (reading `BITPIX` 16 /
+    /// `BZERO` 32768 there) would not change this file's result. The test pins that the whole read ignores the layout
+    /// keywords; the arm itself is pinned by reading, not by this test.
     #[test]
     fn an_xisfs_fits_layout_keywords_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
@@ -707,14 +692,112 @@ mod tests {
         assert_eq!(raw(&b).1, 65535.0);
     }
 
+    /// A FITS file with `cards` (80-column card images, as written) after `NAXIS2`: a 16-bit 2x2 image. For cards
+    /// whose shape `write_fits`' `KEY = value` layout cannot express.
+    fn write_fits_cards(path: &Path, cards: &[String]) {
+        let mut all = vec![
+            format!("{:<80}", format!("SIMPLE  = {:>20}", "T")),
+            card("BITPIX", "16"),
+            card("NAXIS", "2"),
+            card("NAXIS1", "2"),
+            card("NAXIS2", "2"),
+        ];
+        all.extend(cards.iter().map(|c| format!("{c:<80}")));
+        all.push(format!("{:<80}", "END"));
+        let mut bytes: Vec<u8> = all.concat().into_bytes();
+        bytes.resize(bytes.len().div_ceil(2880) * 2880, b' ');
+        bytes.extend_from_slice(&be16(&[10, 20, 30, 40]));
+        bytes.resize(bytes.len().div_ceil(2880) * 2880, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// R-P4-C1: the FITS facts are read by Athenaeum's `FitsHeader`, not by the card parser behind
+    /// `ImageHeader::get`. Each case is a card shape the two read differently; the result is Athenaeum's (the
+    /// commented one is what `ImageHeader::get` + a number parse would give).
     #[test]
-    fn fits_numbers_read_as_athenaeum_reads_them() {
-        assert_eq!(fits_f64("3.2768D4"), Some(32768.0));
-        assert_eq!(fits_f64("1.5d0"), Some(1.5));
-        assert_eq!(fits_f64(""), None);
-        assert_eq!(fits_i32("16"), Some(16));
-        assert_eq!(fits_i32("16.0"), Some(16));
-        assert_eq!(fits_i32("-32"), Some(-32));
+    fn fits_facts_read_as_athenaeum_reads_them_on_unusual_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.fits");
+        let facts = |cards: &[&str]| {
+            write_fits_cards(&p, &cards.iter().map(|c| c.to_string()).collect::<Vec<_>>());
+            raw(&read_raw_frame(&p).unwrap())
+        };
+        // (clip, full scale, gain). No gain, no DATAMAX: the plain 16-bit domain.
+        assert_eq!(facts(&[]), (32767.0, 32767.0, None));
+        // No `= ` in columns 9-10: the card is skipped (gain 1.5, clip 30000).
+        assert_eq!(facts(&["EGAIN    1.5"]).2, None);
+        assert_eq!(facts(&["DATAMAX   30000"]).0, 32767.0);
+        // A value-less card before the real one is skipped (no gain).
+        assert_eq!(facts(&["EGAIN", "EGAIN   = 1.5"]).2, Some(1.5));
+        // HIERARCH cards are read under their long key (no gain).
+        assert_eq!(facts(&["HIERARCH EGAIN = 1.5"]).2, Some(1.5));
+        assert_eq!(facts(&["HIERARCH DATAMAX = 30000"]).0, 30000.0);
+        // Blanks in front of the key are trimmed (no gain).
+        assert_eq!(facts(&[" EGAIN  = 1.5"]).2, Some(1.5));
+        // A string ending in `&` continues; the marker is dropped (no gain), and CONTINUE cards join on (gain 1.).
+        assert_eq!(facts(&["EGAIN   = '1.5&'"]).2, Some(1.5));
+        assert_eq!(facts(&["EGAIN   = '1.&'", "CONTINUE  '5'"]).2, Some(1.5));
+        // The first card of a keyword wins.
+        assert_eq!(facts(&["EGAIN   = 1.5", "EGAIN   = 2.5"]).2, Some(1.5));
+    }
+
+    /// R-P4-C1: the XISF facts are read by Athenaeum's text rule (`formats::stored_keys`), not by
+    /// `ImageHeader::get`. Each case is a `<FITSKeyword>` / element shape the two read differently; the result is
+    /// Athenaeum's (the commented one is what `ImageHeader::get` + `num` would give).
+    #[test]
+    fn xisf_facts_read_as_athenaeum_reads_them_on_unusual_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.xisf");
+        let floats = lef32(&[0.0, 0.25, 0.5, 1.0]);
+        let gain = |children: String| {
+            write_xisf(&p, "2:2:1", "Float32", &children, &floats);
+            raw(&read_raw_frame(&p).unwrap()).2
+        };
+        let clip = |children: String| {
+            write_xisf(&p, "2:2:1", "Float32", &children, &floats);
+            raw(&read_raw_frame(&p).unwrap()).0
+        };
+        // An empty value is skipped and a later keyword of the name wins (no gain).
+        assert_eq!(gain(format!("{}{}", keyword("EGAIN", ""), keyword("EGAIN", "1.5"))), Some(1.5));
+        assert_eq!(gain(format!("{}{}", keyword("EGAIN", "''"), keyword("EGAIN", "1.5"))), Some(1.5));
+        // The value is cut at " / " (no gain).
+        assert_eq!(gain(keyword("EGAIN", "1.5 / e-/ADU")), Some(1.5));
+        assert_eq!(gain(keyword("EGAIN", "'1.5' / e-/ADU")), Some(1.5));
+        // An unclosed quote drops the line (gain 1.5).
+        assert_eq!(gain(keyword("EGAIN", "'1.5")), None);
+        // The name is trimmed and upper-cased; a character reference stays text (gain 1.5).
+        assert_eq!(gain(keyword(" egain", "1.5")), Some(1.5));
+        assert_eq!(gain(keyword("EGAIN", "1&#46;5")), None);
+        // A `<Property>` is not a keyword (gain 1.5), and neither is a start / end pair (gain 1.5).
+        assert_eq!(gain(r#"<Property id="EGAIN" type="Float32" value="1.5"/>"#.to_string()), None);
+        assert_eq!(gain(r#"<FITSKeyword name="EGAIN" value="1.5"></FITSKeyword>"#.to_string()), None);
+        // DATAMAX goes the same way (the clip is 0.9 x 65535 when read, else the full scale).
+        let read_clip = 0.9 * 65535.0;
+        assert!((clip(format!("{}{}", keyword("DATAMAX", ""), keyword("DATAMAX", "0.9"))) - read_clip).abs() < 1e-6);
+        assert!((clip(keyword("DATAMAX", "0.9 / saturation")) - read_clip).abs() < 1e-6);
+        assert_eq!(clip(keyword("DATAMAX", "'0.9")), 65535.0);
+    }
+
+    /// R-P4-C1 through `read_raw_frame`: the reader's fold reads the offsets by the same text rule (the reader's own
+    /// test lists more shapes).
+    #[test]
+    fn an_xisf_mosaic_reads_unusual_offset_values_as_athenaeum_reads_them() {
+        use BayerPattern::{Grbg, Rggb};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.xisf");
+        let pat = keyword("BAYERPAT", "'RGGB'");
+        let cases = [
+            ("empty, then 1", format!("{}{}", keyword("XBAYROFF", ""), keyword("XBAYROFF", "1")), Grbg),
+            ("1 / off", keyword("XBAYROFF", "1 / off"), Grbg),
+            ("unclosed quote", keyword("XBAYROFF", "'1"), Rggb),
+        ];
+        for (label, offsets, expected) in cases {
+            write_xisf(&p, "4:2:1", "UInt16", &format!("{pat}{offsets}"), &le16(&[1, 2, 3, 4, 5, 6, 7, 8]));
+            match read_raw_frame(&p).unwrap().planes {
+                RawPlanes::Cfa { pattern, .. } => assert_eq!(pattern, expected, "{label}"),
+                other => panic!("{label}: expected Cfa, got {other:?}"),
+            }
+        }
     }
 
     #[test]

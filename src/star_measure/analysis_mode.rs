@@ -6,7 +6,14 @@
 //!
 //! This module and [`super::raw`] are the stable entry of `star_measure`: a caller reads a file with
 //! [`super::raw::read_raw_frame`], measures it with [`measure_raw_frame`] and reads the figures off the
-//! [`FrameSummary`]. The row mapping (the per-star rows, the frame row's ids, `config_hash`, `analyzed_at`,
+//! [`FrameSummary`].
+//!
+//! What that promise covers: the function names and what [`FrameOptions`] and [`FrameSummary`] carry, which are
+//! `#[non_exhaustive]` so that fields can be added in 1.x. [`PlaneMeasurement`] (the return type of
+//! [`measure_raw_frame`]) and [`PsfModel`] (the type of `FrameOptions::psf_model`) appear in the signatures but keep
+//! the status of `star_measure`'s other public items, outside the stable entry.
+//!
+//! The row mapping (the per-star rows, the frame row's ids, `config_hash`, `analyzed_at`,
 //! `quality_score`, the detection threshold, the frame's size and channel count, `possibly_trailed` and the measurement
 //! version) stays in Athenaeum, which builds a [`FrameOptions`] from its own `AnalysisConfig`.
 //!
@@ -119,7 +126,9 @@ pub enum Verdict {
 ///
 /// Medians come from the module's frame aggregates and read 0.0 when the frame has no fit in its statistic (PC-7);
 /// `snr_weight`, `psf_signal` and `trail_r_squared` read the same fits. `median_beta` is the frame's fitted beta under
-/// `Auto` and `None` otherwise (PC-9). A non-finite figure is written 0.0, so no figure is NaN.
+/// `Auto` and `None` otherwise (PC-9). The medians, `snr_weight`, `psf_signal`, `background`, `noise` and
+/// `trail_r_squared` are written 0.0 when non-finite; `frame_snr` (a ratio of the finite `background` and `noise`) and
+/// `median_beta` are not wrapped, as in Athenaeum's `map_measurement`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct FrameSummary {
