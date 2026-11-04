@@ -273,6 +273,10 @@ Source sha: Athenaeum `main` 0b6fb183 (owner, 2026-11-04; the freeze of G-2 runs
   - `scripts/star_measure_port/port_digest.rs` runs every entry point (`measure_plane` in `All`, `Budget` and
     `Population`, `prepare_plane` / `plane_beta` / `finish_plane`, `fit_stars_at` / `correct_at_ring`) over three
     synthetic fields and crops of the three test frames, and writes the results in full. Phase 3 reruns it.
+  - Result at 0b6fb183 (x86_64, toolchain 1.96.1): the 288 copied tests match Athenaeum's own run name for name and
+    outcome for outcome; the digest (31 MB, ~15k fits on the real frames) is byte-identical between Athenaeum's copy
+    (dev profile, opt-level 2) and rustafits' (release, LTO), sha256 `4f907cab…`. Renders, `info` and `analyze` are
+    byte-identical to `main`; the release binary grows by 752 bytes (the CLI does not call the module yet).
 - Release 1.7.0, or have Athenaeum pin the git sha.
 
 ### Phase 3: Athenaeum switches the module (Athenaeum branch)

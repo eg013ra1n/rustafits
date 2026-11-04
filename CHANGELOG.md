@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fit with canonical axes, per-frame β, frame aggregates, sky and noise, the
   Analysis budget (≤ N stars over the field), trail / defocus verdicts, refusal
   counts — copied from `athenaeum-core` at 0b6fb183 with only paths, serde
-  gates and visibility changed. Its 288 module tests pass here exactly as
-  Athenaeum's own do on the same machine. Athenaeum switches to it in a later
+  gates and visibility changed. Bit-identical to Athenaeum's copy on the same
+  machine: its 288 module tests pass here exactly as Athenaeum's own do, and a
+  full dump of every entry point over synthetic fields and the test frames is
+  byte-for-byte the same from both copies. Athenaeum switches to it in a later
   step (port plan phase 3); until then the two copies stay frozen together.
   `star_measure::adapter` lists the `#[doc(hidden)]` helpers Athenaeum's
   stacking calls; they are outside semver. `MEASURE_VERSION` (8) comes along.
