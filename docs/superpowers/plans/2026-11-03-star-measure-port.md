@@ -67,21 +67,25 @@ There is one star-measurement implementation, and it lives in rustafits:
 | rustafits `analysis::background`: `estimate_background_mesh`, `estimate_noise_mrs` | domain | `crate::analysis::background` |
 | Athenaeum `integration::stats`: `MAD_TO_SIGMA`, `CLIP_LO/HI`, `NOISE_CLIP_LO/HI`, `median_in_place`, `median_of`, `mad_about`, `avg_dev_about`, `clip_sample`, `location_scale`, `LocationScale`, `ScaleEstimator`, `for_each_stratified`, `stratified_sample`, `noise_scale_factors_within` | domain, fit, mod, photometry, seeds | a new `astroimage::stats`. It takes the first ~230 lines of the 625-line file; the normalization pairs after them stay in Athenaeum. |
 | Athenaeum `geometry::kdtree::KdTree2` (227 lines) | fit (`mark_blend_neighbours`) | a private copy here. Athenaeum keeps its own for registration. |
-| `serde` derives on 24 types; `ts_rs::TS` on `PsfModel` | 8 files | D-4, D-5 |
+| `serde` derives on 24 types; `ts_rs::TS` on `PsfModel` (and on `ScaleEstimator`, in `integration::stats`) | 8 files | D-4, D-5 |
+| `libc` (`clock_gettime` of the thread CPU clock, unix) | substeps | a regular rustafits dependency (it was the `cli` feature's) |
 | `rayon`, `tracing` | everywhere | already rustafits dependencies |
 
-**Fourteen `pub(crate)` items** are called from elsewhere in Athenaeum, so they must stay reachable from it:
+**Thirteen `pub(crate)` items** are called from elsewhere in Athenaeum, so they must stay reachable from it:
 
 | item | called from |
 | ---- | ---- |
-| `aperture_correction` | `stacking::{measure, run, weights, integrate, provenance, ln::scale}`, `analysis::cfa` |
-| `detect_with`, `envelope_floor_factor` | `stacking::integrate` |
-| `finite_median` | `analysis::analyzer` |
-| `inside_half_max` | `ln::scale` |
 | `install_in_span` | `stacking::{measure, ln}` |
-| `is_storable`, `for_pin` | `stacking::pass1_artifact` |
-| `mark_blend_neighbours` | `stacking::common_set` |
-| `read_noise_correlation` and `NoiseCorrelation::rho`, `ring_sky`, `verdict_iterations`, `verdict_time` | `stacking::measure` |
+| `PlanePrep::seeds`, `verdict_time`, `verdict_iterations` | `stacking::measure` |
+| `PlanePrep::is_storable`, `PlanePrep::for_pin` | `stacking::pass1_artifact` |
+| `frame::finite_median` | `analysis::analyzer` |
+| `fit::inside_half_max` | `ln::scale` |
+| `fit::mark_blend_neighbours` | `stacking::common_set` |
+| `seeds::envelope_floor_factor` | `stacking::integrate` |
+| `seeds::read_noise_correlation`, `NoiseCorrelation`, `NoiseCorrelation::rho` | `stacking::measure` (tests) |
+
+(Corrected in phase 2: the first count listed `aperture_correction`, `detect_with` and `ring_sky`, whose matches
+outside the module are a struct field, a doc link and a step name, and missed `PlanePrep::seeds`.)
 
 **Test code:**
 - **Field generators** in `test_support`: `add_noise` (21 uses), `fixture_field` (7), `width_spread_field` (+ `_beta`),
@@ -89,9 +93,14 @@ There is one star-measurement implementation, and it lives in rustafits:
   `moffat_field` / `MoffatStar`, plus `geometry::ransac::SplitMix64`. These get a `#[cfg(test)]` copy here.
 - **Log capture**: `stacking::solve::tests::captured_logs` and `stacking::telemetry::capture_logs` (13 call sites).
   These get a local helper, and `tracing-subscriber` becomes a rustafits dev-dependency.
-- **Two adapter-identity tests** need Athenaeum's stacking adapter, so they move into `stacking::measure`'s tests:
-  `module_measure_equals_the_adapter_bit_for_bit` (feature `solver`) and
-  `adapter_matched_filter_seeds_fit_exactly_as_the_module_matched_filter`.
+- **Three tests** need Athenaeum's own code, so they stay there (phase 3 moves them out of `star_measure/`):
+  - two adapter-identity tests, into `stacking::measure`'s tests: `module_measure_equals_the_adapter_bit_for_bit`
+    and `adapter_matched_filter_seeds_fit_exactly_as_the_module_matched_filter` (both feature `solver`);
+  - `robust::integration_copies_agree_with_this_module`, which compares `robust` with `integration::combine` and
+    `integration::student_t`, into the integration engine's tests.
+- **Serialization pins**: `serde_json` names and the `postcard` encoding of `PlanePrep` (byte length + xxh3), the
+  first-pass artifact Athenaeum stores. They run under `--features serde`, with `postcard` and `xxhash-rust` as
+  dev-dependencies.
 - **`impl StarFit { fn test_at(..) }`** in Athenaeum's `test_support.rs` is an inherent impl on what becomes a
   foreign type, so it no longer compiles there. It has 6 call sites, in `fit.rs` and `stacking/fits_artifact.rs`.
   See D-3.
@@ -126,7 +135,7 @@ Athenaeum's app no longer calls `ImageAnalyzer::analyze*`; its lab and its probe
 ```
 astroimage::stats              robust statistics (pub; Athenaeum's integration::stats re-exports it)
 astroimage::star_measure       the module: Athenaeum's submodule tree and names, unchanged
-    ::adapter                  #[doc(hidden)] re-exports of the 14 helpers Athenaeum's stacking calls (D-3)
+    ::adapter                  #[doc(hidden)] re-exports of the 13 helpers Athenaeum's stacking calls (D-3)
     ::raw                      RawFrame, RawPlanes, read_raw_frame          (from analysis/input.rs)
     ::green                    measure_green_sites, native_seed             (from analysis/cfa.rs)
     ::trail                    trail_r_squared                              (from analysis/trail.rs)
@@ -152,7 +161,7 @@ Taken by the owner on 2026-11-03, every one as recommended.
     plan that changes what a fit accepts or measures"); Athenaeum's cache keys keep reading the constant;
   - the truth lab stays in athenaeum-lab and stays the referee.
 - **D-3 API surface.** The module's surface is shaped by one consumer: every `MeasureOptions` field is public, plus
-  the 14 helpers. Therefore:
+  the 13 helpers. Therefore:
   - `pub mod star_measure`, always compiled (the CLI needs it from phase 5);
   - the helpers re-exported from a `#[doc(hidden)] pub mod adapter` and documented as outside semver;
   - `StarFit::test_at` behind a `test-support` feature that Athenaeum enables for its tests only;
@@ -161,9 +170,9 @@ Taken by the owner on 2026-11-03, every one as recommended.
   the stacking config, the pass-1 / `.athf` artifacts). They get a `serde` feature, off by default and enabled by
   Athenaeum, with every derive and every `#[serde(...)]` attribute under `cfg_attr`. Athenaeum's round-trip tests
   pin the wire.
-- **D-5 `ts_rs::TS` on `PsfModel`.** Athenaeum cannot derive a foreign trait on what becomes a foreign type, so it
-  keeps a wire enum of its own, with `From` both ways; rustafits gets no `ts-rs` feature. Regenerating the TS
-  contract must leave `src/types` unchanged.
+- **D-5 `ts_rs::TS` on `PsfModel`** (and on `ScaleEstimator`, found in phase 1). Athenaeum cannot derive a foreign
+  trait on what becomes a foreign type, so it keeps wire enums of its own, with `From` both ways; rustafits gets no
+  `ts-rs` feature. Regenerating the TS contract must leave `src/types` unchanged.
 - **D-6 The legacy `ImageAnalyzer::analyze*`.**
   - kept through 1.x, marked `#[deprecated]` after phase 5;
   - removed in 2.0 (phase 6), once the lab retires `legacy-analysis` and Athenaeum retires `SeedOverride::Full`;
@@ -225,31 +234,45 @@ Taken by the owner on 2026-11-03, every one as recommended.
 
 ### Phase 1: `astroimage::stats` (rustafits, additive)
 
-- [ ] 1.1 Copy the primitives listed in 2.2 verbatim from `integration/stats.rs`, with their unit tests (they need
-  `add_noise` / `SplitMix64` test copies).
-- [ ] 1.2 Make it a public module whose doc carries the same contract text as Athenaeum's.
+Source sha: Athenaeum `main` 0b6fb183 (owner, 2026-11-04; the freeze of G-2 runs from it).
+
+- [x] 1.1 Copy the primitives listed in 2.2 verbatim from `integration/stats.rs`, with their unit tests (they need
+  `add_noise` / `SplitMix64` test copies). Done: lines 1–236 (everything above the normalization pairs), the 8
+  primitive tests, and a `ScaleEstimator` serde-name test cut from `serde_names_match_the_spec`.
+- [x] 1.2 Make it a public module whose doc carries the same contract text as Athenaeum's.
 - Verify: G-3.
 
 ### Phase 2: `astroimage::star_measure` (rustafits, additive)
 
-- [ ] 2.1 Copy the 12 files verbatim at the sha. The only edits are paths:
+- [x] 2.1 Copy the 12 files verbatim at the sha. The only edits are paths:
   - `crate::integration::stats` → `crate::stats`;
   - `astroimage::analysis::` → `crate::analysis::`;
   - `crate::geometry::kdtree` → a private `kdtree` copy.
 
   Review with `git diff --no-index --word-diff` against the originals: nothing but those paths may differ.
-- [ ] 2.2 serde under `cfg_attr` (D-4); `ts_rs::TS` dropped (D-5).
-- [ ] 2.3 The 14 helpers become `pub` and are re-exported from `star_measure::adapter`; `StarFit::test_at` goes
-  behind `test-support` (D-3).
-- [ ] 2.4 Tests: every test except the two adapter-identity tests, with paths edited and nothing else. They use the
-  local log-capture helper, a `tracing-subscriber` dev-dependency, and generators in a `#[cfg(test)]` `test_fields.rs`.
-- [ ] 2.5 Make `analysis::fitting::lm_counters` public under `lm-counters` without `debug-pipeline`, so phase 3 can
-  drop `debug-pipeline` from Athenaeum.
-- [ ] 2.6 CLAUDE.md:
+  Done by `scripts/star_measure_port/port_star_measure.py`, so the copy can be regenerated: the paths above (the kd-tree and the test RNG keep Athenaeum's
+  `crate::geometry::…` paths in a crate-private `geometry` module), the two log captures →
+  `crate::test_support::…`, the module doc's provenance paragraph, and the clippy allow-list (G-3).
+  `analysis::{fitting, background}` become `pub(crate)` without `debug-pipeline`, so the module reaches them.
+- [x] 2.2 serde under `cfg_attr` (D-4); `ts_rs::TS` dropped (D-5). `fit::not_measured`, which only serde's
+  `default = …` calls, is gated with it.
+- [x] 2.3 The 13 helpers become `pub` and `#[doc(hidden)]` at their own paths (Athenaeum's paths keep working) and
+  are re-exported from `star_measure::adapter`; `StarFit::test_at` goes behind `test-support` in
+  `star_measure::testing` (D-3).
+- [x] 2.4 Tests: every test except the three that stay in Athenaeum (2.2), with paths edited and nothing else.
+  They use the local log captures, a `tracing-subscriber` dev-dependency, and Athenaeum's generators copied into a
+  `#[cfg(test)]` `test_support.rs`. The serialization tests carry `#[cfg(feature = "serde")]`; one test carries
+  `#[allow(clippy::almost_swapped)]` (its second assignment is a no-op).
+- [x] 2.5 Make `analysis::fitting::lm_counters` public under `lm-counters` without `debug-pipeline`
+  (`astroimage::lm_counters`), so phase 3 can drop `debug-pipeline` from Athenaeum.
+- [x] 2.6 CLAUDE.md:
   - the module map line;
   - the `MEASURE_VERSION` policy (D-2);
   - "this module's numbers are Athenaeum's stacking numbers".
 - Verify: G-3, and note the release binary's size change.
+  - `scripts/star_measure_port/port_digest.rs` runs every entry point (`measure_plane` in `All`, `Budget` and
+    `Population`, `prepare_plane` / `plane_beta` / `finish_plane`, `fit_stars_at` / `correct_at_ring`) over three
+    synthetic fields and crops of the three test frames, and writes the results in full. Phase 3 reruns it.
 - Release 1.7.0, or have Athenaeum pin the git sha.
 
 ### Phase 3: Athenaeum switches the module (Athenaeum branch)

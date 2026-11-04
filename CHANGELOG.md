@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`star_measure`**: Athenaeum's one star-measurement path — per-star Moffat
+  fit with canonical axes, per-frame β, frame aggregates, sky and noise, the
+  Analysis budget (≤ N stars over the field), trail / defocus verdicts, refusal
+  counts — copied from `athenaeum-core` at 0b6fb183 with only paths, serde
+  gates and visibility changed. Its 288 module tests pass here exactly as
+  Athenaeum's own do on the same machine. Athenaeum switches to it in a later
+  step (port plan phase 3); until then the two copies stay frozen together.
+  `star_measure::adapter` lists the `#[doc(hidden)]` helpers Athenaeum's
+  stacking calls; they are outside semver. `MEASURE_VERSION` (8) comes along.
+- **`stats`**: the robust statistics `star_measure` reads (median / MAD /
+  biweight midvariance two-sided about the median, the 1/16 stratified sample,
+  noise-scale factors), from Athenaeum's `integration::stats`.
+- Features **`serde`** (off by default: `Serialize` / `Deserialize` on the
+  `star_measure` and `stats` types, the wire Athenaeum stores) and
+  **`test-support`** (`StarFit::test_at` for downstream tests).
+- `astroimage::lm_counters` under `lm-counters`, without `debug-pipeline`.
 - **`processing::cfa`**: green-site helpers for measuring a raw CFA mosaic
   without interpolation — `green_mask` (`true` on the green sites, file row
   order), `green_sum` (`G1 + G2` per 2×2 cell at half width and height, equal
@@ -16,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the G1 sample of every cell, a half-resolution plane of real samples for
   sky / noise statistics). Odd last row / column left out; `BayerPattern::None`
   gives an empty result. Parallel (rayon).
+
+### Changed
+
+- `libc` is a regular dependency (the thread CPU clock of
+  `star_measure`'s sub-step timers, unix), no longer tied to the `cli` feature.
 
 ### Fixed
 
