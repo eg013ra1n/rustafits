@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-11-04
+
+Athenaeum's star-measurement path moves here (`star_measure`, `stats`),
+bit-identical to Athenaeum's own copy, which Athenaeum has now dropped for a
+re-export of this one; plus CFA green-site helpers and the `XBAYROFF` /
+`YBAYROFF` fix (see Fixed). Additive for existing callers, hence a minor bump.
+
 ### Added
 
 - **`star_measure`**: Athenaeum's one star-measurement path — per-star Moffat
@@ -16,8 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gates and visibility changed. Bit-identical to Athenaeum's copy on the same
   machine: its 288 module tests pass here exactly as Athenaeum's own do, and a
   full dump of every entry point over synthetic fields and the test frames is
-  byte-for-byte the same from both copies. Athenaeum switches to it in a later
-  step (port plan phase 3); until then the two copies stay frozen together.
+  byte-for-byte the same from both copies. Athenaeum now uses this copy (port
+  plan phase 3, Athenaeum PR 23): its own is gone, and the switch moved no
+  number — its full test suite with the exact aarch64 pins, the digest of
+  Athenaeum's `main` against the switched branch, and a star probe over its
+  whole star-test corpus all came out identical.
   `star_measure::adapter` lists the `#[doc(hidden)]` helpers Athenaeum's
   stacking calls; they are outside semver. `MEASURE_VERSION` (8) comes along.
 - **`stats`**: the robust statistics `star_measure` reads (median / MAD /
@@ -25,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   noise-scale factors), from Athenaeum's `integration::stats`.
 - Features **`serde`** (off by default: `Serialize` / `Deserialize` on the
   `star_measure` and `stats` types, the wire Athenaeum stores) and
-  **`test-support`** (`StarFit::test_at` for downstream tests).
+  **`test-support`** (`StarFit::test_at` and `PlanePrep::for_pin` for
+  downstream tests).
 - `astroimage::lm_counters` under `lm-counters`, without `debug-pipeline`.
 - **`processing::cfa`**: green-site helpers for measuring a raw CFA mosaic
   without interpolation — `green_mask` (`true` on the green sites, file row
@@ -60,7 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `docs/platesolving.md` no longer says solvemyastro drives `platesolving`.
   - The Athenaeum integration guide marks which of its sections still apply.
   - The plan to move `star_measure` into rustafits is
-    `docs/superpowers/plans/2026-11-03-star-measure-port.md`.
+    `docs/superpowers/plans/2026-11-03-star-measure-port.md`; its bit-identity
+    tools are in `scripts/star_measure_port/` (`port_digest.rs`, the digest of
+    every entry point, and `mac_check.sh`, the aarch64 gate run).
 
 ## [1.6.0] — 2026-10-24
 
