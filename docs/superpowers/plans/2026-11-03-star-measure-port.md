@@ -184,13 +184,22 @@ Taken by the owner on 2026-11-03, every one as recommended.
   - JSON / CSV carry every field;
   - `--max-stars` becomes the budget (default 500);
   - new `--detection-threshold` (σ, default 6.0, range 2–20) and `--psf-model moffat4|auto`.
-- **D-8 Version.**
-  - 1.7.0: phases 1–2, additive;
-  - 1.8.0: phase 5, with a **Changed** entry for the CLI's numbers. Phase 4's rustafits additions ride with it,
-    unless Athenaeum needs them first; then they get a minor release of their own;
+- **D-8 Version.** Releases are cut from `main` only, so they follow the integration merges of D-10 (owner,
+  2026-11-04; was "1.7.0 after phases 1–2"):
+  - 1.7.0: the first merge of `star-measure-port` into `main`, phases 1–3 at least;
+  - 1.8.0: phase 5, with a **Changed** entry for the CLI's numbers, if it reaches `main` in a later merge (if it
+    lands in the same merge as phases 1–3, one 1.7.0 carries both, the **Changed** entry included). Phase 4's
+    rustafits additions ride with phase 5;
   - 2.0: phase 6, the removal under D-6.
 - **D-9 History.** The files are copied at a fixed Athenaeum sha, named in the commit message, rather than imported
   with history. Athenaeum's history stays the record, and its plans and rulings cite Athenaeum shas anyway.
+- **D-10 Branching** (owner, 2026-11-04). The port is collected on the integration branch `star-measure-port`, cut
+  from `main` at 7f824e1:
+  - every phase is a PR into it (squash-merged there, so each phase is one commit);
+  - `main` gets it with a merge commit, never a squash, once phase 3 has passed its gates on the owner's Mac (the
+    lab scorecard, the aarch64 pins). A squash would orphan the commits Athenaeum's submodule pins, while a merge
+    commit keeps them reachable from `main`;
+  - fixes that land on `main` meanwhile are merged into `star-measure-port`, never rebased onto it.
 
 ## 5. Gates
 
@@ -277,12 +286,13 @@ Source sha: Athenaeum `main` 0b6fb183 (owner, 2026-11-04; the freeze of G-2 runs
     outcome for outcome; the digest (31 MB, ~15k fits on the real frames) is byte-identical between Athenaeum's copy
     (dev profile, opt-level 2) and rustafits' (release, LTO), sha256 `4f907cab…`. Renders, `info` and `analyze` are
     byte-identical to `main`; the release binary grows by 752 bytes (the CLI does not call the module yet).
-- Release 1.7.0, or have Athenaeum pin the git sha.
+- No release (D-8, D-10): Athenaeum's phase-3 branch pins the `star-measure-port` commit.
 
 ### Phase 3: Athenaeum switches the module (Athenaeum branch)
 
-- [ ] 3.1 Bump the submodule with `default-features = false, features = ["serde"]`, plus `test-support` for its
-  tests.
+- [ ] 3.1 Bump the submodule to `star-measure-port` with `default-features = false, features = ["serde"]`, plus
+  `test-support` for its tests. Athenaeum's `main` takes the bump only after `star-measure-port` has been merged
+  into rustafits' `main` (D-10), so the pinned commit is reachable from rustafits' `main`.
 - [ ] 3.2 Code moves:
   - `pub use astroimage::star_measure;` in `lib.rs`;
   - delete `src/star_measure/`;
