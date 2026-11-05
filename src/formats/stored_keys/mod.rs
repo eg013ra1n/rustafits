@@ -10,8 +10,10 @@
 //!
 //! - **FITS**: [`FitsHeader`], Athenaeum's `fits_parser/fits_header_reader.rs` at e6344ddd, file and tests unchanged
 //!   (see its own doc). `star_measure::raw` reads `BITPIX`, `BZERO`, `BSCALE`, `DATAMAX` and `EGAIN` through its
-//!   `get_i32` / `get_f64`. The FITS reader folds `XBAYROFF` / `YBAYROFF` into the pattern itself (its own card
-//!   rules, unchanged), as it did for Athenaeum's Analysis.
+//!   `get_i32` / `get_f64`. The FITS reader (`formats::fits`) reads `XBAYROFF` / `YBAYROFF` through `get_i32` too,
+//!   over the header blocks it has read (`from_bytes`), and folds them into the pattern (since 1.8.0, port plan
+//!   phase 5; before, it read them by its own card rule, which gave other values for a quoted, a repeated or a
+//!   lower-case card). A header `from_bytes` cannot parse keeps the reader's own values and logs a warning.
 //! - **XISF**: Athenaeum turns the XML into text first, then reads the text. [`xisf_keyword_text`] is the
 //!   `<FITSKeyword>` loop of `fits_parser::extract_xisf_header` (`NAME = value` lines: Empty elements only, the raw
 //!   attribute value, one pair of quotes stripped); [`parse_stored_xisf_keys`] is `stored_header::parse_stored_header_keys`

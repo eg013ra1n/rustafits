@@ -496,6 +496,7 @@ impl ImageAnalyzer {
     }
 
     /// Analyze a FITS or XISF image file.
+    #[deprecated(since = "1.8.0", note = "use star_measure::analysis_mode (raw::read_raw_frame, measure_raw_frame, FrameSummary); removed in 2.0")]
     pub fn analyze<P: AsRef<Path>>(&self, path: P) -> Result<AnalysisResult> {
         let path = path.as_ref();
         match &self.thread_pool {
@@ -510,6 +511,7 @@ impl ImageAnalyzer {
     /// `width`: image width.
     /// `height`: image height.
     /// `channels`: 1 for mono, 3 for RGB.
+    #[deprecated(since = "1.8.0", note = "use star_measure::analysis_mode (raw::read_raw_frame, measure_raw_frame, FrameSummary); removed in 2.0")]
     pub fn analyze_data(
         &self,
         data: &[f32],
@@ -529,6 +531,7 @@ impl ImageAnalyzer {
     ///
     /// Accepts `ImageMetadata` and borrows `PixelData`, handling u16→f32
     /// conversion and green-channel interpolation for OSC images internally.
+    #[deprecated(since = "1.8.0", note = "use star_measure::analysis_mode (raw::read_raw_frame, measure_raw_frame, FrameSummary); removed in 2.0")]
     pub fn analyze_raw(
         &self,
         meta: &ImageMetadata,
@@ -545,6 +548,7 @@ impl ImageAnalyzer {
     /// `concurrency` controls how many frames are analyzed simultaneously.
     /// `progress` is called after each frame completes with (completed, total, path).
     /// Returns results in approximate completion order.
+    #[deprecated(since = "1.8.0", note = "use star_measure::analysis_mode (raw::read_raw_frame, measure_raw_frame, FrameSummary); removed in 2.0")]
     pub fn analyze_batch<P, F>(
         &self,
         paths: &[P],

@@ -1,9 +1,171 @@
 # Analysis API Usage Guide
 
-## Quick Start
+The crate has two analyzers.
+
+- **`star_measure::analysis_mode`** is the measurement behind Athenaeum's Analysis
+  tab, and the one `rustafits analyze` and `rustafits convert -a` run. Use it.
+- **`ImageAnalyzer::analyze*`** is the legacy analyzer. It is deprecated since 1.8.0
+  and removed in 2.0. Its guide is [further down](#legacy-analyzer-deprecated-since-180-removed-in-20).
+
+## Star measurement: `analysis_mode`
+
+Reading a file, measuring it and reading the figures are three calls. Nothing is
+configured by a builder: `FrameOptions` has three settings.
 
 ```rust
-use rustafits::ImageAnalyzer;
+use std::path::Path;
+use astroimage::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary};
+use astroimage::star_measure::raw::read_raw_frame;
+
+let mut frame = read_raw_frame(Path::new("light_001.fits"))?;
+frame.drop_unmeasured_planes();
+
+let opts = FrameOptions::default();               // 6.0 σ, Moffat 4, 500 stars
+let pm = measure_raw_frame(&frame, &opts, None);  // None: rayon's global pool
+let s = FrameSummary::from_measurement(&pm, &opts);
+
+println!("Stars detected: {}", s.stars_detected);
+println!("Median FWHM:    {:.2} px", s.median_fwhm);
+println!("Median HFR:     {:.2} px", s.median_hfr);
+println!("Median SNR:     {:.1}", s.median_snr);
+println!("Eccentricity:   {:.3}", s.median_eccentricity);
+println!("SNR weight:     {:.1}", s.snr_weight);
+println!("Frame SNR:      {:.1}", s.frame_snr);
+```
+
+`raw` and `analysis_mode` are the stable entry of `star_measure`. `FrameOptions` and
+`FrameSummary` are `#[non_exhaustive]`, so 1.x can add fields to them. The rest of
+`star_measure` is public but outside that promise.
+
+### 1. Read: `raw::read_raw_frame`
+
+`read_raw_frame(path)` reads a FITS or XISF file as a `RawFrame`:
+
+- `planes`: one plane for a mono file, the mosaic plus its Bayer pattern for a
+  one-shot-color file, or three planes for a file that is already debayered. Values
+  are the file's own ADU, with no stretch and no debayer.
+- `w`, `h`: the size of the stored image. A mosaic keeps its full size.
+- `flip_vertical`: the file is bottom-up. The rows are still in file order.
+- `domain`: the full scale, the clip from `DATAMAX` and the gain from `EGAIN`.
+- `channels`: 1 for mono and mosaic, 3 for a debayered file.
+
+The header facts are read by Athenaeum's own rules, so a malformed value gives the
+same number here as in the Analysis tab. A file that cannot be read is an error that
+names the file.
+
+`frame.drop_unmeasured_planes()` frees the red and blue planes of a debayered file
+(about two thirds of its memory). The measurement uses the green plane only. It does
+nothing for mono and mosaic frames.
+
+### 2. Measure: `measure_raw_frame`
+
+`measure_raw_frame(&frame, &opts, pool)` returns a `PlaneMeasurement`: the star list
+(`pm.stars`), the sky, the noise and the frame statistics. Mono frames are measured as
+they are. A mosaic is measured on its green sites, at its native size, with no
+interpolation. A debayered file is measured on its green plane.
+
+| `FrameOptions` field | Default | Meaning |
+|----------------------|---------|---------|
+| `detection_threshold` | 6.0 | Matched-filter threshold, σ above the noise. Athenaeum accepts 2 to 20 |
+| `psf_model` | `PsfModel::Moffat4` | `Moffat4` fixes beta at 4. `Auto` fits the frame's own beta |
+| `max_stars` | 500 | The budget: the brightest good stars measured over the field |
+
+The struct is `#[non_exhaustive]`, so set fields on the default:
+
+```rust
+use astroimage::star_measure::PsfModel;
+
+let mut opts = FrameOptions::default();
+opts.detection_threshold = 4.0;
+opts.psf_model = PsfModel::Auto;
+opts.max_stars = 1000;
+```
+
+The last argument is `Option<&Arc<rayon::ThreadPool>>`. `None` runs on the global pool.
+To keep several frames from fighting over the cores, pass one shared pool:
+
+```rust
+use std::sync::Arc;
+use astroimage::ThreadPoolBuilder;
+
+let pool = Arc::new(ThreadPoolBuilder::new().num_threads(4).build()?);
+let pm = measure_raw_frame(&frame, &opts, Some(&pool));
+```
+
+### 3. Summarize: `FrameSummary`
+
+`FrameSummary::from_measurement(&pm, &opts)` gives the frame figures:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `stars_detected` | `usize` | Stars the matched filter found, extended objects left out |
+| `median_fwhm`, `median_hfr` | `f64` | Medians in pixels. Good seeing: FWHM 2 to 3 px |
+| `median_eccentricity` | `f64` | 0 = round. Above 0.5 suggests tracking trouble |
+| `median_snr` | `f64` | Median per-star SNR |
+| `median_beta` | `Option<f64>` | The frame's fitted beta under `PsfModel::Auto`, else `None` |
+| `snr_weight` | `f64` | `median(star flux)² / (noise² × background)`, for stacking weights |
+| `psf_signal` | `f64` | Median star amplitude over the noise |
+| `frame_snr` | `f64` | `background / noise` |
+| `background`, `noise` | `f64` | Sky median and noise σ, in ADU |
+| `trail_r_squared` | `f64` | Rayleigh statistic of the star angles. 0 = no preferred direction, 1 = all aligned |
+| `stars_refused` | `usize` | Stars the fit refused |
+| `verdict` | `Option<Verdict>` | `Trailed`, `Defocused` or `NoStars`, else `None` |
+
+The medians, `snr_weight` and `psf_signal` read 0.0 when no fit stands in the frame
+statistic. A frame with a `verdict` has no medians worth showing:
+`rustafits analyze` prints `-` for them.
+
+### The star list and the overlay
+
+`pm.stars` holds one fit per measured star, in file row order (not flipped). A display
+flips them when `frame.flip_vertical` is true. To draw them on a rendered image, build
+a `StarOverlay`:
+
+```rust
+use astroimage::{annotate_image_with, AnnotationConfig, ImageConverter, StarOverlay};
+
+let summary = FrameSummary::from_measurement(&pm, &opts);
+let mut image = ImageConverter::new().process("light_001.fits")?;
+
+let overlay = StarOverlay::from_measurement(frame.w, frame.h, &pm, &summary);
+annotate_image_with(&mut image, &overlay, &AnnotationConfig::default());
+ImageConverter::save_processed(&image, "annotated.jpg", 95)?;
+```
+
+`frame.w` and `frame.h` are the measured grid. For a mosaic the render is half that
+size, and the annotation functions scale the stars onto it. The overlay carries the
+frame's median FWHM too, so `ColorScheme::Fwhm` can color each star by its ratio to
+it. See the [Annotation Documentation](annotation.md) for the three tiers
+(`compute_overlay`, `create_overlay_layer`, `annotate_image_with`) and for building a
+`StarOverlay` from your own star list.
+
+### Many frames
+
+There is no batch call. Run one read, one measurement and one summary per file on your
+own workers, and pass the same shared pool to every `measure_raw_frame`. Keep the
+`FrameSummary` and the star list of each frame, not the `RawFrame`: a 26 MP frame is
+hundreds of MB. On 26 MP frames the CLI peaks near 0.9 GB with one frame at a time and
+near 1.5 GB with two, which is why its `-j` default is 2.
+`examples/analyze_batch.rs` shows the pattern.
+
+### Fast detection
+
+When you need only `(x, y, flux)` centroids, `ImageAnalyzer::detect_fast*` does less work
+(no PSF fits, no SNR, no verdicts) and is not deprecated. See the README's "Fast star detection".
+
+---
+
+## Legacy analyzer (deprecated since 1.8.0, removed in 2.0)
+
+`ImageAnalyzer::analyze`, `analyze_data`, `analyze_raw` and `analyze_batch` are
+`#[deprecated]`. They keep their old numbers and their old API in 1.x. The numbers are
+not the Analysis tab's: a different detector, a different fit and a different
+statistic. Everything below describes them.
+
+### Quick Start
+
+```rust
+use astroimage::ImageAnalyzer;
 
 let result = ImageAnalyzer::new()
     .analyze("light_001.fits")?;
@@ -22,7 +184,7 @@ println!("Frame SNR:      {:.1}", result.frame_snr);
 `analyze()` accepts any path to a FITS or XISF file. It handles byte-swap,
 u16-to-f32 conversion, and debayering (for OSC/Bayer images) automatically.
 
-## Configuration
+### Configuration
 
 `ImageAnalyzer` uses a builder pattern. All settings have sensible defaults;
 override only what you need.
@@ -36,7 +198,7 @@ let analyzer = ImageAnalyzer::new()
 let result = analyzer.analyze("light_001.fits")?;
 ```
 
-### Builder Methods
+#### Builder Methods
 
 | Method | Default | Description |
 |--------|---------|-------------|
@@ -56,7 +218,7 @@ let result = analyzer.analyze("light_001.fits")?;
 | `with_centroid_refine(bool)` | `false` | Refine each fast-detection centroid with the Moffat LM and fill `sx`/`sy`/`fwhm` on `FastStar`. Off by default so `detect_fast` output stays byte-identical; per-star gates (SNR < 10, non-physical fit, centre moved > 2 px) keep the pass-1 centroid. |
 | `with_thread_pool(Arc<ThreadPool>)` | Global rayon pool | Route all parallel work through a custom rayon thread pool. |
 
-### When to Adjust
+#### When to Adjust
 
 - **Crowded fields** — lower `detection_sigma` to 3.0, raise `max_stars` to 500+.
 - **Sparse fields / short exposures** — lower `detection_sigma` to 3.0-4.0 to pick up faint stars.
@@ -66,12 +228,12 @@ let result = analyzer.analyze("light_001.fits")?;
 - **MRS wavelet layers** — default 0 uses fast MAD noise. Set to 4 for MRS wavelet on nebula-rich fields where MAD may overestimate noise.
 - **OSC images** — green-channel interpolation and green-pixel-only fitting are applied automatically. No configuration needed.
 
-## Analyzing Raw Data
+### Analyzing Raw Data
 
 If you already have pixel data in memory, use `analyze_data()` to skip file I/O:
 
 ```rust
-use rustafits::ImageAnalyzer;
+use astroimage::ImageAnalyzer;
 
 // Planar f32 data in ADU range [0, 65535]
 // For 3-channel: layout is RRRGGGBBB (channel planes stored contiguously)
@@ -88,12 +250,12 @@ let result = ImageAnalyzer::new()
 in planar f32 format with values in the 0-65535 ADU range. Channel count must
 be 1 (mono) or 3 (RGB in planar RRRGGGBBB layout).
 
-## Batch Analysis
+### Batch Analysis
 
 Use `analyze_batch()` to process multiple files with internal worker orchestration:
 
 ```rust
-use rustafits::ImageAnalyzer;
+use astroimage::ImageAnalyzer;
 
 let analyzer = ImageAnalyzer::new()
     .with_thread_pool(pool.clone());
@@ -115,7 +277,7 @@ for result in results {
 }
 ```
 
-## Arcsecond Output (with_optics)
+### Arcsecond Output (with_optics)
 
 When optical parameters are known, FWHM and HFR can be reported in arcseconds:
 
@@ -128,9 +290,9 @@ let result = ImageAnalyzer::new()
 println!("FWHM: {:.2}\"", result.median_fwhm);
 ```
 
-## Reading Results
+### Reading Results
 
-### `AnalysisResult`
+#### `AnalysisResult`
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -155,7 +317,7 @@ println!("FWHM: {:.2}\"", result.median_fwhm);
 | `possibly_trailed` | `bool` | True if the image is likely trailed (R² above threshold or eccentricity-gated Rayleigh fires). |
 | `stage_timing` | `StageTiming` | Per-stage timing in milliseconds (background, detection, calibration, measurement, SNR, etc.). |
 
-### `StarMetrics`
+#### `StarMetrics`
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -172,7 +334,7 @@ println!("FWHM: {:.2}\"", result.median_fwhm);
 | `beta` | `Option<f32>` | Moffat beta shape parameter. `None` if Gaussian/moments fit was used. |
 | `fit_method` | `FitMethod` | Which PSF fitting method produced this measurement: `FreeMoffat`, `FixedMoffat`, `Gaussian`, or `Moments`. |
 
-## Thread Pool Usage
+### Thread Pool Usage
 
 By default, parallel work uses the global rayon thread pool. To control
 concurrency (e.g., to limit CPU usage or run multiple analyses concurrently),
@@ -180,7 +342,7 @@ pass a custom pool:
 
 ```rust
 use std::sync::Arc;
-use rustafits::{ImageAnalyzer, ThreadPoolBuilder};
+use astroimage::{ImageAnalyzer, ThreadPoolBuilder};
 
 let pool = Arc::new(
     ThreadPoolBuilder::new()
@@ -198,7 +360,7 @@ let result = analyzer.analyze("light_001.fits")?;
 `ThreadPool` and `ThreadPoolBuilder` are re-exported from `rayon` by
 `rustafits`, so you don't need to add `rayon` as a direct dependency.
 
-## Star Annotation Overlay
+### Star Annotation Overlay
 
 Analysis results can be visualized as color-coded ellipses on converted images.
 See the [Annotation Documentation](annotation.md) for the full API reference,
@@ -208,7 +370,7 @@ and configurable color thresholds.
 Quick example:
 
 ```rust
-use rustafits::{ImageConverter, ImageAnalyzer, annotate_image, AnnotationConfig};
+use astroimage::{ImageConverter, ImageAnalyzer, annotate_image, AnnotationConfig};
 
 let mut image = ImageConverter::new().process("light.fits")?;
 let result = ImageAnalyzer::new().analyze("light.fits")?;

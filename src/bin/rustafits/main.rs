@@ -5,6 +5,7 @@ mod analyze;
 mod batch;
 mod convert;
 mod info;
+mod measure;
 mod report;
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -17,7 +18,7 @@ Examples:
   rustafits night1/ -r -o out/ -n           # a tree, mirrored; skip existing
   rustafits m31.xisf -o - | viewer -        # JPEG on stdout
   rustafits info night1/                    # exposure, filter, gain, temp per file
-  rustafits analyze night1/ --sort fwhm     # stars, FWHM, HFR, eccentricity, SNR
+  rustafits analyze night1/ --sort fwhm     # Analysis-tab star metrics, sharpest first
   rustafits completions zsh > ~/.zfunc/_rustafits";
 
 #[derive(Parser, Debug)]
@@ -44,7 +45,7 @@ enum Command {
     Convert(convert::ConvertArgs),
     /// Header summary without reading pixels: size, type, exposure, filter, gain, temperature
     Info(info::InfoArgs),
-    /// Star metrics per frame: stars, FWHM, HFR, eccentricity, SNR (library defaults, as in Athenaeum)
+    /// Star metrics per frame: stars, FWHM, HFR, eccentricity, SNR (Athenaeum's Analysis numbers)
     Analyze(analyze::AnalyzeArgs),
     /// Print a shell completion script (bash, zsh, fish, elvish, powershell)
     Completions {

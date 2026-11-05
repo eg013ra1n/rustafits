@@ -393,14 +393,20 @@ plan section 4, steps 6–7). Branch `feat/star-measure-phase-4` is at 9c5e75d; 
 
 ### Phase 5: rustafits' own consumers
 
-- [ ] 5.1 `rustafits analyze` on `analysis_mode` (D-7):
+The task plan is `docs/superpowers/plans/2026-11-05-star-measure-port-phase-5.md`; each item below names its task.
+Status (2026-11-05): implemented on rustafits' `feat/star-measure-phase-5`; the merge to `main`, the 1.8.0 release and
+Athenaeum's bump (its T7) are pending.
+
+- [x] 5.1 `rustafits analyze` on `analysis_mode` (D-7). Done (T1):
   - `tests/cli.rs` pins the CLI to `measure_raw_frame` + `FrameSummary` instead of `ImageAnalyzer::new().analyze()`;
   - README and CHANGELOG (**Changed**: the numbers).
-- [ ] 5.2 `--annotate`: `annotate.rs` takes `StarMetrics`. Either add an adapter from `StarFit` (x, y, fwhm_x / y,
+- [x] 5.2 `--annotate`: `annotate.rs` takes `StarMetrics`. Either add an adapter from `StarFit` (x, y, fwhm_x / y,
   θ, eccentricity), or keep the legacy analyzer for overlays until D-6. Positions are in file row order, so the
-  render's flip applies, as in Blink.
-- [ ] 5.3 `rustafits-debug`, `docs/usage.md`, `docs/athenaeum-integration.md`, CLAUDE.md.
-- [ ] 5.4 `#[deprecated]` on `ImageAnalyzer::analyze*`, but not on `detect_fast*` (D-6).
+  render's flip applies, as in Blink. Done (T2, T3): a `StarOverlay`, built from the measurement
+  (`StarOverlay::from_measurement`) or from a legacy `AnalysisResult`; the CLI draws the measurement.
+- [x] 5.3 `rustafits-debug`, `docs/usage.md`, `docs/athenaeum-integration.md`, CLAUDE.md. Done (T5, T6).
+- [x] 5.4 `#[deprecated]` on `ImageAnalyzer::analyze*`, but not on `detect_fast*` (D-6). Done (T5).
+- Also in phase 5 (its task plan, P5-7): the FITS reader reads `XBAYROFF` / `YBAYROFF` by Athenaeum's catalog rule (T4).
 
 ### Phase 6 (later, 2.0): remove the legacy full analysis
 

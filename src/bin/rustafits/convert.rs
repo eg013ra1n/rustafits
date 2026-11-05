@@ -13,20 +13,30 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use astroimage::star_measure::analysis_mode::FrameOptions;
 use astroimage::{
-    annotate_image, encode_jpeg, encode_png, AnnotationConfig, ImageAnalyzer, ImageConverter,
-    OutputFormat, PngCompression, ProcessedImage, ThreadPool,
+    annotate_image_with, encode_jpeg, encode_png, AnnotationConfig, ImageConverter, OutputFormat,
+    PngCompression, ProcessedImage, StarOverlay, ThreadPool,
 };
 use clap::{Args, ValueEnum};
 
 use crate::batch::{self, file_name, has_extension, Input, INPUT_EXTENSIONS};
+use crate::measure::{budget_parser, measure_file, report_file_error, warn_ignored, MEASURE_CAP_WHY};
 
 /// Files converted at once when `--jobs` is not given. Every file already uses
 /// all cores for its pixel work; extra jobs mainly overlap the single-threaded
 /// JPEG encoder and file I/O. Measured on 4 cores, 9 real 26 MP frames: plain
-/// conversion 2.1 s at 1 job, 0.84 s at 4 (peak RSS 260 → 650 MB); with
-/// --annotate the analysis saturates the cores by itself, 11.5 s at 1 job,
-/// 8.6 s at 2 or 4, but 1.5 GB at 2 and 2.2 GB at 4 — hence a lower cap.
+/// conversion 2.1 s at 1 job, 0.84 s at 4 (peak RSS 260 → 650 MB).
+///
+/// With --annotate, and for `analyze` (it takes `DEFAULT_MAX_JOBS_ANALYSIS`),
+/// the measurement saturates the cores by itself, so the cap is lower.
+/// Measured with the 1.8.0 measurement (`star_measure::analysis_mode`) on 10
+/// cores, release build, four copies of a 26 MP mono frame: `convert -a` 2.5 s
+/// and 0.86 GB peak RSS at 1 job, 1.9 s and 1.6 GB at 2; `analyze` 2.0 s and
+/// 0.86 GB at 1, 1.7 s and 1.5 GB at 2. `-j 4` measured no faster than `-j 2`
+/// (1.95 s). The bench ran on a loaded machine (load average 6-8), so the times
+/// are approximate; the default of 2 rests on peak RSS, 1.6 GB, under the
+/// 2.25 GB bar (the 1.5 GB the pre-1.8.0 analyzer used at 2 jobs plus half).
 const DEFAULT_MAX_JOBS: usize = 4;
 pub const DEFAULT_MAX_JOBS_ANALYSIS: usize = 2;
 
@@ -94,13 +104,14 @@ pub struct ConvertArgs {
     #[arg(short, long)]
     annotate: bool,
 
-    /// Max stars kept for annotation
-    #[arg(long, default_value_t = 500, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
-    max_stars: u32,
+    /// Star budget for --annotate: the brightest good stars drawn, 10-2000
+    #[arg(long, default_value_t = 500, value_name = "N", value_parser = budget_parser)]
+    max_stars: usize,
 
-    /// Max stars PSF-fitted for annotation (0 = all)
-    #[arg(long, default_value_t = 2000, value_name = "N")]
-    measure_cap: usize,
+    // Flag of the pre-1.8.0 analyzer, kept so old scripts still run (gone in 2.0).
+    /// Ignored since 1.8.0; kept for old scripts (hidden).
+    #[arg(long, value_name = "N", hide = true)]
+    measure_cap: Option<usize>,
 
     /// Per-file details and timings, on stderr (`--log` is an alias)
     #[arg(short, long, alias = "log")]
@@ -183,6 +194,10 @@ struct Tally {
 
 /// `Ok(false)`: the run happened but at least one file failed.
 pub fn run(args: ConvertArgs) -> Result<bool> {
+    // An old script keeps running; the flag is said once, even with --quiet.
+    if args.measure_cap.is_some() {
+        warn_ignored("--measure-cap", MEASURE_CAP_WHY);
+    }
     let jobs = plan(&args)?;
     let pool = batch::thread_pool(args.threads)?;
     let default_jobs = if args.annotate { DEFAULT_MAX_JOBS_ANALYSIS } else { DEFAULT_MAX_JOBS };
@@ -214,7 +229,7 @@ pub fn run(args: ConvertArgs) -> Result<bool> {
                 }
                 Err(e) => {
                     t.failed += 1;
-                    eprintln!("error: {}: {e:#}", job.input.display());
+                    report_file_error(&job.input, e);
                 }
             }
         },
@@ -334,8 +349,11 @@ enum Outcome {
 struct Report {
     width: usize,
     height: usize,
+    /// The render's read of the file. With `--annotate` the measurement reads the file too, before it, and that read
+    /// is inside `analysis`.
     read: Duration,
-    analysis: Option<(Duration, usize, f32)>,
+    /// `--annotate`: the measurement's time (its own read of the file included), the stars detected, the median FWHM.
+    analysis: Option<(Duration, usize, f64)>,
     process: Duration,
     encode: Duration,
     write: Duration,
@@ -374,22 +392,44 @@ fn convert_one(job: &Job, args: &ConvertArgs, pool: &Arc<ThreadPool>) -> Result<
         }
     }
 
+    // The measurement comes first and returns without the planes, so the render's read below starts after they are
+    // freed and the two copies of a 26 MP frame never overlap in memory. (The file is read twice: the measurement's
+    // reader states the ADU facts, the render's does not; the measurement dominates the time.)
+    let measured = if args.annotate {
+        let t = Instant::now();
+        let mut opts = FrameOptions::default();
+        opts.max_stars = args.max_stars;
+        let m = measure_file(&job.input, &opts, pool)?;
+        Some((m, t.elapsed()))
+    } else {
+        None
+    };
+
     let t = Instant::now();
     let (meta, pixels) = ImageConverter::read_raw(&job.input)?;
     let read = t.elapsed();
 
-    let analysis = if args.annotate {
-        let t = Instant::now();
-        let result = ImageAnalyzer::new()
-            .with_max_stars(args.max_stars as usize)
-            .with_measure_cap(args.measure_cap)
-            .with_thread_pool(pool.clone())
-            .analyze_raw(&meta, &pixels)
-            .context("analysis failed")?;
-        Some((result, t.elapsed()))
-    } else {
-        None
-    };
+    // The file is read twice, so check that the render's read describes the frame the measurement read: the rings are
+    // placed on the measurement's grid and scaled to the render's size, so a file rewritten between the two reads (a
+    // capture program writing into the folder) would misplace them. The overlay is flipped by the render's own flag
+    // (`annotate_image_with`), so the flag is compared only as a sign of that rewrite. Unreachable without rewriting
+    // the file mid-run, so there is no test.
+    if let Some((m, _)) = &measured {
+        if (m.frame_w, m.frame_h, m.flip_vertical) != (meta.width, meta.height, meta.flip_vertical) {
+            let rows = |flip: bool| if flip { "bottom-up" } else { "top-down" };
+            bail!(
+                "{}: the file changed between the measurement's read and the render's \
+                 (measured {}x{}, {}; rendered {}x{}, {})",
+                job.input.display(),
+                m.frame_w,
+                m.frame_h,
+                rows(m.flip_vertical),
+                meta.width,
+                meta.height,
+                rows(meta.flip_vertical),
+            );
+        }
+    }
 
     let mut converter = ImageConverter::new()
         .with_downscale(args.downscale as usize)
@@ -406,8 +446,9 @@ fn convert_one(job: &Job, args: &ConvertArgs, pool: &Arc<ThreadPool>) -> Result<
 
     let t = Instant::now();
     let mut image = converter.process_data(meta, pixels)?;
-    if let Some((result, _)) = &analysis {
-        annotate_image(&mut image, result, &AnnotationConfig::default());
+    if let Some((m, _)) = &measured {
+        let overlay = StarOverlay::from_measurement(m.frame_w, m.frame_h, &m.pm, &m.summary);
+        annotate_image_with(&mut image, &overlay, &AnnotationConfig::default());
     }
     let process = t.elapsed();
 
@@ -429,7 +470,7 @@ fn convert_one(job: &Job, args: &ConvertArgs, pool: &Arc<ThreadPool>) -> Result<
         width: image.width,
         height: image.height,
         read,
-        analysis: analysis.map(|(r, d)| (d, r.stars_detected, r.median_fwhm)),
+        analysis: measured.map(|(m, d)| (d, m.summary.stars_detected, m.summary.median_fwhm)),
         process,
         encode,
         write,

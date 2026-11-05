@@ -1,16 +1,23 @@
 //! `rustafits analyze` — star metrics per frame, for culling subs.
 //!
-//! The analyzer runs with the library defaults (what Athenaeum uses), so the
-//! numbers match Athenaeum's for the same file; only the flags given override.
+//! The numbers are Athenaeum's Analysis numbers: the frame is measured by `star_measure::analysis_mode` with its
+//! defaults (6.0 σ matched-filter threshold, Moffat 4, a budget of 500 stars), so a file reads the same here as in
+//! the Analysis tab; only the flags given override. A frame the module judges trailed, defocused or without stars has
+//! no medians to show: the table prints `-` for them and `--sort` ranks the frame after every other.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use astroimage::{AnalysisResult, ImageAnalyzer};
+use astroimage::star_measure::analysis_mode::{FrameOptions, Verdict};
+use astroimage::star_measure::{PsfModel, DEFAULT_THRESHOLD, MEASURE_VERSION};
 use clap::{Args, ValueEnum};
 
 use crate::batch::{self, file_name};
 use crate::convert::DEFAULT_MAX_JOBS_ANALYSIS;
+use crate::measure::{
+    budget_parser, measure_file, report_file_error, threshold_parser, warn_ignored, Measured, MEASURE_CAP_WHY,
+    NO_DEBAYER_WHY,
+};
 use crate::report::{json_num, json_str, print_csv, print_table};
 
 #[derive(Args, Debug)]
@@ -23,7 +30,7 @@ pub struct AnalyzeArgs {
     #[arg(short, long)]
     recursive: bool,
 
-    /// Sort rows best-first by a metric (default: input order)
+    /// Sort rows best-first by a metric (default: input order); a metric sort puts frames with a verdict last
     #[arg(short, long, value_enum, value_name = "METRIC")]
     sort: Option<SortKey>,
 
@@ -39,13 +46,17 @@ pub struct AnalyzeArgs {
     #[arg(long)]
     csv: bool,
 
-    /// Detection threshold in sigma above background [library default: 5]
-    #[arg(long, value_name = "SIGMA")]
-    sigma: Option<f32>,
+    /// Detection threshold in sigma above the noise, 2-20 [default: 6.0]
+    #[arg(long, value_name = "SIGMA", value_parser = threshold_parser)]
+    detection_threshold: Option<f64>,
 
-    /// Max stars PSF-fitted per frame, 0 = all [library default: 500]
-    #[arg(long, value_name = "N")]
-    measure_cap: Option<usize>,
+    /// Star profile: Moffat with beta fixed at 4, or the frame's own beta
+    #[arg(long, value_enum, value_name = "MODEL", default_value_t = PsfChoice::Moffat4)]
+    psf_model: PsfChoice,
+
+    /// Star budget: the brightest good stars measured per frame, 10-2000
+    #[arg(long, value_name = "N", value_parser = budget_parser, default_value_t = 500)]
+    max_stars: usize,
 
     /// Focal length in mm: adds FWHM/HFR in arcsec (with --pixel-size)
     #[arg(long, value_name = "MM", requires = "pixel_size")]
@@ -54,10 +65,6 @@ pub struct AnalyzeArgs {
     /// Pixel size in µm (binned): adds FWHM/HFR in arcsec (with --focal-length)
     #[arg(long, value_name = "UM", requires = "focal_length")]
     pixel_size: Option<f64>,
-
-    /// Analyze OSC frames on the raw mosaic (faster, less accurate)
-    #[arg(long)]
-    no_debayer: bool,
 
     /// Frames analyzed concurrently [default: min(2, cores, files)]
     #[arg(short, long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
@@ -70,6 +77,46 @@ pub struct AnalyzeArgs {
     /// Errors only: no progress bar
     #[arg(long)]
     quiet: bool,
+
+    // Flags of the pre-1.8.0 analyzer, kept so old scripts still run (gone in 2.0). A clap `alias` cannot tell that
+    // it was used, and the warning needs that, so `--sigma` is an argument of its own.
+    /// Old name of --detection-threshold: another detector since 1.8.0
+    #[arg(long, value_name = "SIGMA", value_parser = threshold_parser, conflicts_with = "detection_threshold", hide = true)]
+    sigma: Option<f64>,
+
+    /// Ignored since 1.8.0; kept for old scripts (hidden).
+    #[arg(long, value_name = "N", hide = true)]
+    measure_cap: Option<usize>,
+
+    /// Ignored since 1.8.0; kept for old scripts (hidden).
+    #[arg(long, hide = true)]
+    no_debayer: bool,
+}
+
+/// `--psf-model`: the two models the Analysis tab offers.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PsfChoice {
+    /// Moffat with beta fixed at 4 (the Analysis tab's default)
+    Moffat4,
+    /// The frame's own beta, fitted
+    Auto,
+}
+
+impl PsfChoice {
+    fn model(self) -> PsfModel {
+        match self {
+            PsfChoice::Moffat4 => PsfModel::Moffat4,
+            PsfChoice::Auto => PsfModel::Auto,
+        }
+    }
+
+    /// The name the flag takes and the `psf_model` column prints.
+    fn name(self) -> &'static str {
+        match self {
+            PsfChoice::Moffat4 => "moffat4",
+            PsfChoice::Auto => "auto",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -90,41 +137,56 @@ enum SortKey {
     Weight,
 }
 
+/// What the printers need besides the rows: the options the numbers were measured with, and the optics.
+#[derive(Clone, Copy)]
+struct Context {
+    detection_threshold: f64,
+    psf: PsfChoice,
+    /// (focal length mm, pixel size µm) when both were given.
+    optics: Option<(f64, f64)>,
+}
+
+type Row = (String, Measured);
+
 pub fn run(args: AnalyzeArgs) -> Result<bool> {
+    // Old scripts keep running; each flag is said once, even with --quiet.
+    if args.sigma.is_some() {
+        eprintln!("warning: --sigma is --detection-threshold since 1.8.0: another detector, default 6.0");
+    }
+    if args.measure_cap.is_some() {
+        warn_ignored("--measure-cap", MEASURE_CAP_WHY);
+    }
+    if args.no_debayer {
+        warn_ignored("--no-debayer", NO_DEBAYER_WHY);
+    }
+
     let inputs = batch::collect_inputs(&args.paths, args.recursive)?;
     let pool = batch::thread_pool(args.threads)?;
     let workers = batch::workers(args.jobs, DEFAULT_MAX_JOBS_ANALYSIS, inputs.len());
     let bar = batch::progress_bar(inputs.len(), args.quiet);
 
-    let mut analyzer = ImageAnalyzer::new().with_thread_pool(pool.clone());
-    if let Some(s) = args.sigma {
-        analyzer = analyzer.with_detection_sigma(s);
-    }
-    if let Some(n) = args.measure_cap {
-        analyzer = analyzer.with_measure_cap(n);
-    }
-    if let (Some(f), Some(p)) = (args.focal_length, args.pixel_size) {
-        analyzer = analyzer.with_optics(f, p);
-    }
-    if args.no_debayer {
-        analyzer = analyzer.without_debayer();
-    }
+    let ctx = Context {
+        detection_threshold: args.detection_threshold.or(args.sigma).unwrap_or(DEFAULT_THRESHOLD),
+        psf: args.psf_model,
+        optics: args.focal_length.zip(args.pixel_size),
+    };
+    let opts = frame_options(&ctx, args.max_stars);
 
     let results = batch::run_parallel(
         &inputs,
         workers,
         &bar,
         |input| file_name(&input.path),
-        |input| analyzer.analyze(&input.path),
+        |input| measure_file(&input.path, &opts, &pool),
         |input, result| {
             if let Err(e) = result {
-                eprintln!("error: {}: {e:#}", input.path.display());
+                report_file_error(&input.path, e);
             }
         },
     );
 
     let ok = results.iter().all(Result::is_ok);
-    let mut rows: Vec<(String, AnalysisResult)> = inputs
+    let mut rows: Vec<Row> = inputs
         .iter()
         .zip(results)
         .filter_map(|(input, r)| r.ok().map(|r| (input.path.display().to_string(), r)))
@@ -136,44 +198,80 @@ pub fn run(args: AnalyzeArgs) -> Result<bool> {
         rows.reverse();
     }
 
-    let arcsec = args.focal_length.is_some();
     if args.json {
-        print_json(&rows);
+        print_json(&rows, &ctx);
     } else if args.csv {
-        let (cols, cells) = full_precision(&rows);
+        let (cols, cells) = full_precision(&rows, &ctx);
         print_csv(&cols, &cells);
     } else {
-        print_summary(&rows, arcsec);
+        print_summary(&rows, &ctx);
     }
     Ok(ok)
 }
 
-/// Best-first; NaN (no stars measured) always last.
-fn sort_rows(rows: &mut [(String, AnalysisResult)], key: SortKey) {
-    let metric = |r: &AnalysisResult| -> f64 {
+/// `FrameOptions` is `#[non_exhaustive]`: the fields are assigned onto its default.
+fn frame_options(ctx: &Context, max_stars: usize) -> FrameOptions {
+    let mut opts = FrameOptions::default();
+    opts.detection_threshold = ctx.detection_threshold;
+    opts.psf_model = ctx.psf.model();
+    opts.max_stars = max_stars;
+    opts
+}
+
+/// Best-first; a frame with a verdict (it has no medians) after every frame without one, in input order.
+fn sort_rows(rows: &mut [Row], key: SortKey) {
+    let metric = |m: &Measured| -> f64 {
+        let s = &m.summary;
         match key {
             SortKey::Name => 0.0,
-            SortKey::Stars => -(r.stars_detected as f64),
-            SortKey::Fwhm => r.median_fwhm as f64,
-            SortKey::Hfr => r.median_hfr as f64,
-            SortKey::Ecc => r.median_eccentricity as f64,
-            SortKey::Snr => -(r.median_snr as f64),
-            SortKey::Weight => -(r.snr_weight as f64),
+            SortKey::Stars => -(s.stars_detected as f64),
+            SortKey::Fwhm => s.median_fwhm,
+            SortKey::Hfr => s.median_hfr,
+            SortKey::Ecc => s.median_eccentricity,
+            SortKey::Snr => -s.median_snr,
+            SortKey::Weight => -s.snr_weight,
         }
     };
     match key {
         SortKey::Name => rows.sort_by(|a, b| a.0.cmp(&b.0)),
-        _ => rows.sort_by(|a, b| {
-            let (x, y) = (metric(&a.1), metric(&b.1));
-            match (x.is_nan(), y.is_nan()) {
-                (false, false) => x.total_cmp(&y),
-                (a_nan, b_nan) => a_nan.cmp(&b_nan),
-            }
+        // `sort_by` is stable: two frames with a verdict compare equal and keep their input order.
+        _ => rows.sort_by(|a, b| match (a.1.summary.verdict.is_some(), b.1.summary.verdict.is_some()) {
+            (false, false) => metric(&a.1).total_cmp(&metric(&b.1)),
+            (a_verdict, b_verdict) => a_verdict.cmp(&b_verdict),
         }),
     }
 }
 
-fn fixed(v: f32, decimals: usize) -> String {
+/// px -> arcsec at the plate scale (the legacy formula); `None` without optics or for a frame with a verdict.
+fn arcsec(px: f64, m: &Measured, optics: Option<(f64, f64)>) -> Option<f64> {
+    let (focal_mm, pixel_um) = optics?;
+    if m.summary.verdict.is_some() || !(focal_mm > 0.0 && pixel_um > 0.0) {
+        return None;
+    }
+    Some(px * (pixel_um / focal_mm * 206.265))
+}
+
+/// The table's VERDICT cell.
+fn verdict_cell(v: Option<Verdict>) -> &'static str {
+    match v {
+        Some(Verdict::Trailed) => "trailed",
+        Some(Verdict::Defocused) => "defocused",
+        Some(Verdict::NoStars) => "no stars",
+        None => "-",
+    }
+}
+
+/// The `frame_verdict` value (Athenaeum's `FrameVerdict`, snake_case); `None` without a verdict.
+fn verdict_key(v: Option<Verdict>) -> Option<&'static str> {
+    match v {
+        Some(Verdict::Trailed) => Some("trailed"),
+        Some(Verdict::Defocused) => Some("defocused"),
+        Some(Verdict::NoStars) => Some("no_stars"),
+        None => None,
+    }
+}
+
+fn fixed(v: f64, decimals: usize) -> String {
     if v.is_finite() {
         format!("{v:.decimals$}")
     } else {
@@ -181,37 +279,46 @@ fn fixed(v: f32, decimals: usize) -> String {
     }
 }
 
-fn print_summary(rows: &[(String, AnalysisResult)], arcsec: bool) {
+fn print_summary(rows: &[Row], ctx: &Context) {
+    let with_arcsec = ctx.optics.is_some();
     let mut cols = vec!["FILE", "STARS", "FWHM", "HFR"];
-    if arcsec {
+    if with_arcsec {
         cols.extend(["FWHM\"", "HFR\""]);
     }
-    cols.extend(["ECC", "SNR", "WEIGHT", "BG", "NOISE", "TRAIL"]);
+    cols.extend(["ECC", "SNR", "WEIGHT", "BG", "NOISE", "VERDICT"]);
     let cells: Vec<Vec<String>> = rows
         .iter()
-        .map(|(file, r)| {
-            let mut row = vec![file.clone(), r.stars_detected.to_string(), fixed(r.median_fwhm, 2), fixed(r.median_hfr, 2)];
-            if arcsec {
-                row.push(r.median_fwhm_arcsec.map_or("-".into(), |v| fixed(v, 2)));
-                row.push(r.median_hfr_arcsec.map_or("-".into(), |v| fixed(v, 2)));
+        .map(|(file, m)| {
+            let s = &m.summary;
+            // No fit stands in the frame statistic: the medians are 0.0 (PC-7), which is not a measurement.
+            let metric = |text: String| if s.verdict.is_some() { "-".to_string() } else { text };
+            let mut row = vec![
+                file.clone(),
+                s.stars_detected.to_string(),
+                metric(fixed(s.median_fwhm, 2)),
+                metric(fixed(s.median_hfr, 2)),
+            ];
+            if with_arcsec {
+                row.push(arcsec(s.median_fwhm, m, ctx.optics).map_or("-".into(), |v| fixed(v, 2)));
+                row.push(arcsec(s.median_hfr, m, ctx.optics).map_or("-".into(), |v| fixed(v, 2)));
             }
             row.extend([
-                fixed(r.median_eccentricity, 3),
-                fixed(r.median_snr, 1),
-                format_weight(r.snr_weight),
-                fixed(r.background, 0),
-                fixed(r.noise, 1),
-                if r.possibly_trailed { "yes".into() } else { "-".into() },
+                metric(fixed(s.median_eccentricity, 3)),
+                metric(fixed(s.median_snr, 1)),
+                metric(format_weight(s.snr_weight)),
+                fixed(s.background, 0),
+                fixed(s.noise, 1),
+                verdict_cell(s.verdict).into(),
             ]);
             row
         })
         .collect();
-    let right: Vec<bool> = cols.iter().map(|c| *c != "FILE" && *c != "TRAIL").collect();
+    let right: Vec<bool> = cols.iter().map(|c| *c != "FILE" && *c != "VERDICT").collect();
     print_table(&cols, &cells, &right);
 }
 
 /// SNR weight spans orders of magnitude between setups; 4 significant digits.
-fn format_weight(v: f32) -> String {
+fn format_weight(v: f64) -> String {
     if !v.is_finite() {
         return "-".into();
     }
@@ -219,74 +326,92 @@ fn format_weight(v: f32) -> String {
     format!("{v:.digits$}")
 }
 
-/// Every scalar metric, unrounded (`{}` of the f32), for CSV.
-fn full_precision(rows: &[(String, AnalysisResult)]) -> (Vec<&'static str>, Vec<Vec<String>>) {
-    let opt = |v: Option<f32>| v.map_or(String::new(), |v| v.to_string());
-    let cols = vec![
-        "file", "width", "height", "stars_detected", "stars_measured", "median_fwhm", "median_hfr",
-        "median_eccentricity", "median_snr", "median_beta", "snr_weight", "psf_signal", "frame_snr",
-        "background", "noise", "trail_r_squared", "possibly_trailed", "median_fwhm_arcsec",
-        "median_hfr_arcsec",
-    ];
+/// The columns of the CSV and the keys of the JSON. The first 19 are the ones this command always had, in their
+/// order, so a script that reads by position keeps working; the six after them are what `analysis_mode` adds.
+const COLUMNS: [&str; 25] = [
+    "file", "width", "height", "stars_detected", "stars_measured", "median_fwhm", "median_hfr",
+    "median_eccentricity", "median_snr", "median_beta", "snr_weight", "psf_signal", "frame_snr",
+    "background", "noise", "trail_r_squared", "possibly_trailed", "median_fwhm_arcsec", "median_hfr_arcsec",
+    "channels", "stars_refused", "frame_verdict", "measure_version", "detection_threshold", "psf_model",
+];
+
+/// Every scalar metric, unrounded (`{}` of the f64), for CSV. A frame with a verdict keeps its 0.0 medians: that is
+/// what Athenaeum stores for it.
+fn full_precision(rows: &[Row], ctx: &Context) -> (Vec<&'static str>, Vec<Vec<String>>) {
+    let opt = |v: Option<f64>| v.map_or(String::new(), |v| v.to_string());
     let cells = rows
         .iter()
-        .map(|(file, r)| {
+        .map(|(file, m)| {
+            let s = &m.summary;
             vec![
                 file.clone(),
-                r.width.to_string(),
-                r.height.to_string(),
-                r.stars_detected.to_string(),
-                r.stars_measured.to_string(),
-                r.median_fwhm.to_string(),
-                r.median_hfr.to_string(),
-                r.median_eccentricity.to_string(),
-                r.median_snr.to_string(),
-                opt(r.median_beta),
-                r.snr_weight.to_string(),
-                r.psf_signal.to_string(),
-                r.frame_snr.to_string(),
-                r.background.to_string(),
-                r.noise.to_string(),
-                r.trail_r_squared.to_string(),
-                r.possibly_trailed.to_string(),
-                opt(r.median_fwhm_arcsec),
-                opt(r.median_hfr_arcsec),
+                m.frame_w.to_string(),
+                m.frame_h.to_string(),
+                s.stars_detected.to_string(),
+                m.pm.stars.len().to_string(),
+                s.median_fwhm.to_string(),
+                s.median_hfr.to_string(),
+                s.median_eccentricity.to_string(),
+                s.median_snr.to_string(),
+                opt(s.median_beta),
+                s.snr_weight.to_string(),
+                s.psf_signal.to_string(),
+                s.frame_snr.to_string(),
+                s.background.to_string(),
+                s.noise.to_string(),
+                s.trail_r_squared.to_string(),
+                m.pm.trailed.to_string(),
+                opt(arcsec(s.median_fwhm, m, ctx.optics)),
+                opt(arcsec(s.median_hfr, m, ctx.optics)),
+                m.channels.to_string(),
+                s.stars_refused.to_string(),
+                verdict_key(s.verdict).unwrap_or_default().to_string(),
+                MEASURE_VERSION.to_string(),
+                ctx.detection_threshold.to_string(),
+                ctx.psf.name().to_string(),
             ]
         })
         .collect();
-    (cols, cells)
+    (COLUMNS.to_vec(), cells)
 }
 
-fn print_json(rows: &[(String, AnalysisResult)]) {
-    let num = |v: f32| json_num(v as f64);
-    let opt = |v: Option<f32>| v.map_or("null".to_string(), |v| json_num(v as f64));
+fn print_json(rows: &[Row], ctx: &Context) {
+    let opt = |v: Option<f64>| v.map_or("null".to_string(), json_num);
     println!("[");
-    for (i, (file, r)) in rows.iter().enumerate() {
+    for (i, (file, m)) in rows.iter().enumerate() {
+        let s = &m.summary;
         println!(
             "  {{\"file\": {}, \"width\": {}, \"height\": {}, \"stars_detected\": {}, \"stars_measured\": {}, \
              \"median_fwhm\": {}, \"median_hfr\": {}, \"median_eccentricity\": {}, \"median_snr\": {}, \
              \"median_beta\": {}, \"snr_weight\": {}, \"psf_signal\": {}, \"frame_snr\": {}, \
              \"background\": {}, \"noise\": {}, \"trail_r_squared\": {}, \"possibly_trailed\": {}, \
-             \"median_fwhm_arcsec\": {}, \"median_hfr_arcsec\": {}}}{}",
+             \"median_fwhm_arcsec\": {}, \"median_hfr_arcsec\": {}, \"channels\": {}, \"stars_refused\": {}, \
+             \"frame_verdict\": {}, \"measure_version\": {}, \"detection_threshold\": {}, \"psf_model\": {}}}{}",
             json_str(file),
-            r.width,
-            r.height,
-            r.stars_detected,
-            r.stars_measured,
-            num(r.median_fwhm),
-            num(r.median_hfr),
-            num(r.median_eccentricity),
-            num(r.median_snr),
-            opt(r.median_beta),
-            num(r.snr_weight),
-            num(r.psf_signal),
-            num(r.frame_snr),
-            num(r.background),
-            num(r.noise),
-            num(r.trail_r_squared),
-            r.possibly_trailed,
-            opt(r.median_fwhm_arcsec),
-            opt(r.median_hfr_arcsec),
+            m.frame_w,
+            m.frame_h,
+            s.stars_detected,
+            m.pm.stars.len(),
+            json_num(s.median_fwhm),
+            json_num(s.median_hfr),
+            json_num(s.median_eccentricity),
+            json_num(s.median_snr),
+            opt(s.median_beta),
+            json_num(s.snr_weight),
+            json_num(s.psf_signal),
+            json_num(s.frame_snr),
+            json_num(s.background),
+            json_num(s.noise),
+            json_num(s.trail_r_squared),
+            m.pm.trailed,
+            opt(arcsec(s.median_fwhm, m, ctx.optics)),
+            opt(arcsec(s.median_hfr, m, ctx.optics)),
+            m.channels,
+            s.stars_refused,
+            verdict_key(s.verdict).map_or("null".to_string(), json_str),
+            MEASURE_VERSION,
+            json_num(ctx.detection_threshold),
+            json_str(ctx.psf.name()),
             if i + 1 < rows.len() { "," } else { "" }
         );
     }

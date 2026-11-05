@@ -2,8 +2,9 @@
 //! plan phase 4, ruling R-P4-C1): the header parsing, the card rules (`= ` in columns 9-10, HIERARCH, CONTINUE with a
 //! trailing `&`, COMMENT / HISTORY), the first occurrence of a keyword winning, and the `f64` / `i32` getters with the
 //! Fortran `D` exponent. Only the visibility changed, plus the `dead_code` allowance below: the members this crate
-//! does not call (`get_str`, `to_header_text`, the raw cards, `from_bytes`) are kept so that the file stays Athenaeum's
-//! verbatim. The unit tests are Athenaeum's, bodies unchanged.
+//! does not call (`get_str`, `to_header_text`, the raw cards) are kept so that the file stays Athenaeum's verbatim.
+//! `from_bytes` is called by `formats::fits`, which reads `XBAYROFF` / `YBAYROFF` through it (since 1.8.0). The unit
+//! tests are Athenaeum's, bodies unchanged.
 
 #![allow(dead_code)]
 
