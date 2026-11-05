@@ -16,6 +16,7 @@ use crate::batch::{self, file_name};
 use crate::convert::DEFAULT_MAX_JOBS_ANALYSIS;
 use crate::measure::{
     budget_parser, measure_file, report_file_error, threshold_parser, warn_ignored, Measured, MEASURE_CAP_WHY,
+    NO_DEBAYER_WHY,
 };
 use crate::report::{json_num, json_str, print_csv, print_table};
 
@@ -83,11 +84,11 @@ pub struct AnalyzeArgs {
     #[arg(long, value_name = "SIGMA", value_parser = threshold_parser, conflicts_with = "detection_threshold", hide = true)]
     sigma: Option<f64>,
 
-    /// Ignored since 1.8.0: the star budget is --max-stars
+    /// Ignored since 1.8.0; kept for old scripts (hidden).
     #[arg(long, value_name = "N", hide = true)]
     measure_cap: Option<usize>,
 
-    /// Ignored since 1.8.0: a mosaic is measured on its green sites
+    /// Ignored since 1.8.0; kept for old scripts (hidden).
     #[arg(long, hide = true)]
     no_debayer: bool,
 }
@@ -156,7 +157,7 @@ pub fn run(args: AnalyzeArgs) -> Result<bool> {
         warn_ignored("--measure-cap", MEASURE_CAP_WHY);
     }
     if args.no_debayer {
-        warn_ignored("--no-debayer", "a mosaic is measured on its green sites");
+        warn_ignored("--no-debayer", NO_DEBAYER_WHY);
     }
 
     let inputs = batch::collect_inputs(&args.paths, args.recursive)?;

@@ -39,12 +39,31 @@ fn write_fits(path: &Path, w: usize, h: usize, bayer: Option<&str>) {
 /// A star field the analyzer measures: round Gaussian stars of width `sigma`
 /// on a 24 px grid over a noisy background, plus header keywords.
 fn write_star_field(path: &Path, sigma: f64, extra: &[String]) {
+    write_fits_with(path, 320, 240, extra, |x, y| star_field_pixel(x, y, sigma));
+}
+
+fn star_field_pixel(x: usize, y: usize, sigma: f64) -> f64 {
+    let noise = (((x * 7919 + y * 104_729) % 61) as f64 - 30.0) * 1.5;
+    let (cx, cy) = (((x / 24) * 24 + 12) as f64, ((y / 24) * 24 + 12) as f64);
+    let amp = 4000.0 + ((x / 24 * 7 + y / 24 * 13) % 9) as f64 * 1500.0;
+    let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
+    1000.0 + noise + amp * (-r2 / (2.0 * sigma * sigma)).exp()
+}
+
+/// [`write_star_field`] plus faint stars on the grid's corners, between the bright ones (12 px from the nearest), with
+/// amplitudes from 40 to 160 ADU above the background in nine steps: the detection threshold decides how many of them
+/// are found, so a test of the threshold can see it reach the measurement.
+fn write_star_field_with_faint_stars(path: &Path, sigma: f64, extra: &[String]) {
     write_fits_with(path, 320, 240, extra, |x, y| {
-        let noise = (((x * 7919 + y * 104_729) % 61) as f64 - 30.0) * 1.5;
-        let (cx, cy) = (((x / 24) * 24 + 12) as f64, ((y / 24) * 24 + 12) as f64);
-        let amp = 4000.0 + ((x / 24 * 7 + y / 24 * 13) % 9) as f64 * 1500.0;
-        let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
-        1000.0 + noise + amp * (-r2 / (2.0 * sigma * sigma)).exp()
+        let (i, j) = ((x + 12) / 24, (y + 12) / 24);
+        let faint = if i >= 1 && j >= 1 && i * 24 < 320 && j * 24 < 240 {
+            let amp = 40.0 + ((i * 5 + j * 3) % 9) as f64 * 15.0;
+            let r2 = (x as f64 - (i * 24) as f64).powi(2) + (y as f64 - (j * 24) as f64).powi(2);
+            amp * (-r2 / (2.0 * sigma * sigma)).exp()
+        } else {
+            0.0
+        };
+        star_field_pixel(x, y, sigma) + faint
     });
 }
 
@@ -351,6 +370,13 @@ fn frame_options(detection_threshold: f64, psf_model: PsfModel, max_stars: usize
     opts
 }
 
+/// `stars_detected` of the library's measurement of `path` at `threshold` sigma: the cell a threshold that reaches
+/// the detector moves. A test that sends a non-default threshold through the CLI first asserts that this differs from
+/// the default's, or it would pass with the threshold dropped on the way.
+fn detected_at(path: &Path, threshold: f64) -> usize {
+    lib_measure(path, &frame_options(threshold, PsfModel::Moffat4, 500)).2.stars_detected
+}
+
 /// The CSV row the library's numbers make (no optics: the two arcsec cells are empty), cell by cell as
 /// `f64::to_string()`. `file` is the first cell as the CLI prints it.
 fn lib_row(file: &str, path: &Path, opts: &FrameOptions, psf_model: &str) -> Vec<String> {
@@ -441,7 +467,7 @@ fn analyze_reports_exactly_what_the_library_measures() {
 #[test]
 fn analyze_options_reach_the_measurement() {
     let dir = scratch("analyze-options");
-    write_star_field(&dir.join("sharp.fits"), 1.2, &[]);
+    write_star_field_with_faint_stars(&dir.join("sharp.fits"), 1.2, &[]);
     let path = dir.join("sharp.fits");
 
     // --psf-model auto: the frame's own beta, whatever the library says (Some only for a fitted source).
@@ -451,7 +477,11 @@ fn analyze_options_reach_the_measurement() {
     let (_, _, s) = lib_measure(&path, &auto);
     eprintln!("median_beta under auto on sharp.fits: {:?}", s.median_beta);
 
-    // --detection-threshold: the library's detection at 12.0.
+    // --detection-threshold: the library's detection at 12.0. The field must find a different number of stars at 12
+    // than at 6, or the comparison below could not see the threshold reach the measurement.
+    let (at_6, at_12) = (detected_at(&path, 6.0), detected_at(&path, 12.0));
+    eprintln!("stars_detected on sharp.fits: {at_6} at 6.0, {at_12} at 12.0");
+    assert_ne!(at_6, at_12, "the fixture does not tell 6 sigma from 12");
     let high = frame_options(12.0, PsfModel::Moffat4, 500);
     let (_, rows) = analyze_csv(&dir, &["sharp.fits", "--detection-threshold", "12"]);
     assert_row_eq(&rows[0], &lib_row("sharp.fits", &path, &high, "moffat4"), "--detection-threshold 12");
@@ -549,7 +579,14 @@ fn a_frame_with_a_verdict_prints_dashes_and_sorts_last() {
 #[test]
 fn old_flags_still_run_with_a_warning() {
     let dir = scratch("analyze-old-flags");
-    write_star_field(&dir.join("sharp.fits"), 1.2, &[]);
+    write_star_field_with_faint_stars(&dir.join("sharp.fits"), 1.2, &[]);
+
+    // The field must find a different number of stars at 8 than at 6, or the comparison below could not see the
+    // threshold reach the measurement.
+    let path = dir.join("sharp.fits");
+    let (at_6, at_8) = (detected_at(&path, 6.0), detected_at(&path, 8.0));
+    eprintln!("stars_detected on sharp.fits: {at_6} at 6.0, {at_8} at 8.0");
+    assert_ne!(at_6, at_8, "the fixture does not tell 6 sigma from 8");
 
     let o = run(&dir, &["analyze", "sharp.fits", "--sigma", "8", "--measure-cap", "0", "--no-debayer", "--csv", "--quiet"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));

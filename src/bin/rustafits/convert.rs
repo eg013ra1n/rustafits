@@ -32,10 +32,11 @@ use crate::measure::{budget_parser, measure_file, report_file_error, warn_ignore
 /// the measurement saturates the cores by itself, so the cap is lower.
 /// Measured with the 1.8.0 measurement (`star_measure::analysis_mode`) on 10
 /// cores, release build, four copies of a 26 MP mono frame: `convert -a` 2.5 s
-/// and 0.86 GB peak RSS at 1 job, 1.9 s and 1.6 GB at 2, 1.8 s and 2.1 GB at 3
-/// or 4; `analyze` 2.0 s and 0.86 GB at 1, 1.7 s and 1.5 GB at 2. The jobs
-/// beyond 2 buy under 10 % and cost 0.5 GB, so the default stays 2: its peak
-/// is under 2.25 GB, the 1.5 GB the pre-1.8.0 analyzer used at 2 jobs plus half.
+/// and 0.86 GB peak RSS at 1 job, 1.9 s and 1.6 GB at 2; `analyze` 2.0 s and
+/// 0.86 GB at 1, 1.7 s and 1.5 GB at 2. `-j 4` measured no faster than `-j 2`
+/// (1.95 s). The bench ran on a loaded machine (load average 6-8), so the times
+/// are approximate; the default of 2 rests on peak RSS, 1.6 GB, under the
+/// 2.25 GB bar (the 1.5 GB the pre-1.8.0 analyzer used at 2 jobs plus half).
 const DEFAULT_MAX_JOBS: usize = 4;
 pub const DEFAULT_MAX_JOBS_ANALYSIS: usize = 2;
 
@@ -108,7 +109,7 @@ pub struct ConvertArgs {
     max_stars: usize,
 
     // Flag of the pre-1.8.0 analyzer, kept so old scripts still run (gone in 2.0).
-    /// Ignored since 1.8.0: the star budget is --max-stars
+    /// Ignored since 1.8.0; kept for old scripts (hidden).
     #[arg(long, value_name = "N", hide = true)]
     measure_cap: Option<usize>,
 
@@ -408,14 +409,24 @@ fn convert_one(job: &Job, args: &ConvertArgs, pool: &Arc<ThreadPool>) -> Result<
     let (meta, pixels) = ImageConverter::read_raw(&job.input)?;
     let read = t.elapsed();
 
-    // The star positions are in file row order and the render flips by the file's own flag: the two readers must
-    // agree, or the rings would be mirrored.
+    // The file is read twice, so check that the render's read describes the frame the measurement read: the rings are
+    // placed on the measurement's grid and scaled to the render's size, so a file rewritten between the two reads (a
+    // capture program writing into the folder) would misplace them. The overlay is flipped by the render's own flag
+    // (`annotate_image_with`), so the flag is compared only as a sign of that rewrite. Unreachable without rewriting
+    // the file mid-run, so there is no test.
     if let Some((m, _)) = &measured {
-        if m.flip_vertical != meta.flip_vertical {
+        if (m.frame_w, m.frame_h, m.flip_vertical) != (meta.width, meta.height, meta.flip_vertical) {
+            let rows = |flip: bool| if flip { "bottom-up" } else { "top-down" };
             bail!(
-                "cannot place the stars: the measurement reads the rows {} and the render {}",
-                if m.flip_vertical { "bottom-up" } else { "top-down" },
-                if meta.flip_vertical { "bottom-up" } else { "top-down" },
+                "{}: the file changed between the measurement's read and the render's \
+                 (measured {}x{}, {}; rendered {}x{}, {})",
+                job.input.display(),
+                m.frame_w,
+                m.frame_h,
+                rows(m.flip_vertical),
+                meta.width,
+                meta.height,
+                rows(meta.flip_vertical),
             );
         }
     }

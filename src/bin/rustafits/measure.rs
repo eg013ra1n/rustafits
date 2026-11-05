@@ -19,6 +19,9 @@ const MAX_BUDGET: usize = 2000;
 /// Why `--measure-cap` does nothing, for the one notice both commands print (see [`warn_ignored`]).
 pub(crate) const MEASURE_CAP_WHY: &str = "the star budget is --max-stars";
 
+/// Why `--no-debayer` does nothing on `analyze`: a mosaic is measured on its green sites, not on a debayered image.
+pub(crate) const NO_DEBAYER_WHY: &str = "a mosaic is measured on its green sites";
+
 /// One file, measured: what the commands read off it. The planes are not kept (a 26 MP frame is hundreds of MB), only
 /// the frame's geometry the star positions need.
 pub(crate) struct Measured {
@@ -36,8 +39,11 @@ pub(crate) struct Measured {
 pub(crate) fn measure_file(path: &Path, opts: &FrameOptions, pool: &Arc<ThreadPool>) -> Result<Measured> {
     let mut frame = read_raw_frame(path)?;
     frame.drop_unmeasured_planes();
-    let pm = measure_raw_frame(&frame, opts, Some(pool));
+    let mut pm = measure_raw_frame(&frame, opts, Some(pool));
     let summary = FrameSummary::from_measurement(&pm, opts);
+    // The seeds are not kept: no command reads them (`stars_detected` is in the summary) and a dense frame has tens
+    // of thousands, about a megabyte per frame held until the last file is printed.
+    pm.detected = Vec::new();
     Ok(Measured {
         frame_w: frame.w,
         frame_h: frame.h,
