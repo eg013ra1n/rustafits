@@ -1,34 +1,41 @@
 # Athenaeum Integration Guide
 
-> **Status (2026-11-03).** Much of this guide describes an integration Athenaeum no
+> **Status (2026-11-05).** Much of this guide describes an integration Athenaeum no
 > longer has.
 >
 > - **Not used by Athenaeum any more:**
->   - **§2 Image Analysis, §4 Trail Detection, §6 Batch Analysis, §7 Full Integration
->     Example, §8 Recommendations.** Athenaeum's Analysis tab, Blink and plate-solve
->     input gate stopped calling `ImageAnalyzer` with its Plan C (2026-10-24). They now
->     measure with Athenaeum's own `star_measure` module, which is built on rustafits'
->     `analysis::fitting` and `analysis::background` kernels. These sections still
->     describe `ImageAnalyzer` correctly for its remaining callers: the
->     `rustafits analyze` CLI and `--annotate`.
->   - **§3 Star Annotation.** Athenaeum draws its own overlay; it mirrors
->     `compute_annotations()`'s geometry but does not call these functions.
+>   - **§2 Image Analysis (the legacy part), §4 Trail Detection, §6 Batch Analysis, §7
+>     Full Integration Example, §8 Recommendations.** Athenaeum's Analysis tab, Blink and
+>     plate-solve input gate stopped calling `ImageAnalyzer` with its Plan C
+>     (2026-10-24). They measure with `star_measure`, which is in this crate since port
+>     plan phase 3 and is built on the `analysis::fitting` and `analysis::background`
+>     kernels. These sections describe `ImageAnalyzer::analyze*` correctly, but it is
+>     deprecated since 1.8.0 and removed in 2.0. `rustafits analyze` and `--annotate` no
+>     longer call it either: they run `star_measure::analysis_mode`. What still calls it
+>     is Athenaeum's lab and its probe-only stacking arm, `rustafits-debug`, two
+>     examples and the legacy tests.
+>   - **§3 Star Annotation.** Athenaeum draws its own overlay; it mirrors the geometry
+>     of `compute_overlay()` (formerly `compute_annotations()`) but does not call these
+>     functions.
 > - **Historical:** §10–§12, the migrations from v0.6 to v0.8. The Athenaeum file paths
 >   in them refer to its code at the time.
-> - **Current:** §1 Image Conversion and §5 Thread Pool. §9 lists only part of the
->   crate root; `src/lib.rs` is authoritative.
+> - **Current:** §1 Image Conversion, the first part of §2 (the measurement Athenaeum
+>   uses), §3 (the overlay API, which takes any star list) and §5 Thread Pool. §9 lists
+>   only part of the crate root; `src/lib.rs` is authoritative.
 >
 > What Athenaeum uses today, and the contract that comes with it, is in CLAUDE.md under
-> "Downstream Users". The plan to move `star_measure` into rustafits is
-> `docs/superpowers/plans/2026-11-03-star-measure-port.md`.
+> "Downstream Users". The plan that moved `star_measure` into rustafits is
+> `docs/superpowers/plans/2026-11-03-star-measure-port.md`; phase 5 (the CLI, the
+> overlay API, the deprecation) is
+> `docs/superpowers/plans/2026-11-05-star-measure-port-phase-5.md`.
 
 ## Overview
 
 rustafits provides three pipelines that Athenaeum can use independently or together:
 
 1. **Image Conversion** — FITS/XISF to RGB/RGBA pixel data (`ImageConverter`)
-2. **Image Analysis** — star detection, FWHM, eccentricity, SNR (`ImageAnalyzer`)
-3. **Star Annotation** — color-coded ellipse overlays on converted images (`annotate_image`, `compute_annotations`, `create_annotation_layer`)
+2. **Image Analysis** — star detection, FWHM, eccentricity, SNR (`star_measure::analysis_mode`; the legacy `ImageAnalyzer` is deprecated)
+3. **Star Annotation** — color-coded ellipse overlays on converted images (`annotate_image_with`, `compute_overlay`, `create_overlay_layer`, over a `StarOverlay`)
 
 All three share a common thread pool via `with_thread_pool()`.
 
@@ -80,6 +87,44 @@ a JPEG stream under that name).
 
 ## 2. Image Analysis
 
+Athenaeum measures through `star_measure`, not through `ImageAnalyzer`. `athenaeum-core`
+has `pub use astroimage::star_measure`, and every measurement it makes goes through that
+module:
+
+- the **Analysis tab, Blink and the plate-solve input gate** call `analysis_mode`:
+  `raw::read_raw_frame`, `measure_raw_frame`, `FrameSummary`. Athenaeum keeps only the
+  row mapping (the per-star rows, the ids, `config_hash`, `analyzed_at`) and builds a
+  `FrameOptions` from its own `AnalysisConfig`;
+- **stacking and LN** call the module's other entry points (CLAUDE.md, "Downstream
+  Users", lists them);
+- the registration detector uses `ImageAnalyzer::detect_fast_data` (not deprecated).
+
+```rust
+use astroimage::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary};
+use astroimage::star_measure::raw::read_raw_frame;
+
+let mut frame = read_raw_frame(path)?;
+frame.drop_unmeasured_planes();
+
+let opts = FrameOptions::default();              // 6.0 σ, Moffat 4, 500 stars
+let pm = measure_raw_frame(&frame, &opts, Some(&pool));
+let summary = FrameSummary::from_measurement(&pm, &opts);
+// summary.stars_detected, median_fwhm, median_hfr, median_eccentricity, median_snr,
+// snr_weight, psf_signal, frame_snr, background, noise, trail_r_squared, verdict ...
+```
+
+`FrameOptions` and `FrameSummary` are `#[non_exhaustive]`: Athenaeum builds the options
+from the default and sets the three fields (`detection_threshold`, `psf_model`,
+`max_stars`). A change to anything under `star_measure`, to `analysis::fitting` or to
+`analysis::background` is a change to Athenaeum's numbers (`MEASURE_VERSION`). See
+`docs/usage.md` for the full guide to the measurement.
+
+### Legacy: `ImageAnalyzer::analyze*` (deprecated since 1.8.0, removed in 2.0)
+
+Everything below describes the legacy analyzer. Its numbers are not the Analysis tab's.
+The four methods (`analyze`, `analyze_data`, `analyze_raw`, `analyze_batch`) are
+`#[deprecated]`; the builder and `detect_fast*` are not.
+
 ```rust
 use astroimage::ImageAnalyzer;
 
@@ -92,7 +137,7 @@ let result = ImageAnalyzer::new()
 // MAD noise, detection sigma 5.0, measure cap 500
 ```
 
-### Key `AnalysisResult` Fields
+#### Key `AnalysisResult` Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -111,7 +156,7 @@ let result = ImageAnalyzer::new()
 | `median_beta` | `Option<f32>` | Median Moffat β. Always `Some(...)` with default settings (Moffat is always-on). |
 | `possibly_trailed` | `bool` | Advisory trail flag (Rayleigh angle coherence test). |
 
-### Key `StarMetrics` Fields
+#### Key `StarMetrics` Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -128,7 +173,7 @@ let result = ImageAnalyzer::new()
 | `fit_method` | `FitMethod` | Which fitting method produced this measurement. |
 | `fit_residual` | `f32` | Normalized fit quality (lower = better). 1.0 for moments fallback. |
 
-### Analyzer Builder Methods
+#### Analyzer Builder Methods
 
 | Method | Default | Description |
 |--------|---------|-------------|
@@ -146,7 +191,7 @@ let result = ImageAnalyzer::new()
 | `with_fit_max_rejects(usize)` | 5 | LM consecutive reject bailout. |
 | `with_thread_pool(pool)` | global | Route parallel work to a custom rayon pool. |
 
-### Recommended Settings
+#### Recommended Settings
 
 The defaults are tuned for general-purpose analysis. Mesh-grid background estimation
 is automatic (cell size derived from image dimensions), two-pass Moffat calibration
@@ -170,7 +215,7 @@ PSF fitting. Stars are sorted by flux (brightest first) before capping. Statisti
 (FWHM, eccentricity, HFR) are computed from the measured population, while
 `stars_detected` reports the raw detection count. Set to 0 to measure all.
 
-### Accuracy-Tested Settings
+#### Accuracy-Tested Settings
 
 The default pipeline produces accurate metrics. Based on file-by-file comparison
 of 77 M42 frames (300s + 30s exposures), no special configuration is required:
@@ -182,7 +227,7 @@ let result = ImageAnalyzer::new()
     .analyze("light.fits")?;
 ```
 
-#### Expected accuracy (file-by-file, 77 M42 frames)
+##### Expected accuracy (file-by-file, 77 M42 frames)
 
 | Metric | Accuracy | Notes |
 |--------|----------|-------|
@@ -191,28 +236,28 @@ let result = ImageAnalyzer::new()
 | **Noise** | Consistent | MAD noise (default); MRS wavelet optional |
 | **Star count** | Conservative | Favors quality over quantity |
 
-#### OSC (Bayer) handling
+##### OSC (Bayer) handling
 
 OSC images are green-interpolated before detection and PSF fitting: non-green
 (R/B) pixels are replaced with a distance-weighted average of neighboring green
 values. All pixels in the interpolated image are used for PSF fitting — no
 green mask. This produces accurate FWHM values for Bayer-pattern data.
 
-#### Eccentricity methodology note
+##### Eccentricity methodology note
 
 Eccentricity is computed from the **Moffat/Gaussian fit** axis ratio:
 `e = sqrt(1 - (b/a)^2)`. Frame-level eccentricity uses a sigma-clipped
 weighted median with fit-residual weighting. R²=0.969 indicates excellent
 relative ranking agreement.
 
-#### Fit-residual weighting
+##### Fit-residual weighting
 
 Statistics (FWHM, eccentricity, HFR) are computed using **sigma-clipped weighted
 medians** where each star's weight is `1 / (1 + fit_residual)`. Well-fit stars
 (low residual) contribute more than poorly-fit or moments-fallback stars. This
 continuous quality weighting is the primary reason for the improved R² values vs v0.7.1.
 
-#### When to use each setting
+##### When to use each setting
 
 | Setting | Default | Use when |
 |---------|---------|----------|
@@ -225,7 +270,7 @@ continuous quality weighting is the primary reason for the improved R² values v
 For general-purpose use, the defaults give the best overall results:
 accurate FWHM, stable eccentricity, fast pipeline (~250-750ms per frame).
 
-### Analyzing pre-loaded data
+#### Analyzing pre-loaded data
 
 ```rust
 // Planar f32, [0..65535] ADU range. 3-channel: RRRGGGBBB layout.
@@ -237,18 +282,47 @@ let result = ImageAnalyzer::new()
 
 ## 3. Star Annotation Overlay
 
-Three tiers of API — pick the level of control Athenaeum needs:
+The annotation functions draw a `StarOverlay`: a plain struct holding the stars and the
+pixel grid they were measured on.
 
-### Tier 1: `compute_annotations()` — Raw Geometry
+```rust
+use astroimage::{OverlayStar, StarOverlay};
+
+// From an analysis_mode measurement (the Analysis numbers)
+let overlay = StarOverlay::from_measurement(frame.w, frame.h, &pm, &summary);
+
+// From a legacy AnalysisResult
+let overlay = StarOverlay::from(&result);
+
+// Or by hand, from any star list
+let overlay = StarOverlay {
+    stars: vec![OverlayStar {
+        x: 812.4, y: 240.9,          // source pixels, file row order
+        fwhm_x: 3.1, fwhm_y: 2.6,    // major axis first
+        theta: 0.4,                  // major axis angle, radians, CCW from +X
+        eccentricity: 0.54, fwhm: 2.84,
+    }],
+    width: 6248, height: 4176,       // the grid the stars were measured on
+    median_fwhm: 2.9,                // for ColorScheme::Fwhm; 0.0 colors every star green
+};
+```
+
+The field set of `StarOverlay` and `OverlayStar` is fixed for 1.x (no
+`#[non_exhaustive]`). Three tiers of API — pick the level of control Athenaeum needs.
+Each of the three has a legacy twin that takes an `AnalysisResult`
+(`compute_annotations`, `create_annotation_layer`, `annotate_image`); the twin builds
+`StarOverlay::from(&result)` and calls the function below, so both draw the same.
+
+### Tier 1: `compute_overlay()` — Raw Geometry
 
 Returns `Vec<StarAnnotation>` with transformed coordinates and ellipse parameters.
 Use this when Athenaeum renders with its own drawing system (Canvas2D, SwiftUI, etc.).
 
 ```rust
-use astroimage::{compute_annotations, AnnotationConfig};
+use astroimage::{compute_overlay, AnnotationConfig};
 
-let annotations = compute_annotations(
-    &result,
+let annotations = compute_overlay(
+    &overlay,
     image.width,
     image.height,
     image.flip_vertical,
@@ -261,22 +335,22 @@ for ann in &annotations {
     // ann.semi_minor       — ellipse semi-minor axis (output px)
     // ann.theta            — rotation angle (radians, CCW from +X)
     // ann.eccentricity     — original eccentricity value
-    // ann.fwhm             — original FWHM (analysis pixels)
+    // ann.fwhm             — original FWHM (source pixels)
     // ann.color            — [R, G, B] based on color scheme
     my_canvas.draw_ellipse(ann.x, ann.y, ann.semi_major, ann.semi_minor, ann.theta, ann.color);
 }
 ```
 
-### Tier 2: `create_annotation_layer()` — RGBA Overlay
+### Tier 2: `create_overlay_layer()` — RGBA Overlay
 
 Returns a transparent RGBA buffer (same dimensions as output). Composite over the
 base image to toggle annotations on/off without re-rendering.
 
 ```rust
-use astroimage::create_annotation_layer;
+use astroimage::create_overlay_layer;
 
-let layer = create_annotation_layer(
-    &result,
+let layer = create_overlay_layer(
+    &overlay,
     image.width,
     image.height,
     image.flip_vertical,
@@ -286,14 +360,14 @@ let layer = create_annotation_layer(
 // Transparent where no annotations, opaque colored pixels on ellipses
 ```
 
-### Tier 3: `annotate_image()` — Burn-In
+### Tier 3: `annotate_image_with()` — Burn-In
 
 Draws directly onto a `ProcessedImage`. Simplest path — modifies image in place.
 
 ```rust
-use astroimage::annotate_image;
+use astroimage::annotate_image_with;
 
-annotate_image(&mut image, &result, &AnnotationConfig::default());
+annotate_image_with(&mut image, &overlay, &AnnotationConfig::default());
 ImageConverter::save_processed(&image, "annotated.jpg", 95)?;
 ```
 
@@ -331,18 +405,19 @@ let config = AnnotationConfig {
 
 ### Coordinate Transform
 
-Star positions from `AnalysisResult` are in native resolution. The output image
-may be smaller due to debayer (2x), downscale, and/or preview binning. The
+Star positions in a `StarOverlay` are in the pixels the frame was measured on (the
+file's native size; a mosaic is measured on its green sites at full size). The output
+image may be smaller due to debayer (2x), downscale, and/or preview binning. The
 annotation system handles this automatically:
 
 ```
-scale_x = output_width  / result.width
-scale_y = output_height / result.height
+scale_x = output_width  / overlay.width
+scale_y = output_height / overlay.height
 x_out = star.x * scale_x
 y_out = star.y * scale_y   (or flipped if flip_vertical)
 ```
 
-| Scenario | Analysis dims | Output dims | Scale |
+| Scenario | Overlay dims | Output dims | Scale |
 |----------|---------------|-------------|-------|
 | Mono, no downscale | 4096 x 3072 | 4096 x 3072 | 1.0 |
 | OSC, debayer only | 4096 x 3072 | 2048 x 1536 | 0.5 |

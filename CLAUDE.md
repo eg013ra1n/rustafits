@@ -36,7 +36,7 @@ cargo clippy
 
 ### Crate Structure
 
-The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public. The default `cli` feature carries the `rustafits` binary's only extra deps (clap, clap_complete, indicatif); the binary requires it, and library users (Athenaeum) can build with `default-features = false`. `serde` (off by default) derives `Serialize` / `Deserialize` on the `star_measure` and `stats` types; `test-support` exposes `star_measure::StarFit::test_at` for downstream tests; `lm-counters` adds the debug-only LM solve counters, re-exported as `astroimage::lm_counters`. The binary lives in `src/bin/rustafits/`: `main.rs` (clap; conversion is the default command, plus `info`, `analyze`, `completions`), `batch.rs` (input collection, shared pool, worker loop, progress bar), `convert.rs`, `info.rs`, `analyze.rs`, `report.rs` (table/JSON/CSV). `analyze` runs `ImageAnalyzer` with its library defaults, and `tests/cli.rs` pins the CLI's numbers to `ImageAnalyzer::new().analyze()`. These are no longer the numbers Athenaeum shows: its Analysis tab moved to its own `star_measure` module (see Downstream Users). `tests/cli.rs` drives the binary end to end on synthetic FITS.
+The package produces two binaries (`rustafits`, `rustafits-debug`) and a library (`astroimage`). The `debug-pipeline` feature flag makes `analysis` and `formats` modules public. The default `cli` feature carries the `rustafits` binary's only extra deps (clap, clap_complete, indicatif); the binary requires it, and library users (Athenaeum) can build with `default-features = false`. `serde` (off by default) derives `Serialize` / `Deserialize` on the `star_measure` and `stats` types; `test-support` exposes `star_measure::StarFit::test_at` for downstream tests; `lm-counters` adds the debug-only LM solve counters, re-exported as `astroimage::lm_counters`. The binary lives in `src/bin/rustafits/`: `main.rs` (clap; conversion is the default command, plus `info`, `analyze`, `completions`), `batch.rs` (input collection, shared pool, worker loop, progress bar), `convert.rs`, `info.rs`, `analyze.rs`, `measure.rs` (the one measurement `analyze` and `convert -a` share: read, `measure_raw_frame`, `FrameSummary`, the range checks, the notice for a flag kept for old scripts), `report.rs` (table/JSON/CSV). `analyze` and `convert -a` run `star_measure::analysis_mode` with its defaults (6.0 σ, Moffat 4, 500 stars), so they print Athenaeum's Analysis numbers, and `convert -a` draws the same stars (`StarOverlay::from_measurement`). `tests/cli.rs` pins the CLI's numbers to `measure_raw_frame` + `FrameSummary` (an `#[ignore]`d test does it on the real frames) and drives the binary end to end on synthetic FITS.
 
 ### Processing Pipeline
 
@@ -49,10 +49,15 @@ Pipeline flow for u16 data:
    so it addresses the stored pixels as read — in file row order, whatever
    `flip_vertical` says. FITS folds them onto `BAYERPAT`; XISF folds them onto
    whatever pattern its scan found (`BAYERPAT` or `<ColorFilterArray>`, both
-   `<FITSKeyword>` offsets), and reads an offset as a number rounded (`0.6` is
-   1) where FITS takes the integer prefix (`0.6` is 0): the XISF rule is the
-   one Athenaeum's Analysis tab applied before phase 4 (`formats::stored_keys`,
-   unusual values included), kept so its numbers do not move.
+   `<FITSKeyword>` offsets). Each reader reads an offset by Athenaeum's rule for
+   its format (`formats::stored_keys`, unusual values included), kept so its
+   Analysis numbers do not move. FITS goes through the catalog's header reader
+   (`FitsHeader::get_i32`): a quoted `'1'` is 1, in any case, the first of a
+   repeated card wins, and a fraction is truncated (`0.6` is 0). XISF goes
+   through its `<FITSKeyword>` text rule: the first non-empty value wins and a
+   number is rounded (`0.6` is 1). The two rules differ on a fraction, on a
+   repeated keyword whose first card is empty (FITS reads 0) and on blanks
+   around the name; those differences are by design, so do not "fix" one side.
    `star_measure::raw` folds nothing itself.
 2. Debayer (if Bayer pattern detected) — by default 2x2 super-pixel, producing
    planar f32 RGB at HALF the input width and height (so it consumes a factor 2
@@ -104,7 +109,7 @@ Pipeline flow for u16 data:
 - `processing/` — `stretch.rs`, `debayer.rs` (super-pixel 2x2 + native-resolution green interpolation), `vng.rs` (full-resolution 8-gradient VNG demosaic, rayon over 64-row bands), `cfa.rs` (green-site mask / `G1 + G2` sum / single green phase, for measuring a raw mosaic without interpolation — Athenaeum's Analysis tab), `binning.rs`, `downscale.rs`, `color.rs`
 - `platesolving/` — quad building and matching (`pattern_matcher.rs`, incl. `build_quads_multi`), `ransac.rs`, `wcs.rs`, `projection.rs` (gnomonic), `proper_motion.rs`, `transform.rs`, `types.rs`. Reference: `docs/platesolving.md`.
 - `analysis/` — `background.rs` (mesh-grid + MRS wavelet), `detection.rs` (DAOFIND), `fitting.rs` (two-pass Moffat-primary PSF calibration, LmResult + fit_residual), `metrics.rs` (fit_residual per star), `snr.rs`, `convolution.rs`, `render.rs`, `mod.rs` (two-stage trail detection, residual-weighted statistics)
-- `annotate.rs` — 3-tier annotation API (raw geometry / RGBA layer / burn-in)
+- `annotate.rs` — 3-tier annotation API (raw geometry / RGBA layer / burn-in) over a `StarOverlay`: `compute_overlay`, `create_overlay_layer`, `annotate_image_with`. `StarOverlay::from_measurement` builds it from an `analysis_mode` measurement, `StarOverlay::from(&AnalysisResult)` from the legacy result; `compute_annotations`, `create_annotation_layer` and `annotate_image` are the legacy entries over the latter.
 - `star_measure/` — Athenaeum's one star-measurement path (per-star Moffat fit, per-frame β, frame aggregates, sky, noise, the Analysis budget, trail / defocus verdicts), copied from `athenaeum-core` at 0b6fb183 (port plan phase 2) with paths, serde gates and visibility changed, nothing else. `adapter` lists the `#[doc(hidden)]` helpers Athenaeum's stacking calls (outside semver); `testing` holds `StarFit::test_at`. Port plan phase 4 (copied at e6344ddd, the plan names what changed beyond paths) added the Analysis-mode entry, the semver-covered part of the module: `raw` (`read_raw_frame`: a FITS / XISF file as a `RawFrame` in the file's ADU, header facts read by Athenaeum's own rules, `formats::stored_keys`), `analysis_mode` (`FrameOptions`, `measure_raw_frame`, `FrameSummary`: the measurement and the frame figures the Analysis tab shows), and under them `green` (a mosaic measured on its green sites) and `trail` (trail R²). Its docs cite Athenaeum's specs, rulings and modules.
 - `stats.rs` — robust statistics (median / MAD / BWMV, the 1/16 stratified sample, noise-scale factors) from Athenaeum's `integration::stats`, which re-exports them.
 - `geometry/` (crate-private) — the kd-tree `star_measure` marks blends with, and the test RNG; `test_support.rs` (tests only) — Athenaeum's fixture fields and log captures, byte-identical.
@@ -123,9 +128,9 @@ Athenaeum re-exports this crate's `star_measure` (port plan phase 3; its own cop
 
 This crate holds the only copy of that module (`star_measure`, `stats`, and since phase 4 the Analysis-mode entry), so a change here is a change to Athenaeum's numbers. `MEASURE_VERSION`'s policy applies here: one bump per merged plan that changes what a fit accepts or measures, never one per commit; a change that moves no number keeps it. Athenaeum's truth lab (athenaeum-lab `star_probe` scorecard) stays the referee for any change to these numbers.
 
-`formats::stored_keys` (crate-private, phase 4, ruling R-P4-C1) is Athenaeum's own header-value rules, copied so that the Analysis numbers do not move on any input: its FITS header reader (`BITPIX`, `BZERO`, `BSCALE`, `DATAMAX`, `EGAIN` for `star_measure::raw`) and its XISF `<FITSKeyword>` text rule (`DATAMAX`, `EGAIN`, and the XISF reader's `XBAYROFF` / `YBAYROFF` fold). It disagrees with `ImageHeader`'s own parsing on unusual values by design; change it only with Athenaeum's rules, and keep its parity tests.
+`formats::stored_keys` (crate-private, phase 4, ruling R-P4-C1) is Athenaeum's own header-value rules, copied so that the Analysis numbers do not move on any input: its FITS header reader (`BITPIX`, `BZERO`, `BSCALE`, `DATAMAX`, `EGAIN` for `star_measure::raw`, and, since 1.8.0, `XBAYROFF` / `YBAYROFF` for the FITS reader's Bayer fold) and its XISF `<FITSKeyword>` text rule (`DATAMAX`, `EGAIN`, and the XISF reader's `XBAYROFF` / `YBAYROFF` fold). It disagrees with `ImageHeader`'s own parsing on unusual values by design; change it only with Athenaeum's rules, and keep its parity tests.
 
-The full `ImageAnalyzer::analyze*` is no longer called by the app, only by Athenaeum's lab (`star_probe`'s `legacy-analysis` arm) and a probe-only stacking arm. The plan for moving `star_measure` here and switching Athenaeum and the CLI to it is `docs/superpowers/plans/2026-11-03-star-measure-port.md`.
+`ImageAnalyzer::analyze`, `analyze_data`, `analyze_raw` and `analyze_batch` are `#[deprecated]` since 1.8.0 and are removed in 2.0; `detect_fast*` and the builder stay. The measurement to use is `star_measure::analysis_mode`. Nothing in the CLI calls them now: `analyze` and `convert -a` run `analysis_mode`. The callers left (the ones in this crate carry `#[allow(deprecated)]`; Athenaeum's get it with its 1.8.0 bump): Athenaeum's probe-only stacking arm (`SeedOverride::Full`) and its `star_probe` / `integrate_probe` examples, the lab's `legacy-analysis` arm, `rustafits-debug` (it diagnoses the legacy pipeline), the `trail_test` and `fastdump` examples, and the legacy tests (`tests/analysis.rs`, `tests/fast_detect_real.rs`). `examples/analyze_batch.rs` now shows `analysis_mode` (rayon over files, one shared pool). The port plan is `docs/superpowers/plans/2026-11-03-star-measure-port.md`; phase 5 (the CLI, the overlay API, the deprecation) is `docs/superpowers/plans/2026-11-05-star-measure-port-phase-5.md`.
 
 **solvemyastro** (the plate solver Athenaeum uses; path dependency, default features) uses rustafits only to decode frames and to detect stars: `ImageAnalyzer::detect_fast` and `FastStar`.
 
@@ -146,7 +151,7 @@ Analysis pipeline stages parallelized via rayon: background mesh cells, separabl
 ## Test Data
 
 Test files in `tests/`:
-- `cocoon.fits` — dense star field
+- `cocoon.fits` — dense star field (gitignored, local only: the tests that read it skip it when it is absent)
 - `mono.fits` — monochrome 16-bit (comet, bright extended object)
 - `osc.fits` — OSC Bayer pattern
 - `test.xisf` — XISF format

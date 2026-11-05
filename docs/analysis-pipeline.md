@@ -1,5 +1,9 @@
 # Analysis Pipeline Overview
 
+> **Legacy pipeline.** This page describes `ImageAnalyzer::analyze*`, deprecated since
+> 1.8.0 and removed in 2.0. The measurement Athenaeum and `rustafits analyze` use is
+> `star_measure::analysis_mode`: see `docs/usage.md`.
+
 The analysis module performs automatic star detection, PSF measurement, and image quality
 assessment on astronomical images. It outputs per-star metrics and image-wide statistics
 suitable for subframe evaluation and stacking weight computation.

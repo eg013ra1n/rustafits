@@ -1,19 +1,24 @@
 # Star Annotation Overlay
 
-The annotation module draws detected-star ellipses onto converted images, showing
+The annotation module draws measured-star ellipses onto converted images, showing
 PSF shape, elongation direction, and quality at a glance. Zero external dependencies —
 all rasterization uses integer Bresenham algorithms on the existing u8 pixel buffer.
+
+The stars come from a `StarOverlay` (see [The star list](#the-star-list-staroverlay)).
+`rustafits convert --annotate` builds one from the same measurement `rustafits analyze`
+prints (`star_measure::analysis_mode`), so the ellipses sit on the stars the numbers
+were computed on. A library caller builds one the same way, or from its own list.
 
 ## Quick Start
 
 ### CLI
 
 ```bash
-# Annotate with defaults (eccentricity color coding, 200 stars)
+# Annotate with defaults (eccentricity color coding, a budget of 500 stars)
 rustafits image.fits output.jpg --annotate
 
 # More stars, with logging
-rustafits image.fits output.jpg --annotate --max-stars 5000 --log
+rustafits image.fits output.jpg --annotate --max-stars 1000 -v
 
 # Works with all other options
 rustafits image.fits output.jpg --annotate --downscale 2 --preview --quality 90
@@ -22,42 +27,83 @@ rustafits image.fits output.jpg --annotate --downscale 2 --preview --quality 90
 ### Library (Simplest Path)
 
 ```rust
-use astroimage::{ImageConverter, ImageAnalyzer, annotate_image, AnnotationConfig};
+use std::path::Path;
+use astroimage::{annotate_image_with, AnnotationConfig, ImageConverter, StarOverlay};
+use astroimage::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary};
+use astroimage::star_measure::raw::read_raw_frame;
 
-// 1. Convert image
+// 1. Measure the file (see usage.md)
+let mut frame = read_raw_frame(Path::new("light.fits"))?;
+frame.drop_unmeasured_planes();
+let opts = FrameOptions::default();
+let pm = measure_raw_frame(&frame, &opts, None);
+let summary = FrameSummary::from_measurement(&pm, &opts);
+
+// 2. Convert the same file
 let mut image = ImageConverter::new().process("light.fits")?;
 
-// 2. Analyze same file
-let result = ImageAnalyzer::new()
-    .with_max_stars(500)
-    .analyze("light.fits")?;
-
-// 3. Burn annotations onto image
-annotate_image(&mut image, &result, &AnnotationConfig::default());
+// 3. Build the star list and burn it onto the image
+let overlay = StarOverlay::from_measurement(frame.w, frame.h, &pm, &summary);
+annotate_image_with(&mut image, &overlay, &AnnotationConfig::default());
 
 // 4. Save
 ImageConverter::save_processed(&image, "annotated.jpg", 95)?;
 ```
+
+The functions that take an `AnalysisResult` (`annotate_image`, `compute_annotations`,
+`create_annotation_layer`) still work. They belong to the legacy analyzer, which is
+deprecated since 1.8.0 and removed in 2.0: see [the legacy functions](#the-legacy-functions).
+
+## The star list: `StarOverlay`
+
+A `StarOverlay` is the list of stars to draw and the grid they were measured on. It is
+a plain struct with public fields. Its field set is fixed for 1.x, so a caller can build
+one from its own measurements.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `stars` | `Vec<OverlayStar>` | The stars to draw. |
+| `width`, `height` | `usize` | Size of the pixel grid the stars were measured on. A mosaic is measured at its native size, and rendered at half size. |
+| `median_fwhm` | `f32` | The frame's median FWHM in source pixels, for `ColorScheme::Fwhm`. 0.0 when the frame has none: every star then reads green. |
+
+`OverlayStar`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y` | `f32` | Centroid in source pixels, in the file's row order (not flipped). |
+| `fwhm_x` | `f32` | FWHM along the **major** axis, source pixels. |
+| `fwhm_y` | `f32` | FWHM along the minor axis, source pixels. |
+| `theta` | `f32` | Angle of the major axis, radians, counter-clockwise from +X. |
+| `eccentricity` | `f32` | 0 = round, approaching 1 = elongated. |
+| `fwhm` | `f32` | Geometric mean FWHM, source pixels. |
+
+Two constructors:
+
+- `StarOverlay::from_measurement(frame_w, frame_h, &pm, &summary)`: one star per fit in
+  `pm.stars`, and `summary.median_fwhm`. Pass the measured frame's `RawFrame::w` and
+  `RawFrame::h`, also for a mosaic.
+- `StarOverlay::from(&result)`: the stars and the median FWHM of a legacy
+  `AnalysisResult`, as they are.
 
 ## Three-Tier API
 
 The annotation system provides three levels of control. Pick the one that fits
 your application:
 
-### Tier 1: `compute_annotations()` — Raw Geometry
+### Tier 1: `compute_overlay()` — Raw Geometry
 
 Returns a `Vec<StarAnnotation>` with transformed coordinates and ellipse
-parameters. Use this when your app has its own rendering system (HTML Canvas,
-SwiftUI, OpenGL, etc.).
+parameters. It is empty when the overlay has no stars or a zero size. Use this when
+your app has its own rendering system (HTML Canvas, SwiftUI, OpenGL, etc.).
 
 ```rust
-use astroimage::{compute_annotations, AnnotationConfig, ImageAnalyzer, ImageConverter};
+use astroimage::{compute_overlay, AnnotationConfig, ImageConverter};
 
 let image = ImageConverter::new().process("light.fits")?;
-let result = ImageAnalyzer::new().analyze("light.fits")?;
+// `overlay` is a StarOverlay, built as shown above
 
-let annotations = compute_annotations(
-    &result,
+let annotations = compute_overlay(
+    &overlay,
     image.width,
     image.height,
     image.flip_vertical,
@@ -70,7 +116,7 @@ for ann in &annotations {
     // ann.semi_minor       — ellipse semi-minor axis (output pixels)
     // ann.theta            — rotation angle (radians, CCW from +X)
     // ann.eccentricity     — original eccentricity value
-    // ann.fwhm             — original FWHM (analysis pixels)
+    // ann.fwhm             — original FWHM (source pixels)
     // ann.color            — [R, G, B] based on color scheme
 
     my_canvas.draw_ellipse(
@@ -82,20 +128,19 @@ for ann in &annotations {
 }
 ```
 
-### Tier 2: `create_annotation_layer()` — RGBA Overlay
+### Tier 2: `create_overlay_layer()` — RGBA Overlay
 
 Returns an RGBA `Vec<u8>` buffer (same dimensions as the output image) with
 transparent background and colored ellipses. Use this when you want to toggle
 annotations on/off without re-rendering the base image.
 
 ```rust
-use astroimage::{create_annotation_layer, AnnotationConfig, ImageAnalyzer, ImageConverter};
+use astroimage::{create_overlay_layer, AnnotationConfig, ImageConverter};
 
 let image = ImageConverter::new().process("light.fits")?;
-let result = ImageAnalyzer::new().analyze("light.fits")?;
 
-let layer = create_annotation_layer(
-    &result,
+let layer = create_overlay_layer(
+    &overlay,
     image.width,
     image.height,
     image.flip_vertical,
@@ -107,22 +152,36 @@ let layer = create_annotation_layer(
 // Composite over base image in your UI when user toggles "show stars"
 ```
 
-### Tier 3: `annotate_image()` — Burn-In
+### Tier 3: `annotate_image_with()` — Burn-In
 
 Draws directly onto a `ProcessedImage` buffer. Simplest path — one call,
 modifies the image in place. Use for CLI tools or one-shot rendering.
 
 ```rust
-use astroimage::{annotate_image, AnnotationConfig, ImageAnalyzer, ImageConverter};
+use astroimage::{annotate_image_with, AnnotationConfig, ImageConverter};
 
 let mut image = ImageConverter::new().process("light.fits")?;
-let result = ImageAnalyzer::new().analyze("light.fits")?;
 
-annotate_image(&mut image, &result, &AnnotationConfig::default());
+annotate_image_with(&mut image, &overlay, &AnnotationConfig::default());
 
 // image.data now contains the annotations burned in
 ImageConverter::save_processed(&image, "annotated.jpg", 95)?;
 ```
+
+### The legacy functions
+
+`compute_annotations()`, `create_annotation_layer()` and `annotate_image()` take an
+`AnalysisResult` from the deprecated `ImageAnalyzer::analyze*`. They are wrappers: each
+builds `StarOverlay::from(&result)` and calls its twin above, so both draw the same
+pixels. Their signatures have not changed.
+
+| Legacy | Current |
+|--------|---------|
+| `compute_annotations(&result, w, h, flip, &config)` | `compute_overlay(&overlay, w, h, flip, &config)` |
+| `create_annotation_layer(&result, w, h, flip, &config)` | `create_overlay_layer(&overlay, w, h, flip, &config)` |
+| `annotate_image(&mut image, &result, &config)` | `annotate_image_with(&mut image, &overlay, &config)` |
+
+The wrappers stay as long as `AnalysisResult` does, which is until 2.0.
 
 ## Configuration
 
@@ -164,7 +223,8 @@ let config = AnnotationConfig {
 
 ### `StarAnnotation` Fields
 
-Returned by `compute_annotations()`. All coordinates are in output image space.
+Returned by `compute_overlay()` (and `compute_annotations()`). All coordinates are in
+output image space. The struct derives `Debug`, `Clone`, `Copy` and `PartialEq`.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -173,21 +233,22 @@ Returned by `compute_annotations()`. All coordinates are in output image space.
 | `semi_major` | `f32` | Ellipse semi-major axis (output pixels). `fwhm_x * scale_x * ellipse_scale`, clamped to `[min_radius, max_radius]`. |
 | `semi_minor` | `f32` | Ellipse semi-minor axis (output pixels). `fwhm_y * scale_y * ellipse_scale`, clamped to `[min_radius, max_radius]`. |
 | `theta` | `f32` | Rotation angle in radians, counter-clockwise from +X axis. |
-| `eccentricity` | `f32` | Original eccentricity value from analysis. |
-| `fwhm` | `f32` | Original geometric mean FWHM in analysis pixels. |
+| `eccentricity` | `f32` | Original eccentricity value from the measurement. |
+| `fwhm` | `f32` | Original geometric mean FWHM in source pixels. |
 | `color` | `[u8; 3]` | RGB color assigned by the color scheme. |
 
 ## Coordinate Transform
 
-Star positions from `AnalysisResult` are in **native resolution** (the analysis
-pipeline uses green-channel interpolation at full size for OSC). The output image
-may be smaller due to debayer (2x), downscale, and/or preview binning.
+Star positions in a `StarOverlay` are in the pixels the frame was **measured** on,
+which is the file's native size (a Bayer mosaic is measured on its green sites at full
+size). The output image may be smaller due to debayer (2x), downscale, and/or preview
+binning.
 
 The annotation system handles this automatically:
 
 ```
-scale_x = output_width  / result.width
-scale_y = output_height / result.height
+scale_x = output_width  / overlay.width
+scale_y = output_height / overlay.height
 
 x_out = star.x * scale_x
 y_out = star.y * scale_y          (or flipped if flip_vertical)
@@ -201,24 +262,25 @@ keep the annotation ellipse and direction ticks aligned with the actual star
 elongation in the output image.
 
 `ProcessedImage` carries a `flip_vertical` field set during processing. The
-`annotate_image()` function reads it automatically. For `compute_annotations()`
-and `create_annotation_layer()`, pass `image.flip_vertical` explicitly.
+`annotate_image_with()` function reads it automatically. For `compute_overlay()`
+and `create_overlay_layer()`, pass `image.flip_vertical` explicitly. The stars of an
+overlay are always in file row order: the flip is applied here, never before.
 
 ### Why This Works for All Cases
 
-| Scenario | result dimensions | output dimensions | scale |
+| Scenario | overlay dimensions | output dimensions | scale |
 |----------|-------------------|-------------------|-------|
 | Mono, no downscale | 4096 × 3072 | 4096 × 3072 | 1.0 |
-| OSC, debayer only | 4096 × 3072 (native green) | 2048 × 1536 (debayered) | 0.5 |
+| OSC, debayer only | 4096 × 3072 (native mosaic) | 2048 × 1536 (debayered) | 0.5 |
 | OSC, debayer + 2x downscale | 4096 × 3072 | 1024 × 768 | 0.25 |
 | Mono, preview binning | 4096 × 3072 | 2048 × 1536 | 0.5 |
 
 ## What Gets Drawn
 
-For each detected star:
+For each star in the overlay:
 
 - **Rotated ellipse** centered on the star's centroid, using `fwhm_x`, `fwhm_y`,
-  and `theta` from the analysis. Semi-axes are scaled by `ellipse_scale` (1.2x by default) and
+  and `theta` from the fit. Semi-axes are scaled by `ellipse_scale` (1.2x by default) and
   clamped to `[min_radius, max_radius]`.
 
 - **Color** based on the chosen scheme and configurable thresholds. Default
@@ -230,50 +292,56 @@ For each detected star:
   or field curvature orientation.
 
 No text labels — the color coding and ellipse shape convey quality visually.
-Numeric values are available via `AnalysisResult` fields or `--log` in the CLI.
+Numeric values are available from `FrameSummary` and the star list, or from `-v` in the CLI.
 
 ## Integration Examples
 
 ### Desktop App — Toggleable Layer
 
 ```rust
+use std::path::Path;
 use astroimage::{
-    create_annotation_layer, compute_annotations,
-    AnnotationConfig, ColorScheme,
-    ImageAnalyzer, ImageConverter,
+    create_overlay_layer, AnnotationConfig, ImageConverter, StarOverlay,
 };
+use astroimage::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary};
+use astroimage::star_measure::raw::read_raw_frame;
 
-// Process and analyze
+// Measure with a budget of 1000 stars, then render
+let mut frame = read_raw_frame(Path::new("light.fits"))?;
+frame.drop_unmeasured_planes();
+let mut opts = FrameOptions::default();
+opts.max_stars = 1000;
+let pm = measure_raw_frame(&frame, &opts, None);
+let summary = FrameSummary::from_measurement(&pm, &opts);
+let stars = StarOverlay::from_measurement(frame.w, frame.h, &pm, &summary);
+
 let image = ImageConverter::new()
     .with_rgba_output()
     .process("light.fits")?;
-let result = ImageAnalyzer::new()
-    .with_max_stars(1000)
-    .analyze("light.fits")?;
 
-// Create overlay (transparent RGBA, same size as image)
+// Create the layer (transparent RGBA, same size as image)
 let config = AnnotationConfig {
     ecc_good: 0.4,
     ecc_warn: 0.55,
     ..AnnotationConfig::default()
 };
-let overlay = create_annotation_layer(
-    &result, image.width, image.height, image.flip_vertical, &config,
+let layer = create_overlay_layer(
+    &stars, image.width, image.height, image.flip_vertical, &config,
 );
 
 // In your UI:
 // - Base layer: image.data (RGBA)
-// - Annotation layer: overlay (RGBA, transparent bg)
+// - Annotation layer: layer (RGBA, transparent bg)
 // - Toggle annotation visibility without re-rendering base
-// - Switch color scheme by regenerating overlay with different config
+// - Switch color scheme by regenerating the layer with a different config
 ```
 
 ### Web App — Canvas Overlay with JavaScript
 
 ```rust
 // Rust/Wasm side: compute geometry, send to JS
-let annotations = compute_annotations(
-    &result, canvas_width, canvas_height, image.flip_vertical, &config,
+let annotations = compute_overlay(
+    &stars, canvas_width, canvas_height, image.flip_vertical, &config,
 );
 
 // Serialize to JSON or pass via wasm-bindgen
@@ -325,24 +393,28 @@ let config = AnnotationConfig {
 ```rust
 use std::sync::Arc;
 use astroimage::{
-    annotate_image, AnnotationConfig,
-    ImageAnalyzer, ImageConverter, ThreadPoolBuilder,
+    annotate_image_with, AnnotationConfig,
+    ImageConverter, StarOverlay, ThreadPoolBuilder,
 };
+use astroimage::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary};
+use astroimage::star_measure::raw::read_raw_frame;
 
 let pool = Arc::new(ThreadPoolBuilder::new().num_threads(8).build()?);
 let config = AnnotationConfig::default();
+let opts = FrameOptions::default();
 
 for path in &fits_files {
     let mut image = ImageConverter::new()
         .with_thread_pool(pool.clone())
         .process(path)?;
 
-    let result = ImageAnalyzer::new()
-        .with_thread_pool(pool.clone())
-        .with_max_stars(500)
-        .analyze(path)?;
+    let mut frame = read_raw_frame(path)?;
+    frame.drop_unmeasured_planes();
+    let pm = measure_raw_frame(&frame, &opts, Some(&pool));
+    let summary = FrameSummary::from_measurement(&pm, &opts);
+    let overlay = StarOverlay::from_measurement(frame.w, frame.h, &pm, &summary);
 
-    annotate_image(&mut image, &result, &config);
+    annotate_image_with(&mut image, &overlay, &config);
 
     let out = path.with_extension("annotated.jpg");
     ImageConverter::save_processed(&image, &out, 95)?;
@@ -352,27 +424,29 @@ for path in &fits_files {
 ## CLI Reference
 
 ```
---annotate           Overlay star detection ellipses on the output image
---max-stars <N>      Max stars for annotation analysis (default: 200)
---log                Show analysis stats (star count, median FWHM, eccentricity)
+-a, --annotate       Overlay star ellipses on the output image
+--max-stars <N>      Star budget for --annotate: the brightest good stars, 10 to 2000 (default: 500)
+-v, --verbose        Per-file details and timings on stderr (--log is an alias)
 ```
 
-`--annotate` runs the full analysis pipeline (`ImageAnalyzer`) on the input file,
-then draws annotations onto the converted output. Combined with `--log`, it prints
-summary statistics:
+`--annotate` measures the input with `star_measure::analysis_mode`, the measurement
+`rustafits analyze` prints and Athenaeum's Analysis tab shows, with its defaults (6.0 σ,
+Moffat 4). It then draws the brightest good stars of that measurement, up to
+`--max-stars`, onto the converted output. A file that measurement cannot read fails with
+an error that names it, even if the plain render could have read it. With `-v` it
+prints the measurement's summary (the star count is the number the detector found; at
+most `--max-stars` are drawn):
 
 ```
-$ rustafits image.fits output.jpg --annotate --max-stars 1000 --log
-Converting to JPEG...
-  Input:  image.fits
-  Output: output.jpg
-  Downscale: 1x
-  Quality: 95
-  Debayer: enabled
-  Preview mode: disabled
-Analysis: 784 stars detected, median FWHM=2.60, median ecc=0.430
-Conversion successful!
+$ rustafits tests/mono.fits annotated.jpg -a -v
+tests/mono.fits -> annotated.jpg  6252x4176  read 5 ms | analysis 374 ms (4775 stars, FWHM 2.01) | process 10 ms | encode 82 ms | write 2 ms
+1 converted in 0.5 s
 ```
+
+`--max-stars` below 10 or above 2000 is refused with exit code 2. `--measure-cap` is
+still accepted so old scripts run; it prints a warning and does nothing (it is hidden from
+`--help` and goes in 2.0). `-j` defaults to 2 with `--annotate`: on 26 MP frames more
+jobs were no faster and held more memory (about 1.6 GB at two jobs).
 
 ## Public Exports
 
@@ -380,12 +454,19 @@ All annotation types and functions are re-exported from the crate root:
 
 ```rust
 use astroimage::{
-    // Functions
-    annotate_image,           // Tier 3: burn into ProcessedImage
-    create_annotation_layer,  // Tier 2: RGBA overlay buffer
-    compute_annotations,      // Tier 1: raw geometry
+    // Functions over a StarOverlay
+    annotate_image_with,      // Tier 3: burn into ProcessedImage
+    create_overlay_layer,     // Tier 2: RGBA overlay buffer
+    compute_overlay,          // Tier 1: raw geometry
+
+    // Legacy twins over an AnalysisResult (deprecated analyzer)
+    annotate_image,
+    create_annotation_layer,
+    compute_annotations,
 
     // Types
+    StarOverlay,              // The star list and the grid it was measured on
+    OverlayStar,              // One star of it
     AnnotationConfig,         // Configuration struct
     ColorScheme,              // Eccentricity | Fwhm | Uniform
     StarAnnotation,           // Per-star output geometry

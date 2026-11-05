@@ -149,7 +149,7 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
   - `fn warn_ignored(flag: &str, why: &str)`: prints `warning: {flag} has no effect since 1.8.0: {why}` to stderr.
     T1 and T3 print these strings through this one function, never a second copy (a plan-verbatim seam).
 
-- [ ] **Step 1: rewrite the analyze test and add five (failing).** In `tests/cli.rs` (an integration-test crate: it
+- [x] **Step 1: rewrite the analyze test and add five (failing).** In `tests/cli.rs` (an integration-test crate: it
   cannot see the binary's `Measured`), the library reference is a helper
   `lib_measure(path: &Path, opts: &FrameOptions) -> (RawFrame, PlaneMeasurement, FrameSummary)` built from
   `read_raw_frame` + `measure_raw_frame(…, None)` + `FrameSummary::from_measurement` (G-6: no result reads a thread
@@ -177,9 +177,9 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
     2 with the range message; nothing on stdout.
   - `analyze_matches_the_library_on_the_test_frames` (`#[ignore]`, gate G5-f: real 26 MP frames are slow in a test
     run): every CSV column of `tests/{mono,osc,cocoon}.fits` and `tests/test.xisf` equals `lib_measure`'s.
-- [ ] **Step 2: run them, see them fail.** `cargo test -p rustafits --test cli analyze` → FAIL (the CLI still runs
+- [x] **Step 2: run them, see them fail.** `cargo test -p rustafits --test cli analyze` → FAIL (the CLI still runs
   `ImageAnalyzer`).
-- [ ] **Step 3: implement.**
+- [x] **Step 3: implement.**
   - `AnalyzeArgs`: `--detection-threshold <SIGMA>` (default 6.0, `threshold_parser`), `--psf-model <moffat4|auto>`
     (a `ValueEnum` mapped to `PsfModel`, default `moffat4`), `--max-stars <N>` (default 500, `budget_parser`). A clap
     `alias` cannot tell that it was used, so `--sigma <SIGMA>` is its own hidden argument (`threshold_parser`,
@@ -193,8 +193,8 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
   - Sort: same keys; a row with a verdict sorts after every row without one, in input order (it replaces today's NaN
     rule); `--reverse` reverses the whole list, as today.
   - The module doc says the numbers are Athenaeum's Analysis numbers (`analysis_mode`, defaults 6.0 σ, Moffat 4, 500).
-- [ ] **Step 4: pass.** `cargo test -p rustafits --test cli` → PASS; then G-3.
-- [ ] **Step 5: commit** `feat(cli): analyze on star_measure::analysis_mode, Athenaeum's Analysis numbers (port phase 5.1)`.
+- [x] **Step 4: pass.** `cargo test -p rustafits --test cli` → PASS; then G-3.
+- [x] **Step 5: commit** `feat(cli): analyze on star_measure::analysis_mode, Athenaeum's Analysis numbers (port phase 5.1)`.
 
 ### T2 (rustafits) — 5.2, library half: `StarOverlay`
 
@@ -223,7 +223,7 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
     through `StarOverlay::from(result)`. `compute_overlay` keeps today's empty-result guard (`stars` empty or a zero
     size → empty).
 
-- [ ] **Step 1: tests (failing).**
+- [x] **Step 1: tests (failing).**
   - `legacy_functions_draw_what_they_drew`: on three `make_star` stars of a `dummy_result` (one round; one elongated,
     its `theta` set to 0.6 after `make_star`, which fixes 0.0 at `:494`; one past `ecc_warn`), a source 200×100 drawn
     at 100×50, `compute_annotations` returns, field by field, the values computed by hand from today's rules
@@ -239,10 +239,10 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
     `x, y, fwhm_x, fwhm_y, theta` equal the fit's as f32, `fwhm_x >= fwhm_y`.
   - `median_zero_colours_green` (a pin: `annotate.rs:426-428` already does it): `ColorScheme::Fwhm` with
     `median_fwhm = 0.0` gives `[0, 255, 0]` (a frame whose only fits are saturated).
-- [ ] **Step 2: fail.** `cargo test -p rustafits annotate` → FAIL (types missing).
-- [ ] **Step 3: implement** per Interfaces; the drawing primitives stay as they are.
-- [ ] **Step 4: pass,** then G-3.
-- [ ] **Step 5: commit** `feat(annotate): StarOverlay, a star list both the measurement and AnalysisResult draw through (port phase 5.2)`.
+- [x] **Step 2: fail.** `cargo test -p rustafits annotate` → FAIL (types missing).
+- [x] **Step 3: implement** per Interfaces; the drawing primitives stay as they are.
+- [x] **Step 4: pass,** then G-3.
+- [x] **Step 5: commit** `feat(annotate): StarOverlay, a star list both the measurement and AnalysisResult draw through (port phase 5.2)`.
 
 ### T3 (rustafits) — 5.2, CLI half: `convert --annotate` on `analysis_mode`
 
@@ -255,7 +255,7 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
 - Consumes: T1's `measure_file`, `budget_parser`, `warn_ignored`; T2's `StarOverlay::from_measurement`,
   `annotate_image_with`.
 
-- [ ] **Step 1: tests (failing).**
+- [x] **Step 1: tests (failing).**
   An ellipse is a ring whose semi-axes clamp to ≥ `min_radius` 6 output px (`src/annotate.rs:49, :112-113`; the
   fixture's FWHM 2.8 is far below it), so the tests look for the ring, not the centre:
   - `annotate_draws_on_the_stars`: `write_star_field` sharp → `rustafits sharp.fits a.png -a` and `plain.png`; the
@@ -266,8 +266,8 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
   - `annotate_old_flags_still_run`: `-a --measure-cap 0` exits 0 with one warning; `-a --max-stars 5` exits 2.
   - `annotate_reports_a_broken_file_and_keeps_the_rest`: one good and one broken file with `-a` → exit 1, the good
     output written.
-- [ ] **Step 2: fail.**
-- [ ] **Step 3: implement.** With `--annotate`: `measure_file` first (budget = `--max-stars`, other options
+- [x] **Step 2: fail.**
+- [x] **Step 3: implement.** With `--annotate`: `measure_file` first (budget = `--max-stars`, other options
   default); it returns without the planes, so the render's `read_raw` starts after they are freed and the two reads
   never overlap in memory (the file is read twice: the measurement's reader states the ADU facts, the render's does
   not; the measurement dominates the time); the overlay is
@@ -277,8 +277,8 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
   comment: wall time and peak RSS (`/usr/bin/time -l`) of `convert -a` and `analyze` over four copies of
   `tests/cocoon.fits` at `-j 1` and `-j 2`, release build, and the same `analyze` runs on `main`'s binary, so the
   CHANGELOG can say how the speed moved; P5-4's bar decides the default.
-- [ ] **Step 4: pass,** then G-3.
-- [ ] **Step 5: commit** `feat(cli): --annotate draws the analysis_mode measurement (port phase 5.2)`.
+- [x] **Step 4: pass,** then G-3.
+- [x] **Step 5: commit** `feat(cli): --annotate draws the analysis_mode measurement (port phase 5.2)`.
 
 ### T4 (rustafits, only if Q-1 is yes) — the FITS reader's Bayer offsets by the catalog rule
 
@@ -290,19 +290,19 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
 **Interfaces:**
 - Consumes: `formats::stored_keys::FitsHeader::{from_bytes, get_i32}` (crate-private, `src/formats/stored_keys/fits_header_reader.rs:138, :160`).
 
-- [ ] **Step 1: tests (failing).** `quoted_bayer_offsets_fold_like_the_catalog`: `BAYERPAT= 'RGGB'`, `XBAYROFF= '1'`
+- [x] **Step 1: tests (failing).** `quoted_bayer_offsets_fold_like_the_catalog`: `BAYERPAT= 'RGGB'`, `XBAYROFF= '1'`
   → pattern GRBG; `YBAYROFF= '1'` alone → GBRG; both → BGGR. `bayer_offsets_follow_the_catalog_rule_on_unusual_cards`:
   a repeated `XBAYROFF` (0 then 1), a lower-case `xbayroff = 1`, and `XBAYROFF= 1.0` give exactly what
   `FitsHeader::from_bytes(…).get_i32("XBAYROFF")` gives — computed in the test, not hand-written, so the test pins
   parity. Plain `XBAYROFF= 1` keeps today's result (a regression line).
-- [ ] **Step 2: fail.**
-- [ ] **Step 3: implement:** `read_fits_header` (`:65-130`) reads 2880-byte blocks without keeping them; it now also
+- [x] **Step 2: fail.**
+- [x] **Step 3: implement:** `read_fits_header` (`:65-130`) reads 2880-byte blocks without keeping them; it now also
   appends each block to a `Vec<u8>` and, after `END`, takes both offsets from `stored_keys::FitsHeader::from_bytes(…)?
   .get_i32(…)` (absent → 0; import it under another name: the reader has its own `FitsHeader` struct). If
   `from_bytes` fails where the reader's own parse succeeded, keep the reader's integer-prefix values and log a
   `tracing::warn!` with the error (never silently). Every other card keeps the reader's own parse.
-- [ ] **Step 4: pass,** G-3, and G5-b's render identity (none of the four test files carries an offset).
-- [ ] **Step 5: commit** `fix(fits): XBAYROFF / YBAYROFF read by Athenaeum's catalog rule (quoted, repeated, any case)`.
+- [x] **Step 4: pass,** G-3, and G5-b's render identity (none of the four test files carries an offset).
+- [x] **Step 5: commit** `fix(fits): XBAYROFF / YBAYROFF read by Athenaeum's catalog rule (quoted, repeated, any case)`.
 
 ### T5 (rustafits) — 5.4: `#[deprecated]` on `ImageAnalyzer::analyze*`
 
@@ -313,20 +313,20 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
   `tests/fast_detect_real.rs`, and the three examples `cargo test` compiles (no `autoexamples = false`):
   `examples/analyze_batch.rs:29`, `examples/trail_test.rs:9`, `examples/fastdump.rs:9`.
 
-- [ ] **Step 1:** add `#[deprecated(since = "1.8.0", note = "use star_measure::analysis_mode (raw::read_raw_frame, measure_raw_frame, FrameSummary); removed in 2.0")]`
+- [x] **Step 1:** add `#[deprecated(since = "1.8.0", note = "use star_measure::analysis_mode (raw::read_raw_frame, measure_raw_frame, FrameSummary); removed in 2.0")]`
   to the four methods; not to `detect_fast*`, `with_*`, `AnalysisResult` or `StarMetrics`.
-- [ ] **Step 2:** build every G-3 target and list each deprecation warning. Silence them where the legacy pipeline is
+- [x] **Step 2:** build every G-3 target and list each deprecation warning. Silence them where the legacy pipeline is
   the subject: `#![allow(deprecated)]` at the top of `tests/analysis.rs`, `tests/fast_detect_real.rs`,
   `examples/trail_test.rs` and `examples/fastdump.rs` (each with one comment line: it exercises the legacy analyzer,
   removed in 2.0), and an item-level `#[allow(deprecated)]` on debug.rs's `cmd_pipeline` / `analyze_one_file` (P5-6).
   `examples/analyze_batch.rs` is the library's batch showcase, so it is ported instead: rayon over the paths calling
   `read_raw_frame` → `measure_raw_frame` → `FrameSummary::from_measurement`, printing the same per-file line. Any other
   caller is a defect of T1 / T3, reported, not silenced.
-- [ ] **Step 3:** `rustafits-debug`'s usage text gains one line: it diagnoses the legacy `ImageAnalyzer` pipeline
+- [x] **Step 3:** `rustafits-debug`'s usage text gains one line: it diagnoses the legacy `ImageAnalyzer` pipeline
   (deprecated since 1.8.0); the measurement Athenaeum and `rustafits analyze` use is `star_measure`.
-- [ ] **Step 4:** G-3 with zero `deprecated` warnings (`cargo build … 2>&1 | grep -c 'use of deprecated'` → 0 on every
+- [x] **Step 4:** G-3 with zero `deprecated` warnings (`cargo build … 2>&1 | grep -c 'use of deprecated'` → 0 on every
   target).
-- [ ] **Step 5: commit** `chore(analysis): deprecate ImageAnalyzer::analyze* for star_measure::analysis_mode (port phase 5.4)`.
+- [x] **Step 5: commit** `chore(analysis): deprecate ImageAnalyzer::analyze* for star_measure::analysis_mode (port phase 5.4)`.
 
 ### T6 (rustafits) — 5.3: docs, CHANGELOG, CLAUDE.md
 
@@ -334,23 +334,23 @@ read at rustafits `main` 8b25b85 (= Athenaeum `main` b3cbeb85's pin) on 2026-11-
 `docs/athenaeum-integration.md` §2–3 (`:81-360`); `docs/analysis-pipeline.md:1-10`; `CLAUDE.md` (Crate Structure,
 Downstream Users); `CHANGELOG.md` `[Unreleased]`; the port plan's §6 phase 5 (status).
 
-- [ ] **Step 1: README.** The `analyze` section: what it measures (Athenaeum's Analysis numbers: 6.0 σ, Moffat 4, 500
+- [x] **Step 1: README.** The `analyze` section: what it measures (Athenaeum's Analysis numbers: 6.0 σ, Moffat 4, 500
   stars), the new flags, the VERDICT column, the deprecated flags, and the example table regenerated from the T1
   release build on `tests/mono.fits tests/osc.fits tests/test.xisf --sort fwhm`. The library section leads with
   `star_measure::analysis_mode`; the `ImageAnalyzer` examples move under "Legacy analyzer (deprecated since 1.8.0,
   removed in 2.0)"; fast detection stays where it is; the annotation example uses `StarOverlay` +
   `annotate_image_with`; the dependency snippet's `version = "1.6"` (`README.md:174`) becomes `"1.8"`.
-- [ ] **Step 2: docs/.** `usage.md`: a new first section for `analysis_mode` (read, measure, summarize, the overlay),
+- [x] **Step 2: docs/.** `usage.md`: a new first section for `analysis_mode` (read, measure, summarize, the overlay),
   the rest under the legacy heading. `annotation.md`: `StarOverlay` and the three `*_overlay` / `_with` functions, the
   legacy functions as wrappers, the CLI's `--max-stars` budget. `athenaeum-integration.md` §2: Athenaeum measures
   through `pub use astroimage::star_measure` (stacking, LN, Analysis, Blink, plate-solve gate), not `ImageAnalyzer`;
   §3: the overlay types. `analysis-pipeline.md`: a two-line banner (legacy pipeline, deprecated, see `star_measure`).
-- [ ] **Step 3: CLAUDE.md.** Crate Structure: `analyze` runs `analysis_mode` and `tests/cli.rs` pins it to
+- [x] **Step 3: CLAUDE.md.** Crate Structure: `analyze` runs `analysis_mode` and `tests/cli.rs` pins it to
   `measure_raw_frame` + `FrameSummary`; drop "These are no longer the numbers Athenaeum shows". Downstream Users: the
   two stale paragraphs (`ImageAnalyzer::analyze*` "no longer called by the app…", and the port-plan sentence) say
   deprecated since 1.8.0, removed in 2.0, callers left: Athenaeum's probe arm and lab, `rustafits-debug`, the
   `trail_test` / `fastdump` examples and the legacy tests.
-- [ ] **Step 4: CHANGELOG `[Unreleased]`** (it already holds phase 4): **Changed** — `rustafits analyze` and
+- [x] **Step 4: CHANGELOG `[Unreleased]`** (it already holds phase 4): **Changed** — `rustafits analyze` and
   `--annotate` measure with `star_measure::analysis_mode`, so the numbers change (they are Athenaeum's Analysis
   numbers); VERDICT replaces TRAIL; six CSV / JSON columns appended; `--max-stars` 10–2000. **Added** — `StarOverlay`,
   `OverlayStar`, `compute_overlay`, `create_overlay_layer`, `annotate_image_with`; `--detection-threshold`,
@@ -358,7 +358,7 @@ Downstream Users); `CHANGELOG.md` `[Unreleased]`; the port plan's §6 phase 5 (s
   `analyze --no-debayer`; `convert --max-stars` below 10 is refused. **Fixed** (if T4) — FITS `XBAYROFF` /
   `YBAYROFF` read by Athenaeum's catalog rule: a quoted value, any case, the first of a repeated card; a fractional value
   still truncates in FITS and rounds in XISF, by design (P5-7).
-- [ ] **Step 5:** the port plan's phase 5 items 5.1–5.4 ticked with this plan's path; commit
+- [x] **Step 5:** the port plan's phase 5 items 5.1–5.4 ticked with this plan's path; commit
   `docs: phase 5 — analyze and --annotate on analysis_mode, the overlay API, the deprecation (port phase 5.3)`.
 
 ### T7 (Athenaeum, after the 1.8.0 tag) — the bump and the deprecation's callers
