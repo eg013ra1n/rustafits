@@ -288,6 +288,31 @@ fn info_summarises_headers_without_pixels() {
     assert!(all.contains("EXPTIME  = 30.0  / [s]") && all.contains("COMMENT  = synthetic"), "{all}");
 }
 
+/// `info` shows the Bayer pattern with the offsets folded in by Athenaeum's catalog rule: a quoted
+/// `XBAYROFF= '1'` counts (RGGB -> GRBG), the first of a repeated card wins, and the plain card is as before.
+#[test]
+fn info_folds_quoted_and_repeated_bayer_offsets_like_the_catalog() {
+    let dir = scratch("info-bayroff");
+    let cases: [(&str, &[&str], &str); 4] = [
+        ("plain.fits", &["XBAYROFF= 1"], "GRBG"),
+        ("quoted.fits", &["XBAYROFF= '1'"], "GRBG"),
+        ("repeated.fits", &["XBAYROFF= 0", "XBAYROFF= 1"], "RGGB"),
+        ("quoted_both.fits", &["XBAYROFF= '1'", "YBAYROFF= '1'"], "BGGR"),
+    ];
+    for (name, cards, _) in cases {
+        let mut extra = vec!["BAYERPAT= 'RGGB'".to_string()];
+        extra.extend(cards.iter().map(|c| c.to_string()));
+        write_star_field(&dir.join(name), 1.5, &extra);
+    }
+    for (name, _, want) in cases {
+        let o = run(&dir, &["info", name, "--csv"]);
+        assert!(o.status.success(), "{}", stderr(&o));
+        let row = stdout(&o).lines().nth(1).unwrap().to_string();
+        let bayer = row.split(',').nth(3).unwrap();
+        assert_eq!(bayer, want, "{name}: {row}");
+    }
+}
+
 /// Parse `analyze --csv` into (header, rows).
 fn analyze_csv(dir: &Path, args: &[&str]) -> (Vec<String>, Vec<Vec<String>>) {
     let mut full = vec!["analyze", "--csv", "--quiet"];
