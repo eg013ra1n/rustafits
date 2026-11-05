@@ -5,7 +5,7 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.8.0] — 2026-11-05
 
 The Analysis-mode entry of Athenaeum's star measurement moves here (port plan
 phase 4): the raw-frame input, the measurement with the frame figures its
@@ -19,7 +19,8 @@ Port plan phase 5: `rustafits analyze` and `convert --annotate` measure with
 `star_measure::analysis_mode`, so the CLI prints the numbers Athenaeum's
 Analysis tab shows. The annotation API draws any star list, not only a legacy
 `AnalysisResult`. `ImageAnalyzer::analyze*` is deprecated and goes in 2.0. A
-FITS `XBAYROFF` / `YBAYROFF` is read by Athenaeum's rule.
+FITS `XBAYROFF` / `YBAYROFF` is read by Athenaeum's rule. The library stays
+additive, hence a minor bump; the CLI's numbers change by design (see Changed).
 
 ### Added
 
