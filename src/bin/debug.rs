@@ -48,6 +48,7 @@ struct Opts {
 
 fn print_usage() {
     eprintln!("rustafits-debug: diagnostic CLI for the analysis pipeline");
+    eprintln!("It diagnoses the legacy ImageAnalyzer pipeline (deprecated since 1.8.0); the measurement Athenaeum and `rustafits analyze` use is star_measure.");
     eprintln!();
     eprintln!("Usage: rustafits-debug <subcommand> <input> [OPTIONS]");
     eprintln!();
@@ -955,6 +956,8 @@ fn cmd_query(
 
 // ── Pipeline ─────────────────────────────────────────────────────────────────
 
+// Diagnoses the legacy ImageAnalyzer pipeline (deprecated since 1.8.0, removed in 2.0, P5-6).
+#[allow(deprecated)]
 fn cmd_pipeline(
     lum: &[f32],
     w: usize,
@@ -1248,6 +1251,8 @@ fn csv_split(line: &str) -> Vec<String> {
 }
 
 /// Run analysis on a single file and return our measurements.
+// Diagnoses the legacy ImageAnalyzer pipeline (deprecated since 1.8.0, removed in 2.0, P5-6).
+#[allow(deprecated)]
 fn analyze_one_file(
     path: &std::path::Path,
     opts: &Opts,

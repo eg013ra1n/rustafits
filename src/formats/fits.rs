@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 
+use super::stored_keys::FitsHeader as CatalogHeader;
 use crate::types::{BayerPattern, DataType, FileFormat, HeaderKeyword, ImageHeader, ImageMetadata, PixelData};
 
 const FITS_BLOCK_SIZE: usize = 2880;
@@ -62,7 +63,17 @@ fn parse_string_keyword(card: &str, keyword: &str) -> Option<String> {
 
 /// Read the primary header up to END. With `cards_out`, every card before END
 /// is also collected (as the parser saw it) for [`read_fits_header_info`].
-fn read_fits_header(reader: &mut BufReader<File>, mut cards_out: Option<&mut Vec<String>>) -> Result<FitsHeader> {
+///
+/// `XBAYROFF` / `YBAYROFF` are the exception to the reader's own card parse:
+/// they come from Athenaeum's catalog reader (`stored_keys::FitsHeader`, over
+/// the same header blocks), so a quoted, lower-case or repeated card (the
+/// first one wins) means to the render, the Analysis numbers and the catalog
+/// what it means to the catalog. `path` only names the file in the warning.
+fn read_fits_header(
+    reader: &mut BufReader<File>,
+    path: &Path,
+    mut cards_out: Option<&mut Vec<String>>,
+) -> Result<FitsHeader> {
     let mut hdr = FitsHeader {
         bitpix: 0,
         naxis: 0,
@@ -78,12 +89,14 @@ fn read_fits_header(reader: &mut BufReader<File>, mut cards_out: Option<&mut Vec
     };
 
     let mut block = [0u8; FITS_BLOCK_SIZE];
+    let mut header_bytes: Vec<u8> = Vec::with_capacity(FITS_BLOCK_SIZE);
     let mut found_end = false;
 
     while !found_end {
         reader
             .read_exact(&mut block)
             .context("Failed to read FITS header block")?;
+        header_bytes.extend_from_slice(&block);
 
         for i in 0..(FITS_BLOCK_SIZE / FITS_CARD_SIZE) {
             let card_bytes = &block[i * FITS_CARD_SIZE..(i + 1) * FITS_CARD_SIZE];
@@ -121,6 +134,22 @@ fn read_fits_header(reader: &mut BufReader<File>, mut cards_out: Option<&mut Vec
                 hdr.roworder = v;
             }
         }
+    }
+
+    // The offsets by the catalog's rule; the integer-prefix values the card loop
+    // read stay only if the catalog reader cannot parse this header at all. The
+    // warning reaches a caller that installs a tracing subscriber (Athenaeum's
+    // log); the `rustafits` binary installs none yet, so it shows nothing there.
+    match CatalogHeader::from_bytes(&header_bytes) {
+        Ok(catalog) => {
+            hdr.xbayroff = catalog.get_i32("XBAYROFF").unwrap_or(0);
+            hdr.ybayroff = catalog.get_i32("YBAYROFF").unwrap_or(0);
+        }
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            error = %format!("{e:#}"),
+            "catalog header parse failed; Bayer offsets from the reader"
+        ),
     }
 
     if hdr.bitpix == 0 {
@@ -181,7 +210,7 @@ pub fn read_fits_header_info(path: &Path) -> Result<ImageHeader> {
     let file = File::open(path).context("Failed to open FITS file")?;
     let mut reader = BufReader::new(file);
     let mut cards = Vec::new();
-    let hdr = read_fits_header(&mut reader, Some(&mut cards))?;
+    let hdr = read_fits_header(&mut reader, path, Some(&mut cards))?;
     let (channels, bayer_pattern, flip_vertical) = layout(&hdr)?;
     let sample_type = match hdr.bitpix {
         8 => "u8",
@@ -249,7 +278,7 @@ pub fn read_fits_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     let file = File::open(path).context("Failed to open FITS file")?;
     let mut reader = BufReader::new(file);
 
-    let hdr = read_fits_header(&mut reader, None)?;
+    let hdr = read_fits_header(&mut reader, path, None)?;
 
     let (channels, bayer_pattern, flip_vertical) = layout(&hdr)?;
 
@@ -595,6 +624,169 @@ mod tests {
             }
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A 4 x 2 unsigned 16-bit top-down CFA FITS with BAYERPAT 'RGGB' whose
+    /// `extra` cards are written verbatim (padded to 80 columns), so a card
+    /// can be quoted, repeated or lower-case. Returns the header bytes, the
+    /// very bytes Athenaeum's catalog reads.
+    fn write_cfa_fits_raw(path: &Path, extra: &[&str]) -> Vec<u8> {
+        let mut cards = vec![
+            make_card("SIMPLE", "T"),
+            make_card("BITPIX", 16),
+            make_card("NAXIS", 2),
+            make_card("NAXIS1", 4),
+            make_card("NAXIS2", 2),
+            make_card("BZERO", 32768),
+            make_card("BAYERPAT", "'RGGB'"),
+            make_card("ROWORDER", "'TOP-DOWN'"),
+        ];
+        cards.extend(extra.iter().map(|c| format!("{c:<width$}", width = FITS_CARD_SIZE)));
+        let header = build_header_block(&cards);
+        let mut bytes = header.clone();
+        bytes.extend([0u8; 4 * 2 * 2]);
+        bytes.resize(bytes.len().div_ceil(FITS_BLOCK_SIZE) * FITS_BLOCK_SIZE, 0);
+        std::fs::write(path, bytes).expect("failed to write synthetic FITS test file");
+        header
+    }
+
+    /// The pattern both readers (pixel and header-only) report for `path`.
+    fn both_readers_pattern(path: &Path, what: &str) -> BayerPattern {
+        let (meta, _) = read_fits_image(path).unwrap();
+        let info = read_fits_header_info(path).unwrap();
+        assert_eq!(meta.bayer_pattern, info.bayer_pattern, "pixel and header-only reads disagree, {what}");
+        meta.bayer_pattern
+    }
+
+    #[test]
+    fn quoted_bayer_offsets_fold_like_the_catalog() {
+        use BayerPattern as P;
+        let path = std::env::temp_dir().join(format!("rustafits_test_quoted_bayroff_{}.fits", std::process::id()));
+        let cases: [(&[&str], BayerPattern); 5] = [
+            (&["XBAYROFF= '1'"], P::Grbg),
+            (&["YBAYROFF= '1'"], P::Gbrg),
+            (&["XBAYROFF= '1'", "YBAYROFF= '1'"], P::Bggr),
+            (&["XBAYROFF= '1       ' / padded and commented", "YBAYROFF= '0'"], P::Grbg),
+            (&["XBAYROFF= '2'", "YBAYROFF= '3'"], P::Gbrg),
+        ];
+        for (cards, want) in cases {
+            write_cfa_fits_raw(&path, cards);
+            assert_eq!(both_readers_pattern(&path, &format!("{cards:?}")), want, "{cards:?}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The offsets are what Athenaeum's catalog reads from the same header
+    /// bytes (`FitsHeader::get_i32`, the first of a repeated card, any case,
+    /// a fraction truncated), folded into the pattern; the expected values
+    /// are computed by that reader, never written by hand, so the test pins
+    /// the parity.
+    #[test]
+    fn bayer_offsets_follow_the_catalog_rule_on_unusual_cards() {
+        use BayerPattern as P;
+        let path = std::env::temp_dir().join(format!("rustafits_test_catalog_bayroff_{}.fits", std::process::id()));
+        let cases: &[&[&str]] = &[
+            &["XBAYROFF= 1 / Bayer pattern X axis offset", "YBAYROFF= 0 / Bayer pattern Y axis offset"],
+            &["XBAYROFF= 0", "XBAYROFF= 1"],
+            &["XBAYROFF= 1", "XBAYROFF= 0"],
+            &["YBAYROFF= 0", "YBAYROFF= 1", "XBAYROFF= '1'"],
+            &["xbayroff= 1"],
+            &["xbayroff = 1"],
+            &["Ybayroff= 1"],
+            &["XBAYROFF= 1.0"],
+            &["XBAYROFF= 0.6", "YBAYROFF= 1.9"],
+            &["XBAYROFF= 0.1E1"],
+            &["XBAYROFF= 1D0"],
+            &["XBAYROFF= -1", "YBAYROFF= +1"],
+            &["XBAYROFF= 1 / comment", "YBAYROFF= -1"],
+        ];
+        let mut seen = Vec::new();
+        for cards in cases {
+            let header = write_cfa_fits_raw(&path, cards);
+            let catalog = CatalogHeader::from_bytes(&header).unwrap();
+            let (x, y) = (catalog.get_i32("XBAYROFF").unwrap_or(0), catalog.get_i32("YBAYROFF").unwrap_or(0));
+            let want = super::super::shift_bayer_pattern(P::Rggb, x % 2 != 0, y % 2 != 0);
+            assert_eq!(
+                both_readers_pattern(&path, &format!("{cards:?}")),
+                want,
+                "{cards:?}: the catalog reads XBAYROFF {x}, YBAYROFF {y}"
+            );
+            if !seen.contains(&want) {
+                seen.push(want);
+            }
+        }
+        assert!(seen.len() >= 3, "the cases must exercise several patterns, saw {seen:?}");
+
+        // The plain card keeps today's result.
+        write_cfa_fits_raw(&path, &["XBAYROFF= 1 / Bayer pattern X axis offset", "YBAYROFF= 0"]);
+        assert_eq!(both_readers_pattern(&path, "plain card"), P::Grbg);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A header of two blocks with the offset card in the second one: the
+    /// catalog parse must see every block the reader read, not only the first.
+    /// The expected value is the catalog reader's on the same bytes.
+    #[test]
+    fn bayer_offsets_in_the_second_header_block_follow_the_catalog() {
+        use BayerPattern as P;
+        let path = std::env::temp_dir().join(format!("rustafits_test_block2_bayroff_{}.fits", std::process::id()));
+        // 8 base cards + 40 filler cards fill block 1 (36 cards) and spill into block 2.
+        let mut cards: Vec<String> = (0..40).map(|i| format!("FILLER{i:02}= {i}")).collect();
+        cards.push("XBAYROFF= '1'".to_string());
+        let cards: Vec<&str> = cards.iter().map(String::as_str).collect();
+        let header = write_cfa_fits_raw(&path, &cards);
+
+        assert_eq!(header.len(), 2 * FITS_BLOCK_SIZE, "the premise: the header has two blocks");
+        assert!(
+            !String::from_utf8_lossy(&header[..FITS_BLOCK_SIZE]).contains("XBAYROFF"),
+            "the premise: the offset card is not in the first block"
+        );
+        let catalog = CatalogHeader::from_bytes(&header).unwrap();
+        let (x, y) = (catalog.get_i32("XBAYROFF").unwrap_or(0), catalog.get_i32("YBAYROFF").unwrap_or(0));
+        assert_eq!((x, y), (1, 0), "the premise: the catalog reads the card in block 2");
+        let want = super::super::shift_bayer_pattern(P::Rggb, x % 2 != 0, y % 2 != 0);
+        assert_eq!(want, P::Grbg);
+        assert_eq!(both_readers_pattern(&path, "offset card in the second header block"), want);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A header the reader parses to its END but the catalog reader does not
+    /// (an END card with text in columns 5-8 is not END to the catalog)
+    /// keeps the reader's own integer-prefix offsets and logs the failure.
+    #[test]
+    fn bayer_offsets_fall_back_to_the_reader_when_the_catalog_parse_fails() {
+        use BayerPattern as P;
+        let path = std::env::temp_dir().join(format!("rustafits_test_fallback_bayroff_{}.fits", std::process::id()));
+        // build_header_block appends the well-formed END after these cards;
+        // the file is cut at the malformed one instead.
+        let mut cards = vec![
+            make_card("SIMPLE", "T"),
+            make_card("BITPIX", 16),
+            make_card("NAXIS", 2),
+            make_card("NAXIS1", 4),
+            make_card("NAXIS2", 2),
+            make_card("BZERO", 32768),
+            make_card("BAYERPAT", "'RGGB'"),
+            make_card("XBAYROFF", 1),
+            make_card("YBAYROFF", 1),
+        ];
+        cards.push(format!("{:<width$}", "END  x", width = FITS_CARD_SIZE));
+        let mut bytes: Vec<u8> = cards.iter().flat_map(|c| c.bytes()).collect();
+        bytes.resize(FITS_BLOCK_SIZE, b' ');
+        bytes.extend([0u8; 4 * 2 * 2]);
+        bytes.resize(2 * FITS_BLOCK_SIZE, 0);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            CatalogHeader::from_bytes(&std::fs::read(&path).unwrap()[..FITS_BLOCK_SIZE]).is_err(),
+            "the premise: the catalog reader does not find an END in this header"
+        );
+
+        let mut got = None;
+        let logs = crate::test_support::captured_logs(|| got = Some(both_readers_pattern(&path, "fallback")));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(got, Some(P::Bggr), "the reader's own offsets (1, 1) fold RGGB into BGGR");
+        assert!(logs.contains("catalog header parse failed; Bayer offsets from the reader"), "{logs}");
+        assert!(logs.contains("WARN") && logs.contains("rustafits_test_fallback_bayroff_"), "the warning names the path: {logs}");
     }
 
     /// A star lit only on the red sites of the sensor renders red, whichever

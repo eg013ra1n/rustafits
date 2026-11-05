@@ -342,11 +342,12 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
 /// value of a name (upper-cased) wins, and a value is read as a number — quotes and blanks trimmed, `f64`, rounded,
 /// non-finite or unreadable counts as 0 — whose parity is the offset's.
 ///
-/// The FITS reader reads its offsets by its own card rule instead, and the two readers differ on these inputs, among
-/// them: a non-integer value (`0.6` is 0 for FITS, which takes the integer prefix of the card, and 1 here), a quoted
-/// value (`'1'` is 0 for FITS and 1 here), a keyword repeated (the last card for FITS, the first non-empty value here),
-/// the keyword's case (FITS matches upper case only, XISF any case) and blanks around the name (XISF trims them; FITS
-/// needs the keyword at column 1).
+/// The FITS reader reads its offsets through the same module (`FitsHeader::get_i32`, Athenaeum's rule for a FITS
+/// header; since 1.8.0), so a quoted value (`'1'` is 1 for both), the keyword's case and a repeated keyword (the first
+/// card wins) read alike. Three differences remain, each Athenaeum's rule for its format, kept so that its numbers do
+/// not move: a non-integer value (`0.6` is 0 for FITS, which truncates, and 1 here, where it is rounded); a repeated
+/// keyword whose first card is empty (FITS keeps that card and reads 0, here the first non-empty value wins); and
+/// blanks around the name (XISF trims them; FITS needs the keyword at column 1).
 fn odd_bayer_offsets(xml: &str) -> (bool, bool) {
     let keys = stored_keys::xisf_stored_keys(xml, None);
     let odd = |key: &str| stored_keys::offset(stored_keys::num(&keys, key)).rem_euclid(2) == 1;

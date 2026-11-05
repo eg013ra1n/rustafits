@@ -15,6 +15,12 @@ Blink and plate-solve gate call them. Plus the XISF `XBAYROFF` / `YBAYROFF`
 fix (see Fixed): the raw input leaves the offsets to the readers. Additive for
 existing callers, bar that fix.
 
+Port plan phase 5: `rustafits analyze` and `convert --annotate` measure with
+`star_measure::analysis_mode`, so the CLI prints the numbers Athenaeum's
+Analysis tab shows. The annotation API draws any star list, not only a legacy
+`AnalysisResult`. `ImageAnalyzer::analyze*` is deprecated and goes in 2.0. A
+FITS `XBAYROFF` / `YBAYROFF` is read by Athenaeum's rule.
+
 ### Added
 
 - **`star_measure::raw`**: `read_raw_frame` reads a FITS / XISF file as a
@@ -36,6 +42,62 @@ existing callers, bar that fix.
   **`star_measure::trail`** (trail R²: the Rayleigh statistic of the measured
   stars' angles): the two helpers `analysis_mode` calls, public like the rest
   of `star_measure`'s submodules, outside the stable entry.
+- **`StarOverlay` and `OverlayStar`**: the star list the annotation functions
+  draw: each star's position and ellipse shape in the pixels the frame was
+  measured on, and the frame's median FWHM. `StarOverlay::from_measurement`
+  builds one from an `analysis_mode` measurement, and `StarOverlay::from(&result)`
+  from a legacy `AnalysisResult`. Both are plain structs with public fields, so
+  a caller can fill one from its own measurements. Their fields are fixed for
+  1.x.
+- **`compute_overlay`, `create_overlay_layer`, `annotate_image_with`**: the
+  three annotation tiers (raw geometry, a transparent RGBA layer, burn-in) over
+  a `StarOverlay`. `compute_annotations`, `create_annotation_layer` and
+  `annotate_image` stay and give the same results: they call the new functions.
+  `StarAnnotation` now derives `Debug`, `Clone`, `Copy` and `PartialEq`.
+- **`rustafits analyze --detection-threshold <SIGMA>`** (2 to 20, default 6.0),
+  **`--psf-model moffat4|auto`** (default `moffat4`) and **`--max-stars <N>`**
+  (10 to 2000, default 500): the three settings of Athenaeum's Analysis tab.
+
+### Changed
+
+- **`rustafits analyze` and `convert --annotate` measure with
+  `star_measure::analysis_mode`**, so their numbers change: they are Athenaeum's
+  Analysis numbers (a 6.0 σ matched-filter threshold, a Moffat profile with
+  beta fixed at 4, the brightest 500 good stars), no longer `ImageAnalyzer`'s.
+  `convert -a` draws the stars that measurement kept. On `analyze`:
+  - the table's VERDICT column replaces TRAIL. A frame the measurement judges
+    trailed, defocused or without stars shows that word, `-` for its medians,
+    and `--sort` by a metric ranks it after every other frame;
+  - the CSV and JSON keep their first 19 columns in their order and append six:
+    `channels`, `stars_refused`, `frame_verdict`, `measure_version`,
+    `detection_threshold`, `psf_model`;
+  - `median_beta` is empty (`null` in JSON) unless `--psf-model auto`, because
+    Moffat 4 fixes beta;
+  - `--max-stars` is the star budget the measurement works with. On
+    `convert --max-stars` it is now 10 to 2000: a value below 10 is refused.
+- `analyze` and `convert -a` run about as fast as before on 26 MP frames (the
+  timing ran on a loaded machine, so there are no percentages), with 0.1 to
+  0.25 GB more peak memory at one and at two jobs. The `-j` default for both
+  stays 2.
+- `convert -a` now fails a file that the measurement's reader refuses (it reads
+  the file's ADU facts, `star_measure::raw::read_raw_frame`), even when a plain
+  render could read it. The error names the file. `analyze` refuses the same
+  files.
+- `examples/analyze_batch.rs` shows `analysis_mode` (rayon over files, one
+  shared pool) and takes the files on the command line.
+
+### Deprecated
+
+- **`ImageAnalyzer::analyze`, `analyze_data`, `analyze_raw` and
+  `analyze_batch`**: use `star_measure::analysis_mode` (`raw::read_raw_frame`,
+  `measure_raw_frame`, `FrameSummary`). They are removed in 2.0. `detect_fast*`
+  and the builder are not deprecated.
+- The CLI flags of the old analyzer, still accepted so scripts keep running and
+  hidden from `--help`; each prints a warning on stderr and goes in 2.0:
+  `analyze --sigma` (now `--detection-threshold`, for another detector: default
+  6.0, it was 5.0), `--measure-cap` on `analyze` and `convert` (no effect: the
+  budget is `--max-stars`) and `analyze --no-debayer` (no effect: a mosaic is
+  measured on its green sites).
 
 ### Fixed
 
@@ -48,16 +110,27 @@ existing callers, bar that fix.
   (`analyze*`, `detect_fast*`) took red / blue sites for green. `read_header`
   and `rustafits info` report the folded pattern. An XISF offset is read by
   Athenaeum's rule for header values, copied into the crate: a number, rounded
-  (`0.6` counts as 1), the first non-empty value of the keyword, unlike the FITS
-  reader's integer prefix of the last card, so that the XISF figures of
-  Athenaeum's Analysis tab, which always read it this way, do not move on any
-  input (the keyword list of `read_header` and `rustafits info` still shows
+  (`0.6` counts as 1), the first non-empty value of the keyword, so that the
+  XISF figures of Athenaeum's Analysis tab, which always read it this way, do
+  not move on any input. Since 1.8.0 the FITS reader reads its offsets by
+  Athenaeum's FITS rule too (see the FITS entry below); the two rules still
+  differ on a fraction, on an empty first card and on blanks around the name.
+  The keyword list of `read_header` and `rustafits info` still shows
   `XBAYROFF` by `ImageHeader`'s own rule, so on an unusual value it can differ
-  from the folded pattern). The offsets are folded onto whatever pattern
+  from the folded pattern. The offsets are folded onto whatever pattern
   the file declares (`BAYERPAT` or `<ColorFilterArray>`), as that tab always
   did: a file whose `<ColorFilterArray>` already includes its odd offset has it
   counted twice. Files without the keywords, or with even offsets, read and
   render exactly as before.
+- FITS: `XBAYROFF` / `YBAYROFF` are read by Athenaeum's catalog rule: a quoted
+  value (`'1'` counts as 1), the keyword in any case, and the first card of a
+  repeated keyword. The reader used to take the integer prefix of an unquoted
+  card only (`'1'` read 0), to match upper case only and to keep the last card
+  of a repeat, so on such a file its Bayer pattern disagreed with the one
+  Athenaeum's catalog records, and the render and the measurement used the
+  wrong phase. A fractional value still truncates in FITS (`0.6` is 0) and
+  rounds in XISF (`0.6` is 1): that is each format's rule in Athenaeum, kept by
+  design. A file with plain integer offsets reads exactly as before.
 
 ## [1.7.0] — 2026-11-04
 

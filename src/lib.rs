@@ -24,8 +24,9 @@ pub use analysis::{
     FastStar, FitMethod, ImageAnalyzer, StageTiming, StarMetrics,
 };
 pub use annotate::{
-    annotate_image, compute_annotations, create_annotation_layer, AnnotationConfig, ColorScheme,
-    StarAnnotation,
+    annotate_image, annotate_image_with, compute_annotations, compute_overlay,
+    create_annotation_layer, create_overlay_layer, AnnotationConfig, ColorScheme, OverlayStar,
+    StarAnnotation, StarOverlay,
 };
 pub use converter::ImageConverter;
 /// In-memory JPEG encoding (baseline, 4:2:0). Accepts RGB (3 ch) or RGBA (4 ch)

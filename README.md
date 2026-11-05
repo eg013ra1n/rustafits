@@ -11,11 +11,11 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
-- **Image Analysis**: Two-pass Moffat-primary PSF calibration with adaptive moments screening, star detection, FWHM/HFR/eccentricity measurement, SNR computation, auto-tuned mesh-grid background, and MAD noise estimation (optional MRS wavelet)
+- **Star Measurement**: the measurement behind Athenaeum's Analysis tab (`star_measure::analysis_mode`) — matched-filter detection, a Moffat fit per star, one beta per frame, FWHM/HFR/eccentricity/SNR medians, background and noise, and trail and defocus verdicts. `rustafits analyze` and `--annotate` run it. The older `ImageAnalyzer::analyze*` is deprecated since 1.8.0
 - **Plate-Solving Blocks**: quad pattern matching, RANSAC outlier rejection, gnomonic projection, affine/SIP transform fitting and a WCS you can write to a FITS header — building blocks, no catalogue and no orchestration (see [docs/platesolving.md](docs/platesolving.md))
-- **Fast Star Detection**: Lean single-pass detector that skips PSF fitting, SNR photometry, and trail detection — intended for pipelines that only need `(x, y, flux)` centroids (blind plate solving, quick previews). Runs in ~300–500 ms on a full-frame image vs. seconds for the precise analyzer
+- **Fast Star Detection**: Lean single-pass detector that skips PSF fitting, SNR photometry, and trail detection — intended for pipelines that only need `(x, y, flux)` centroids (blind plate solving, quick previews). Runs in ~300–500 ms on a full-frame image vs. seconds for the legacy analyzer
 - **Pure-Rust JPEG Encoder**: SIMD-accelerated JPEG encoding (NEON on aarch64, AVX2/SSE2 on x86_64, scalar fallback elsewhere) — baseline 4:2:0, no C toolchain, no cmake/nasm
-- **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading
+- **Star Annotation**: Color-coded ellipse overlay showing PSF shape, elongation direction, and quality grading, drawn from the same measurement `analyze` prints (or from any star list you build)
 
 ## Supported Formats
 
@@ -100,9 +100,8 @@ leaves no truncated images behind.
 | `-p, --preview` | off | 2x2 binning for mono images |
 | `--no-debayer` | off | Keep the raw Bayer mosaic |
 | `--vng` | off | Debayer at native resolution (VNG) instead of 2x2 super-pixel |
-| `-a, --annotate` | off | Overlay star detection ellipses |
-| `--max-stars <N>` | 500 | Max stars kept for annotation |
-| `--measure-cap <N>` | 2000 | Max stars PSF-fitted for annotation (0 = all) |
+| `-a, --annotate` | off | Overlay ellipses on the stars `analyze` measures (same numbers, same stars) |
+| `--max-stars <N>` | 500 | Star budget for `-a`: the brightest good stars measured and drawn, 10–2000 |
 | `-v, --verbose` | off | Per-file details and timings on stderr (`--log` is an alias) |
 | `--quiet` | off | Errors only |
 
@@ -133,27 +132,65 @@ XISF property ids as fallback (`Instrument:ExposureTime`, …).
 
 ### Star metrics: `rustafits analyze`
 
-Per-frame quality for culling subs. The analyzer (`ImageAnalyzer`) runs with
-the library defaults, so the numbers match what the library reports for the
-same file. Athenaeum's Analysis tab has measured with its own star-measurement
-module since late October 2026, so its numbers differ from these. Moving that
-module into rustafits is planned in
-`docs/superpowers/plans/2026-11-03-star-measure-port.md`.
+Per-frame quality for culling subs. `analyze` measures a frame the way
+Athenaeum's Analysis tab does (`star_measure::analysis_mode`): a matched filter
+finds the stars at 6.0 σ, each gets a Moffat fit with beta fixed at 4, and the
+brightest 500 good ones give the frame's medians. A file reads the same here as
+in the tab. Only the flags you give change that.
 
 ```bash
-$ rustafits analyze tests/ --sort fwhm
-FILE             STARS  FWHM   HFR    ECC    SNR  WEIGHT    BG  NOISE  TRAIL
-tests/mono.fits    679  1.95  1.50  0.408   55.0   128.2   848   34.1  -
-tests/osc.fits     297  2.63  2.05  0.473   25.0   34.10  1276   41.5  -
-tests/test.xisf  14089  3.44  2.07  0.562  202.0   91793   291    8.5  yes
+$ rustafits analyze tests/mono.fits tests/osc.fits tests/test.xisf --sort fwhm
+FILE             STARS  FWHM   HFR    ECC   SNR  WEIGHT    BG  NOISE  VERDICT
+tests/mono.fits   4775  2.01  1.18  0.476  11.9   6.669   850   33.5  -
+tests/osc.fits     590  2.50  2.49  0.424   9.7   6.170  1272   61.8  -
+tests/test.xisf  24284  2.81  2.97  0.590  20.2   190.7   291   11.7  -
 
 rustafits analyze night1/ --csv > night1.csv              # full precision
 rustafits analyze night1/ --focal-length 448 --pixel-size 3.76   # + arcsec
+rustafits analyze night1/ --detection-threshold 4 --psf-model auto
 ```
 
-`--sort stars|fwhm|hfr|ecc|snr|weight|name` (best first; `--reverse` for
-worst first), `--json`, `--csv`, `--sigma`, `--measure-cap`, `--no-debayer`,
-`-j` (default 2 frames at once — analysis already uses every core).
+What the columns mean:
+
+- `STARS` is the number of stars the detector found. The medians come from the
+  brightest good stars among them, at most `--max-stars`.
+- `FWHM` and `HFR` are in pixels (with `--focal-length` and `--pixel-size`, two
+  more columns give arcseconds). `ECC` is 0 for round stars. `SNR` is the
+  median star SNR, `WEIGHT` the SNR weight for stacking, `BG` and `NOISE` are
+  in ADU.
+- `VERDICT` is `-` for a usable frame. When the measurement judges a frame
+  `trailed`, `defocused` or `no stars`, the word shows here, the medians show
+  `-`, and `--sort` by a metric puts the frame after all the others.
+
+Options:
+
+| Option | Default | |
+|---|---|---|
+| `--detection-threshold <SIGMA>` | 6.0 | Detection threshold in σ above the noise, 2–20 |
+| `--psf-model moffat4\|auto` | moffat4 | `moffat4` fixes beta at 4; `auto` fits the frame's own beta (the `median_beta` column) |
+| `--max-stars <N>` | 500 | Star budget: the brightest good stars measured per frame, 10–2000 |
+| `--focal-length <MM>`, `--pixel-size <UM>` | none | Both together add FWHM and HFR in arcseconds |
+| `-s, --sort stars\|fwhm\|hfr\|ecc\|snr\|weight\|name` | input order | Best first; `--reverse` for worst first |
+| `--json`, `--csv` | table | One object or row per frame, full precision |
+| `-j, --jobs <N>` | min(2, cores, files) | Frames analyzed at once. Analysis already uses every core |
+| `--threads <N>` | all cores | Threads for pixel work, shared by all jobs |
+| `-r, --recursive`, `--quiet` | off | Descend into directories; errors only |
+
+The CSV and JSON have 25 columns. The first 19 are the ones `analyze` had
+before 1.8.0, in the same order, so a script that reads by position keeps
+working. Six follow: `channels`, `stars_refused`, `frame_verdict`
+(`trailed`, `defocused`, `no_stars` or empty), `measure_version`,
+`detection_threshold` and `psf_model`. `median_beta` is empty unless you ask for
+`--psf-model auto`.
+
+A file the measurement cannot read is reported on stderr with its path, the
+other files carry on, and the exit code is 1.
+
+**Deprecated flags.** Scripts written for 1.7 still run. These flags are hidden
+from `--help`, print a warning on stderr and go in 2.0: `--sigma` (now
+`--detection-threshold`, for another detector: the default is 6.0, it was 5.0),
+`--measure-cap` (no effect: the budget is `--max-stars`) and `--no-debayer`
+(no effect: a mosaic is measured on its green sites).
 
 ### Shell completion
 
@@ -169,9 +206,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustafits = "1.6"
+rustafits = "1.8"
 # Library only, without the CLI's clap/indicatif dependencies:
-# rustafits = { version = "1.6", default-features = false }
+# rustafits = { version = "1.8", default-features = false }
 ```
 
 ### File output
@@ -233,7 +270,137 @@ depend on the thread count or on where a band boundary falls.
 
 ### Image analysis
 
-Detect stars, measure PSF shape, and compute image quality metrics:
+Measure a frame the way Athenaeum's Analysis tab does. Three calls: read the
+file as a raw frame, measure it, summarise the result.
+
+```rust
+use std::path::Path;
+use astroimage::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary};
+use astroimage::star_measure::raw::read_raw_frame;
+
+// 1. Read: the file's own ADU values, in file row order. A Bayer mosaic stays a mosaic.
+let mut frame = read_raw_frame(Path::new("light.fits"))?;
+frame.drop_unmeasured_planes();   // frees the R and B planes of a debayered file
+
+// 2. Measure. The defaults are the Analysis tab's: 6.0 σ, Moffat 4, 500 stars.
+let opts = FrameOptions::default();
+let pm = measure_raw_frame(&frame, &opts, None);   // None: rayon's global pool
+
+// 3. Summarise: the frame figures the Analysis tab shows.
+let s = FrameSummary::from_measurement(&pm, &opts);
+println!("Stars: {}  FWHM: {:.2} px  HFR: {:.2} px  Ecc: {:.3}  SNR: {:.1}",
+    s.stars_detected, s.median_fwhm, s.median_hfr, s.median_eccentricity, s.median_snr);
+if let Some(v) = s.verdict {
+    println!("Verdict: {v:?}");   // Trailed, Defocused or NoStars: the medians read 0.0
+}
+```
+
+`FrameOptions` has three settings. It is `#[non_exhaustive]`, so you set the
+fields on the default:
+
+```rust
+use astroimage::star_measure::PsfModel;
+
+let mut opts = FrameOptions::default();
+opts.detection_threshold = 4.0;      // σ above the noise; Athenaeum accepts 2 to 20
+opts.psf_model = PsfModel::Auto;     // fit the frame's own beta instead of fixing it at 4
+opts.max_stars = 1000;               // the brightest good stars measured
+```
+
+`FrameSummary` holds the frame figures. Sizes are in pixels, `background` and
+`noise` in ADU:
+
+| Field | Meaning |
+|-------|---------|
+| `stars_detected` | Stars the matched filter found (extended objects left out) |
+| `median_fwhm`, `median_hfr`, `median_eccentricity`, `median_snr` | Medians over the measured stars; 0.0 when no fit stands in the statistic |
+| `median_beta` | The frame's fitted beta under `PsfModel::Auto`, else `None` |
+| `snr_weight`, `psf_signal`, `frame_snr` | SNR weight for stacking, median amplitude over noise, background over noise |
+| `background`, `noise` | Sky level and noise σ |
+| `trail_r_squared` | Rayleigh statistic of the star angles: 0 = no direction, 1 = all aligned |
+| `stars_refused` | Stars the fit refused (the reasons are in the measurement) |
+| `verdict` | `Some(Trailed \| Defocused \| NoStars)` or `None` |
+
+The measurement `pm` also holds the star list (`pm.stars`), in file row order.
+`frame.flip_vertical` says whether a display must flip it. A Bayer mosaic is
+measured at its native size, on its green sites. `raw` and `analysis_mode` are
+the stable entry of `star_measure`: `FrameOptions` and `FrameSummary` are
+`#[non_exhaustive]`, so 1.x can add fields to them. The rest of `star_measure`
+is public but outside that promise.
+
+For many frames, run one measurement per file on your own workers and pass one
+shared pool to each (`Some(&pool)`). `examples/analyze_batch.rs` does it.
+
+### Fast star detection
+
+When you only need rough `(x, y, flux)` centroids — e.g. for blind plate solving, quick
+previews, or any quad-hash matching pipeline — `detect_fast` skips everything the legacy
+analyzer does after the first detection pass. No PSF calibration, no Levenberg–Marquardt
+Moffat fitting, no SNR photometry, no trail detection. On a full-frame (~26 Mpx) image this
+drops star detection from ~5–6 s to ~300–500 ms in release builds. Centroid accuracy is
+pass-1 (intensity-weighted, typically ~0.3–0.5 px) — fine for quad matching, insufficient
+for stacking registration.
+
+```rust
+use astroimage::ImageAnalyzer;
+
+let result = ImageAnalyzer::new()
+    .with_detection_sigma(5.0)
+    .with_max_stars(500)
+    .detect_fast("light.fits")?;
+
+println!("{} stars in {:.0} ms ({}x{})",
+    result.stars.len(),
+    result.timing.total_ms,
+    result.width,
+    result.height);
+
+for s in result.stars.iter().take(10) {
+    println!("  ({:.2}, {:.2}) flux={:.0}", s.x, s.y, s.flux);
+}
+```
+
+All three entry-point variants mirror the legacy `analyze*` entry points:
+
+| Method | Input | Use case |
+|--------|-------|----------|
+| `detect_fast(path)` | FITS / XISF file | Most common entry point |
+| `detect_fast_data(&[f32], w, h, channels)` | Pre-loaded planar f32 | You already decoded pixels elsewhere |
+| `detect_fast_raw(&ImageMetadata, &PixelData)` | Read-but-not-converted | Skip file I/O while keeping u16→f32 + debayer internal |
+
+All three honor the same `ImageAnalyzer` builder settings as the legacy `analyze` —
+`with_detection_sigma`, `with_max_stars`, `with_min_star_area`, `with_max_star_area`,
+`with_saturation_fraction`, `without_debayer`, and `with_thread_pool`. Settings related
+to the PSF fit (`with_measure_cap`, `with_fit_max_iter`, `with_fit_tolerance`,
+`with_mrs_layers`, `with_trail_threshold`, `with_optics`) are simply ignored because
+those stages don't run.
+
+Pipeline stages in the fast path:
+
+1. OSC green interpolation (for Bayer frames, same as the legacy `analyze`)
+2. Luminance extraction if `channels == 3`
+3. `estimate_background_mesh` (parallelized, MAD noise — MRS wavelet is never called)
+4. Single matched-filter pass of `detect_stars` with fixed FWHM = 3.0 px
+5. Sort by flux descending, truncate to `max_stars`, pack into `FastStar`
+
+**When to use which**: if you need FWHM, eccentricity, SNR, HFR, per-star fit quality,
+or trail detection, use `star_measure::analysis_mode` (see Image analysis). If you only
+need positions and brightness ordering (quad matching, hash lookup, quick counts), use
+`detect_fast`: it skips the PSF fits, SNR and verdicts and returns first-pass centroids.
+On a 26 MP frame the two take comparable wall time (see Performance), so choose by what
+you need, not by speed.
+
+### Legacy analyzer (deprecated since 1.8.0, removed in 2.0)
+
+`ImageAnalyzer::analyze`, `analyze_data`, `analyze_raw` and `analyze_batch` are
+deprecated. The compiler says so and names `star_measure::analysis_mode` as the
+replacement. They keep their old numbers in 1.x and go in 2.0. `detect_fast*`
+and the builder methods are not deprecated (see
+[Fast star detection](#fast-star-detection)).
+
+#### Single frame
+
+`analyze` detects stars, measures PSF shape and computes image quality metrics:
 
 ```rust
 use astroimage::ImageAnalyzer;
@@ -263,65 +430,9 @@ uses parallelized mesh-grid with auto-tuned cell size and MAD noise estimation (
 available via `with_mrs_layers(4)`). OSC/Bayer images are green-interpolated before
 detection and PSF fitting.
 
-### Fast star detection
+#### Batch
 
-When you only need rough `(x, y, flux)` centroids — e.g. for blind plate solving, quick
-previews, or any quad-hash matching pipeline — `detect_fast` skips everything the precise
-analyzer does after the first detection pass. No PSF calibration, no Levenberg–Marquardt
-Moffat fitting, no SNR photometry, no trail detection. On a full-frame (~26 Mpx) image this
-drops star detection from ~5–6 s to ~300–500 ms in release builds. Centroid accuracy is
-pass-1 (intensity-weighted, typically ~0.3–0.5 px) — fine for quad matching, insufficient
-for stacking registration.
-
-```rust
-use astroimage::ImageAnalyzer;
-
-let result = ImageAnalyzer::new()
-    .with_detection_sigma(5.0)
-    .with_max_stars(500)
-    .detect_fast("light.fits")?;
-
-println!("{} stars in {:.0} ms ({}x{})",
-    result.stars.len(),
-    result.timing.total_ms,
-    result.width,
-    result.height);
-
-for s in result.stars.iter().take(10) {
-    println!("  ({:.2}, {:.2}) flux={:.0}", s.x, s.y, s.flux);
-}
-```
-
-All three entry-point variants mirror the precise pipeline's:
-
-| Method | Input | Use case |
-|--------|-------|----------|
-| `detect_fast(path)` | FITS / XISF file | Most common entry point |
-| `detect_fast_data(&[f32], w, h, channels)` | Pre-loaded planar f32 | You already decoded pixels elsewhere |
-| `detect_fast_raw(&ImageMetadata, &PixelData)` | Read-but-not-converted | Skip file I/O while keeping u16→f32 + debayer internal |
-
-All three honor the same `ImageAnalyzer` builder settings as `analyze` —
-`with_detection_sigma`, `with_max_stars`, `with_min_star_area`, `with_max_star_area`,
-`with_saturation_fraction`, `without_debayer`, and `with_thread_pool`. Settings related
-to the PSF fit (`with_measure_cap`, `with_fit_max_iter`, `with_fit_tolerance`,
-`with_mrs_layers`, `with_trail_threshold`, `with_optics`) are simply ignored because
-those stages don't run.
-
-Pipeline stages in the fast path:
-
-1. OSC green interpolation (for Bayer frames, same as `analyze`)
-2. Luminance extraction if `channels == 3`
-3. `estimate_background_mesh` (parallelized, MAD noise — MRS wavelet is never called)
-4. Single matched-filter pass of `detect_stars` with fixed FWHM = 3.0 px
-5. Sort by flux descending, truncate to `max_stars`, pack into `FastStar`
-
-**When to use which**: if you need FWHM, eccentricity, SNR, HFR, per-star fit quality,
-or trail detection, use `analyze`. If you only need positions and brightness ordering
-(quad matching, hash lookup, quick counts), use `detect_fast` and take the ~10× speedup.
-
-### Batch analysis
-
-Analyze multiple images in parallel with progress reporting:
+`analyze_batch` analyzes multiple images in parallel with progress reporting:
 
 ```rust
 use astroimage::ImageAnalyzer;
@@ -351,49 +462,71 @@ Results are returned in approximate completion order with their paths.
 
 ### Star annotation overlay
 
-Analyze an image for stars and draw color-coded ellipses showing PSF shape and quality:
+Draw color-coded ellipses showing PSF shape and quality. The stars come from a
+`StarOverlay`: build one from an `analysis_mode` measurement, as the CLI does for
+`--annotate`.
 
 ```rust
-use astroimage::{
-    ImageConverter, ImageAnalyzer,
-    annotate_image, AnnotationConfig, ColorScheme,
-};
+use std::path::Path;
+use astroimage::{annotate_image_with, AnnotationConfig, ColorScheme, ImageConverter, StarOverlay};
+use astroimage::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary};
+use astroimage::star_measure::raw::read_raw_frame;
 
+// Measure (see Image analysis), then render the same file.
+let mut frame = read_raw_frame(Path::new("light.fits"))?;
+frame.drop_unmeasured_planes();
+let opts = FrameOptions::default();
+let pm = measure_raw_frame(&frame, &opts, None);
+let summary = FrameSummary::from_measurement(&pm, &opts);
 let mut image = ImageConverter::new().process("light.fits")?;
-let result = ImageAnalyzer::new()
-    .with_max_stars(500)
-    .analyze("light.fits")?;
+
+// The star list, in the pixels the frame was measured on. A mosaic is measured at
+// its native size and rendered at half size; the overlay scales for you.
+let overlay = StarOverlay::from_measurement(frame.w, frame.h, &pm, &summary);
 
 // Burn annotations with default settings (eccentricity color coding)
-annotate_image(&mut image, &result, &AnnotationConfig::default());
+annotate_image_with(&mut image, &overlay, &AnnotationConfig::default());
 
-// Or customize thresholds and color scheme
+// Or customize thresholds and color scheme instead
 let config = AnnotationConfig {
     color_scheme: ColorScheme::Eccentricity,
     ecc_good: 0.5,   // ≤ 0.5 → green
     ecc_warn: 0.6,   // 0.51–0.6 → yellow, > 0.6 → red
     ..AnnotationConfig::default()
 };
-annotate_image(&mut image, &result, &config);
+annotate_image_with(&mut image, &overlay, &config);
 
 ImageConverter::save_processed(&image, "annotated.jpg", 95)?;
 ```
+
+A `StarOverlay` is a plain struct, so you can fill one from your own star list:
+
+| Field | Meaning |
+|-------|---------|
+| `stars` | `Vec<OverlayStar>`: `x`, `y` (source pixels, file row order), `fwhm_x` (major axis), `fwhm_y` (minor axis), `theta` (major axis angle, radians, counter-clockwise from +X), `eccentricity`, `fwhm` |
+| `width`, `height` | Size of the pixel grid the stars were measured on |
+| `median_fwhm` | The frame's median FWHM, for `ColorScheme::Fwhm` (0.0 colors every star green) |
 
 Three API tiers for different integration needs:
 
 | Function | Returns | Use Case |
 |----------|---------|----------|
-| `compute_annotations()` | `Vec<StarAnnotation>` | Raw geometry for custom rendering (Canvas2D, SwiftUI, SVG) |
-| `create_annotation_layer()` | `Vec<u8>` (RGBA) | Transparent overlay for toggleable layer compositing |
-| `annotate_image()` | modifies `ProcessedImage` | Burn-in for CLI or one-shot use |
+| `compute_overlay()` | `Vec<StarAnnotation>` | Raw geometry for custom rendering (Canvas2D, SwiftUI, SVG) |
+| `create_overlay_layer()` | `Vec<u8>` (RGBA) | Transparent overlay for toggleable layer compositing |
+| `annotate_image_with()` | modifies `ProcessedImage` | Burn-in for CLI or one-shot use |
 
-**`compute_annotations(result, width, height, flip_vertical, config)`** — Transforms star positions from analysis coordinates to output image coordinates (handling debayer scaling, downscale, and vertical flip), computes ellipse semi-axes from `fwhm_x`/`fwhm_y`, and assigns colors. Returns `Vec<StarAnnotation>` where each entry contains `x`, `y`, `semi_major`, `semi_minor`, `theta`, `eccentricity`, `fwhm`, and `color` — everything needed to draw the ellipse in any rendering system.
+Each has a legacy twin that takes an `AnalysisResult` from the deprecated
+`ImageAnalyzer::analyze*`: `compute_annotations()`, `create_annotation_layer()` and
+`annotate_image()`. They build `StarOverlay::from(&result)` and call the function above, so
+both draw the same.
 
-**`create_annotation_layer(result, width, height, flip_vertical, config)`** — Calls `compute_annotations()` internally, then rasterizes all ellipses and direction ticks onto a transparent RGBA buffer (same dimensions as the output image). Use as a compositable layer that can be toggled on/off without re-rendering the base image.
+**`compute_overlay(overlay, width, height, flip_vertical, config)`** — Transforms star positions from the measured grid to output image coordinates (handling debayer scaling, downscale, and vertical flip), computes ellipse semi-axes from `fwhm_x`/`fwhm_y`, and assigns colors. Returns `Vec<StarAnnotation>` where each entry contains `x`, `y`, `semi_major`, `semi_minor`, `theta`, `eccentricity`, `fwhm`, and `color` — everything needed to draw the ellipse in any rendering system.
 
-**`annotate_image(image, result, config)`** — Calls `compute_annotations()` internally, then draws directly onto the `ProcessedImage.data` buffer (RGB or RGBA). Reads `image.flip_vertical` automatically. Simplest path — one call, image modified in place.
+**`create_overlay_layer(overlay, width, height, flip_vertical, config)`** — Calls `compute_overlay()` internally, then rasterizes all ellipses and direction ticks onto a transparent RGBA buffer (same dimensions as the output image). Use as a compositable layer that can be toggled on/off without re-rendering the base image.
 
-**`ImageConverter::save_processed(image, path, quality)`** — Saves a `ProcessedImage` to disk as JPEG or PNG. Use after `annotate_image()` or any other post-processing on the pixel buffer. The format follows the extension: `.png` → PNG; `.jpg`, `.jpeg` or none → JPEG; anything else is an error. `save_processed_with(image, path, quality, PngCompression::None)` picks the PNG compression level (`ImageConverter::with_png_compression` does the same for `convert()`).
+**`annotate_image_with(image, overlay, config)`** — Calls `compute_overlay()` internally, then draws directly onto the `ProcessedImage.data` buffer (RGB or RGBA). Reads `image.flip_vertical` automatically. Simplest path — one call, image modified in place.
+
+**`ImageConverter::save_processed(image, path, quality)`** — Saves a `ProcessedImage` to disk as JPEG or PNG. Use after `annotate_image_with()` or any other post-processing on the pixel buffer. The format follows the extension: `.png` → PNG; `.jpg`, `.jpeg` or none → JPEG; anything else is an error. `save_processed_with(image, path, quality, PngCompression::None)` picks the PNG compression level (`ImageConverter::with_png_compression` does the same for `convert()`).
 
 #### AnnotationConfig fields
 
@@ -425,6 +558,8 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 
 ### ImageAnalyzer builder methods
 
+The deprecated `analyze*` methods read all of these. `detect_fast*` reads the detection ones (it ignores the PSF-fit settings).
+
 | Method | Description |
 |--------|-------------|
 | `with_detection_sigma(f32)` | Detection threshold in sigma above background (default 5.0) |
@@ -443,7 +578,9 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 | `with_fit_max_rejects(usize)` | Max outlier-rejection rounds in the fit |
 | `with_thread_pool(pool)` | Use a custom rayon thread pool |
 
-### AnalysisResult fields
+### AnalysisResult fields (legacy)
+
+Returned by the deprecated `ImageAnalyzer::analyze*`.
 
 | Field | Type | Unit | Description |
 |-------|------|------|-------------|
@@ -469,7 +606,7 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 | `gaussian_count` | usize | — | Gaussian fits among measured stars |
 | `stage_timing` | StageTiming | ms | Per-stage timing breakdown |
 
-### StarMetrics fields
+### StarMetrics fields (legacy)
 
 | Field | Type | Unit | Description |
 |-------|------|------|-------------|
@@ -487,7 +624,7 @@ See [Annotation Documentation](docs/annotation.md) for full API reference, integ
 | `fit_method` | FitMethod | — | FreeMoffat, FixedMoffat, Gaussian, or Moments |
 | `fit_residual` | f32 | — | Normalized fit quality (lower = better) |
 
-### StageTiming fields
+### StageTiming fields (legacy)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -581,15 +718,15 @@ let results: Vec<_> = handles.into_iter()
 
 ## Performance
 
-Benchmarks on Apple M4 (6252x4176 16-bit images):
+Benchmarks on Apple M4 (6252x4176 16-bit images), wall time of one CLI call, warm cache:
 
 | Mode | Time |
 |------|------|
 | Mono FITS → JPEG | ~107ms |
 | OSC FITS → JPEG | ~67ms |
 | XISF → JPEG | ~106ms |
-| Mono FITS + annotate | ~970ms |
-| Analysis only | ~250-750ms |
+| Mono FITS + annotate | ~480ms |
+| `rustafits analyze`, one frame | ~260-390ms |
 
 ### SIMD Acceleration
 
@@ -611,7 +748,7 @@ rustafits/
 ├── src/
 │   ├── lib.rs              # Library entry + public API
 │   ├── types.rs            # Core types (PixelData, ProcessedImage, etc.)
-│   ├── annotate.rs         # Star annotation overlay (3-tier API)
+│   ├── annotate.rs         # Star annotation overlay (3-tier API over a StarOverlay)
 │   ├── converter.rs        # ImageConverter builder
 │   ├── pipeline.rs         # Processing pipeline
 │   ├── output.rs           # JPEG/PNG file output
@@ -620,8 +757,9 @@ rustafits/
 │   │   ├── mod.rs          # Format dispatch
 │   │   ├── fits.rs         # FITS reader
 │   │   └── xisf.rs         # XISF reader (zlib/LZ4/Zstd)
+│   ├── star_measure/       # Athenaeum's star measurement (analysis_mode, raw: the Analysis numbers)
 │   ├── analysis/
-│   │   ├── mod.rs            # Analyzer builder + pipeline orchestration
+│   │   ├── mod.rs            # Legacy analyzer (analyze* deprecated) + detect_fast
 │   │   ├── background.rs     # Background estimation (global, mesh-grid, MRS wavelet)
 │   │   ├── convolution.rs    # Separable convolution + B3-spline smoothing
 │   │   ├── detection.rs      # Star detection (DAOFIND + proximity blend rejection)
