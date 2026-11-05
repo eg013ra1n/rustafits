@@ -150,8 +150,8 @@ near 1.5 GB with two, which is why its `-j` default is 2.
 
 ### Fast detection
 
-When you need only `(x, y, flux)` centroids, `ImageAnalyzer::detect_fast*` is faster
-and is not deprecated. See the README's "Fast star detection".
+When you need only `(x, y, flux)` centroids, `ImageAnalyzer::detect_fast*` does less work
+(no PSF fits, no SNR, no verdicts) and is not deprecated. See the README's "Fast star detection".
 
 ---
 

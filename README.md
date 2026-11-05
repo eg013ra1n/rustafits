@@ -160,7 +160,7 @@ What the columns mean:
   in ADU.
 - `VERDICT` is `-` for a usable frame. When the measurement judges a frame
   `trailed`, `defocused` or `no stars`, the word shows here, the medians show
-  `-`, and `--sort` puts the frame after all the others.
+  `-`, and `--sort` by a metric puts the frame after all the others.
 
 Options:
 
@@ -386,7 +386,9 @@ Pipeline stages in the fast path:
 **When to use which**: if you need FWHM, eccentricity, SNR, HFR, per-star fit quality,
 or trail detection, use `star_measure::analysis_mode` (see Image analysis). If you only
 need positions and brightness ordering (quad matching, hash lookup, quick counts), use
-`detect_fast` and take the ~10× speedup.
+`detect_fast`: it skips the PSF fits, SNR and verdicts and returns first-pass centroids.
+On a 26 MP frame the two take comparable wall time (see Performance), so choose by what
+you need, not by speed.
 
 ### Legacy analyzer (deprecated since 1.8.0, removed in 2.0)
 
@@ -716,7 +718,7 @@ let results: Vec<_> = handles.into_iter()
 
 ## Performance
 
-Benchmarks on Apple M4 (6252x4176 16-bit images):
+Benchmarks on Apple M4 (6252x4176 16-bit images), wall time of one CLI call, warm cache:
 
 | Mode | Time |
 |------|------|

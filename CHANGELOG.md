@@ -67,7 +67,7 @@ FITS `XBAYROFF` / `YBAYROFF` is read by Athenaeum's rule.
   `convert -a` draws the stars that measurement kept. On `analyze`:
   - the table's VERDICT column replaces TRAIL. A frame the measurement judges
     trailed, defocused or without stars shows that word, `-` for its medians,
-    and `--sort` ranks it after every other frame;
+    and `--sort` by a metric ranks it after every other frame;
   - the CSV and JSON keep their first 19 columns in their order and append six:
     `channels`, `stars_refused`, `frame_verdict`, `measure_version`,
     `detection_threshold`, `psf_model`;

@@ -137,7 +137,9 @@ fn read_fits_header(
     }
 
     // The offsets by the catalog's rule; the integer-prefix values the card loop
-    // read stay only if the catalog reader cannot parse this header at all.
+    // read stay only if the catalog reader cannot parse this header at all. The
+    // warning reaches a caller that installs a tracing subscriber (Athenaeum's
+    // log); the `rustafits` binary installs none yet, so it shows nothing there.
     match CatalogHeader::from_bytes(&header_bytes) {
         Ok(catalog) => {
             hdr.xbayroff = catalog.get_i32("XBAYROFF").unwrap_or(0);

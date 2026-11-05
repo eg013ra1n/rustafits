@@ -30,7 +30,7 @@ pub struct AnalyzeArgs {
     #[arg(short, long)]
     recursive: bool,
 
-    /// Sort rows best-first by a metric (default: input order); frames with a verdict go last
+    /// Sort rows best-first by a metric (default: input order); a metric sort puts frames with a verdict last
     #[arg(short, long, value_enum, value_name = "METRIC")]
     sort: Option<SortKey>,
 
