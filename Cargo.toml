@@ -81,6 +81,8 @@ serde_json = "1"
 # The first-pass artifact's encoding pin (Athenaeum stores `PlanePrep` as postcard).
 postcard = { version = "1", features = ["use-std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# `star_measure::raw`'s tests write their FITS / XISF files into a scratch directory.
+tempfile = "3"
 
 [profile.release]
 lto = true

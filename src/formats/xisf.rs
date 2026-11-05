@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -8,6 +9,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rayon::prelude::*;
 
+use super::stored_keys;
 use crate::types::{BayerPattern, DataType, FileFormat, HeaderKeyword, ImageHeader, ImageMetadata, PixelData};
 
 const XISF_SIGNATURE: &[u8; 8] = b"XISF0100";
@@ -320,7 +322,44 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
         info.bayer_pattern = BayerPattern::Grbg;
     }
 
+    // Fold the offsets in, whatever the scan above found, so the pattern
+    // addresses pixel (0, 0) of the stored frame — as `formats::fits` does. A
+    // file without a pattern has nothing to shift and skips the keyword pass.
+    if info.bayer_pattern != BayerPattern::None {
+        let (odd_x, odd_y) = odd_bayer_offsets(xml);
+        info.bayer_pattern = super::shift_bayer_pattern(info.bayer_pattern, odd_x, odd_y);
+    }
+
     Ok(info)
+}
+
+/// Whether the XISF header `xml` has an odd `XBAYROFF` and an odd `YBAYROFF`.
+///
+/// The offsets are read by Athenaeum's own header-value rule, `formats::stored_keys` (port plan phase 4, ruling
+/// R-P4-C1), the rule its Analysis tab applied to XISF files before the star measurement moved into this crate, so
+/// that its XISF figures do not move on any input: the XML is turned into `NAME = value` lines (empty `<FITSKeyword>`
+/// elements only, the raw attribute, one pair of quotes stripped) and the lines are read as keys; the first non-empty
+/// value of a name (upper-cased) wins, and a value is read as a number — quotes and blanks trimmed, `f64`, rounded,
+/// non-finite or unreadable counts as 0 — whose parity is the offset's.
+///
+/// The FITS reader reads its offsets by its own card rule instead, and the two readers differ on these inputs, among
+/// them: a non-integer value (`0.6` is 0 for FITS, which takes the integer prefix of the card, and 1 here), a quoted
+/// value (`'1'` is 0 for FITS and 1 here), a keyword repeated (the last card for FITS, the first non-empty value here),
+/// the keyword's case (FITS matches upper case only, XISF any case) and blanks around the name (XISF trims them; FITS
+/// needs the keyword at column 1).
+fn odd_bayer_offsets(xml: &str) -> (bool, bool) {
+    let keys = stored_keys::xisf_stored_keys(xml, None);
+    let odd = |key: &str| stored_keys::offset(stored_keys::num(&keys, key)).rem_euclid(2) == 1;
+    (odd("XBAYROFF"), odd("YBAYROFF"))
+}
+
+/// The stored-header keys of the XISF file at `path`, read by Athenaeum's rule (`formats::stored_keys`): the keys
+/// `star_measure::raw` reads its `DATAMAX` and `EGAIN` from. Reads the XML header only.
+pub(crate) fn read_xisf_stored_keys(path: &Path) -> Result<HashMap<String, String>> {
+    let file = File::open(path).context("Failed to open XISF file")?;
+    let mut reader = BufReader::new(file);
+    let xml = read_xml_header(&mut reader)?;
+    Ok(stored_keys::xisf_stored_keys(&xml, Some(path)))
 }
 
 fn unshuffle_bytes(data: &mut [u8], item_size: usize) {
@@ -677,14 +716,15 @@ fn parse_xisf_keywords(xml: &str) -> Result<Vec<HeaderKeyword>> {
 /// PRODUCTION CONTRACT, not just a rendering convenience: `athenaeum-core`'s
 /// `integration::banded::spill_via_read_raw` (master builds, light
 /// calibration) spills `PixelData::Float32` straight into its ADU-domain
-/// band scratch, and `analysis::analyzer::analyze_frame` hands it straight
-/// to a detector whose thresholds (`star_levels`, `saturation_limit`) are
-/// ADU-domain by construction — either consumer fed a native-`[0, 1]` XISF
-/// float would be silently wrong (a 65535×-too-small master; a detector
-/// that finds nothing). A one-time attempt to remove this scale (M4a Task 1,
-/// commit `b7d1d306`) broke nothing in THIS crate's own tests — its
-/// `pipeline.rs`'s auto-stretch is provably invariant to a uniform rescale
-/// of its float input (see `processing/stretch.rs`'s
+/// band scratch, and `star_measure::raw::read_raw_frame` (this crate's
+/// Analysis-mode input) hands it straight to a measurement whose domain
+/// (`Domain::RawAdu`: `clip`, `full_scale`, the saturation test and the
+/// shot-noise term) is the file's ADU by construction — either consumer fed a
+/// native-`[0, 1]` XISF float would be silently wrong (a 65535×-too-small
+/// master; a detector that finds nothing). A one-time attempt to remove this
+/// scale (M4a Task 1, commit `b7d1d306`) broke nothing in THIS crate's own
+/// tests — its `pipeline.rs`'s auto-stretch is provably invariant to a
+/// uniform rescale of its float input (see `processing/stretch.rs`'s
 /// `unit_range_floats_stretch_like_u16` test) — but was wrong at the
 /// `athenaeum-core` call sites above, so it was reverted; DO NOT remove it
 /// again without auditing every `ImageConverter::read_raw`/`read_xisf_image`
@@ -863,7 +903,8 @@ mod tests {
     }
 
     /// A unique scratch path per test process (mirrors `formats/fits.rs`'s
-    /// existing test pattern — no `tempfile` dependency in this crate).
+    /// existing test pattern: these tests keep their own scratch paths;
+    /// `tempfile` is a dev-dependency for `star_measure::raw`'s tests only).
     fn scratch_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "rustafits_test_{name}_{}_{}.xisf",
@@ -1167,5 +1208,214 @@ mod tests {
         assert_eq!((info.bayer_pattern, info.flip_vertical), (meta.bayer_pattern, meta.flip_vertical));
         assert_eq!(info.sample_type, "u16");
         assert!(!info.keywords.is_empty());
+    }
+
+    /// Writes a UInt16 mosaic (one plane, `width` x `height`) whose `<Image>`
+    /// element carries a `BAYERPAT` keyword and then `keywords`, each as a
+    /// `(name, value attribute text)` `<FITSKeyword>`.
+    fn write_cfa_xisf(
+        path: &std::path::Path,
+        width: usize,
+        height: usize,
+        bayerpat: &str,
+        keywords: &[(&str, &str)],
+        data: &[u16],
+    ) {
+        let mut keyword_tags = format!(r#"<FITSKeyword name="BAYERPAT" value="'{bayerpat}'" comment=""/>"#);
+        for (name, value) in keywords {
+            keyword_tags.push_str(&format!(r#"<FITSKeyword name="{name}" value="{value}" comment=""/>"#));
+        }
+        write_cfa_xisf_children(path, width, height, &keyword_tags, data);
+    }
+
+    /// Writes a UInt16 mosaic whose `<Image>` element holds `children` as written (any element shape).
+    fn write_cfa_xisf_children(
+        path: &std::path::Path,
+        width: usize,
+        height: usize,
+        children: &str,
+        data: &[u16],
+    ) {
+        assert_eq!(data.len(), width * height);
+        let pos: u64 = 4096;
+        let size = (data.len() * 2) as u64;
+        let tags = vec![format!(
+            r#"<Image geometry="{width}:{height}:1" sampleFormat="UInt16" colorSpace="Gray" location="attachment:{pos}:{size}">{children}</Image>"#
+        )];
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_xisf_header_and_attachments(path, &tags, &[(pos, &bytes)]);
+    }
+
+    #[test]
+    fn xisf_bayer_offsets_fold_into_the_pattern() {
+        use BayerPattern as P;
+        // (BAYERPAT, [pattern at (0,0), (1,0), (0,1), (1,1) offsets]): an odd
+        // XBAYROFF swaps the cell's columns, an odd YBAYROFF its rows.
+        let table = [
+            ("RGGB", [P::Rggb, P::Grbg, P::Gbrg, P::Bggr]),
+            ("GRBG", [P::Grbg, P::Rggb, P::Bggr, P::Gbrg]),
+            ("GBRG", [P::Gbrg, P::Bggr, P::Rggb, P::Grbg]),
+            ("BGGR", [P::Bggr, P::Gbrg, P::Grbg, P::Rggb]),
+        ];
+        let path = scratch_path("bayroff_table");
+        for (bayerpat, expected) in table {
+            let base = expected[0];
+            // Only the parity counts: even and negative offsets behave like 0 / 1.
+            let cases = [
+                (None, base),
+                (Some((0, 0)), expected[0]),
+                (Some((1, 0)), expected[1]),
+                (Some((0, 1)), expected[2]),
+                (Some((1, 1)), expected[3]),
+                (Some((2, 4)), expected[0]),
+                (Some((3, -1)), expected[3]),
+            ];
+            for (offsets, want) in cases {
+                let (x, y);
+                let keywords: Vec<(&str, &str)> = match offsets {
+                    Some((ox, oy)) => {
+                        x = ox.to_string();
+                        y = oy.to_string();
+                        vec![("XBAYROFF", x.as_str()), ("YBAYROFF", y.as_str())]
+                    }
+                    None => Vec::new(),
+                };
+                write_cfa_xisf(&path, 4, 2, bayerpat, &keywords, &[0; 8]);
+                let info = read_xisf_header_info(&path).unwrap();
+                let (meta, _) = read_xisf_image(&path).unwrap();
+                assert_eq!(meta.bayer_pattern, want, "BAYERPAT {bayerpat}, offsets {offsets:?}");
+                assert_eq!(info.bayer_pattern, want, "header-only read, BAYERPAT {bayerpat}, offsets {offsets:?}");
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The offset rule is the one Athenaeum's Analysis tab applied to XISF
+    /// before the port (`formats::stored_keys`): a number, quotes trimmed,
+    /// rounded; the first non-empty value of a name wins, whatever its case.
+    #[test]
+    fn xisf_bayer_offset_values_read_as_athenaeum_reads_them() {
+        let path = scratch_path("bayroff_values");
+        let read = |keywords: &[(&str, &str)]| {
+            write_cfa_xisf(&path, 4, 2, "RGGB", keywords, &[0; 8]);
+            let info = read_xisf_header_info(&path).unwrap();
+            let (meta, _) = read_xisf_image(&path).unwrap();
+            assert_eq!(info.bayer_pattern, meta.bayer_pattern, "keywords {keywords:?}");
+            meta.bayer_pattern
+        };
+        // Odd after rounding: RGGB with its columns swapped.
+        for value in ["1", "1.0", "'1'", "-1", "3", "0.6"] {
+            assert_eq!(read(&[("XBAYROFF", value)]), BayerPattern::Grbg, "XBAYROFF {value}");
+        }
+        // Even, unreadable, absent: unchanged.
+        for value in ["2", "x", "", "nan"] {
+            assert_eq!(read(&[("XBAYROFF", value)]), BayerPattern::Rggb, "XBAYROFF {value}");
+        }
+        assert_eq!(read(&[]), BayerPattern::Rggb, "no offset keywords");
+        // YBAYROFF swaps the rows, by the same rule.
+        assert_eq!(read(&[("YBAYROFF", "0.6")]), BayerPattern::Gbrg);
+        // The name matches in any case, and the first non-empty value of a name wins.
+        assert_eq!(read(&[("xbayroff", "1")]), BayerPattern::Grbg);
+        assert_eq!(read(&[("XBAYROFF", "1"), ("XBAYROFF", "0")]), BayerPattern::Grbg);
+        assert_eq!(read(&[("XBAYROFF", "0"), ("XBAYROFF", "1")]), BayerPattern::Rggb);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// R-P4-C1: on unusual or malformed values the reader folds exactly as Athenaeum's Analysis tab did, because both
+    /// run the same rule (`formats::stored_keys`). Every case below reads a different pattern under the plain rule
+    /// "the first `<FITSKeyword>` of the name, XML-normalized, as a number" (the commented result), which the first
+    /// version of this fold used. RGGB base: an odd XBAYROFF reads GRBG, an odd YBAYROFF GBRG.
+    #[test]
+    fn xisf_bayer_offsets_follow_athenaeums_rule_on_unusual_values() {
+        use BayerPattern::{Gbrg, Grbg, Rggb};
+        let path = scratch_path("bayroff_parity");
+        let kw = |name: &str, value: &str| format!(r#"<FITSKeyword name="{name}" value="{value}" comment=""/>"#);
+        let read = |children: String| {
+            write_cfa_xisf_children(&path, 4, 2, &format!("{}{children}", kw("BAYERPAT", "'RGGB'")), &[0; 8]);
+            let info = read_xisf_header_info(&path).unwrap();
+            let (meta, _) = read_xisf_image(&path).unwrap();
+            assert_eq!(info.bayer_pattern, meta.bayer_pattern, "header-only read");
+            meta.bayer_pattern
+        };
+        let cases: Vec<(&str, String, BayerPattern)> = vec![
+            // An empty value is skipped and a later keyword of the name wins (plain rule: the empty one, Rggb).
+            ("empty, then 1", format!("{}{}", kw("XBAYROFF", ""), kw("XBAYROFF", "1")), Grbg),
+            ("quote pair only, then 1", format!("{}{}", kw("XBAYROFF", "''"), kw("XBAYROFF", "1")), Grbg),
+            (
+                "no value attribute, then 1",
+                format!(r#"<FITSKeyword name="XBAYROFF"/>{}"#, kw("XBAYROFF", "1")),
+                Grbg,
+            ),
+            // The value stops at " / " or at the closing quote (plain rule: unreadable, Rggb).
+            ("1 / off", kw("XBAYROFF", "1 / off"), Grbg),
+            ("'1' / off", kw("XBAYROFF", "'1' / off"), Grbg),
+            ("YBAYROFF 1 / off", kw("YBAYROFF", "1 / off"), Gbrg),
+            // An unclosed quote drops the line (plain rule: 1, Grbg).
+            ("unclosed quote", kw("XBAYROFF", "'1"), Rggb),
+            // A lone quote is no pair (Athenaeum's own loop panicked here; the line is dropped).
+            ("lone quote", kw("XBAYROFF", "'"), Rggb),
+            // The name is trimmed (plain rule: no match, Rggb).
+            ("leading blank in the name", kw(" XBAYROFF", "1"), Grbg),
+            // The raw attribute is read, a character reference stays text (plain rule: 1, Grbg).
+            ("character reference", kw("XBAYROFF", "&#49;"), Rggb),
+            // Empty elements only (plain rule: the pair is read, Grbg).
+            (
+                "start and end tag",
+                r#"<FITSKeyword name="XBAYROFF" value="1"></FITSKeyword>"#.to_string(),
+                Rggb,
+            ),
+        ];
+        for (label, children, want) in cases {
+            assert_eq!(read(children), want, "{label}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A star lit only on the red sites of the sensor renders red, whichever
+    /// (BAYERPAT, XBAYROFF, YBAYROFF) spelling describes that sensor — with
+    /// the super-pixel and the VNG debayer.
+    #[test]
+    fn xisf_red_star_stays_red_for_every_bayer_offset() {
+        let (w, h) = (32usize, 32usize);
+        let path = scratch_path("red_star");
+        for bayerpat in ["RGGB", "GRBG", "GBRG", "BGGR"] {
+            // Colour (0 = R, 1 = G, 2 = B) of each site of BAYERPAT's cell, by (y & 1) * 2 + (x & 1).
+            let cell: Vec<usize> = bayerpat.chars().map(|c| "RGB".find(c).unwrap()).collect();
+            for (xoff, yoff) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                // The sensor: pixel (x, y) sits at site (x + XBAYROFF, y + YBAYROFF) of the cell.
+                let color_at = |x: usize, y: usize| cell[((y + yoff) & 1) * 2 + ((x + xoff) & 1)];
+                let data: Vec<u16> = (0..w * h)
+                    .map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        let star = x.abs_diff(16) <= 3 && y.abs_diff(16) <= 3 && color_at(x, y) == 0;
+                        if star { 50000 } else { 1000 + ((x / 2 * 7 + y / 2 * 13) % 50) as u16 }
+                    })
+                    .collect();
+                let (x_text, y_text) = (xoff.to_string(), yoff.to_string());
+                write_cfa_xisf(
+                    &path,
+                    w,
+                    h,
+                    bayerpat,
+                    &[("XBAYROFF", x_text.as_str()), ("YBAYROFF", y_text.as_str())],
+                    &data,
+                );
+
+                for (name, converter, centre) in [
+                    ("super-pixel", crate::ImageConverter::new(), (8, 8)),
+                    ("VNG", crate::ImageConverter::new().with_vng_debayer(), (16, 16)),
+                ] {
+                    let img = converter.process(&path).unwrap();
+                    assert!(img.is_color);
+                    let at = (centre.1 * img.width + centre.0) * img.channels as usize;
+                    let (r, g, b) = (img.data[at], img.data[at + 1], img.data[at + 2]);
+                    assert!(
+                        r > g.saturating_add(100) && r > b.saturating_add(100),
+                        "{name}, BAYERPAT {bayerpat}, offsets ({xoff}, {yoff}): star renders as RGB ({r}, {g}, {b})"
+                    );
+                }
+            }
+        }
+        std::fs::remove_file(&path).ok();
     }
 }
