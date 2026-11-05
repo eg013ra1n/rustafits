@@ -681,7 +681,6 @@ mod tests {
     /// the parity.
     #[test]
     fn bayer_offsets_follow_the_catalog_rule_on_unusual_cards() {
-        use crate::formats::stored_keys::FitsHeader as CatalogHeader;
         use BayerPattern as P;
         let path = std::env::temp_dir().join(format!("rustafits_test_catalog_bayroff_{}.fits", std::process::id()));
         let cases: &[&[&str]] = &[
@@ -722,6 +721,33 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A header of two blocks with the offset card in the second one: the
+    /// catalog parse must see every block the reader read, not only the first.
+    /// The expected value is the catalog reader's on the same bytes.
+    #[test]
+    fn bayer_offsets_in_the_second_header_block_follow_the_catalog() {
+        use BayerPattern as P;
+        let path = std::env::temp_dir().join(format!("rustafits_test_block2_bayroff_{}.fits", std::process::id()));
+        // 8 base cards + 40 filler cards fill block 1 (36 cards) and spill into block 2.
+        let mut cards: Vec<String> = (0..40).map(|i| format!("FILLER{i:02}= {i}")).collect();
+        cards.push("XBAYROFF= '1'".to_string());
+        let cards: Vec<&str> = cards.iter().map(String::as_str).collect();
+        let header = write_cfa_fits_raw(&path, &cards);
+
+        assert_eq!(header.len(), 2 * FITS_BLOCK_SIZE, "the premise: the header has two blocks");
+        assert!(
+            !String::from_utf8_lossy(&header[..FITS_BLOCK_SIZE]).contains("XBAYROFF"),
+            "the premise: the offset card is not in the first block"
+        );
+        let catalog = CatalogHeader::from_bytes(&header).unwrap();
+        let (x, y) = (catalog.get_i32("XBAYROFF").unwrap_or(0), catalog.get_i32("YBAYROFF").unwrap_or(0));
+        assert_eq!((x, y), (1, 0), "the premise: the catalog reads the card in block 2");
+        let want = super::super::shift_bayer_pattern(P::Rggb, x % 2 != 0, y % 2 != 0);
+        assert_eq!(want, P::Grbg);
+        assert_eq!(both_readers_pattern(&path, "offset card in the second header block"), want);
+        std::fs::remove_file(&path).ok();
+    }
+
     /// A header the reader parses to its END but the catalog reader does not
     /// (an END card with text in columns 5-8 is not END to the catalog)
     /// keeps the reader's own integer-prefix offsets and logs the failure.
@@ -749,7 +775,7 @@ mod tests {
         bytes.resize(2 * FITS_BLOCK_SIZE, 0);
         std::fs::write(&path, bytes).unwrap();
         assert!(
-            crate::formats::stored_keys::FitsHeader::from_bytes(&std::fs::read(&path).unwrap()[..FITS_BLOCK_SIZE]).is_err(),
+            CatalogHeader::from_bytes(&std::fs::read(&path).unwrap()[..FITS_BLOCK_SIZE]).is_err(),
             "the premise: the catalog reader does not find an END in this header"
         );
 
