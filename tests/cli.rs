@@ -5,7 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use astroimage::{ImageAnalyzer, ImageConverter};
+use astroimage::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary, Verdict};
+use astroimage::star_measure::raw::{read_raw_frame, RawFrame, RawPlanes};
+use astroimage::star_measure::{PlaneMeasurement, PsfModel, MEASURE_VERSION};
+use astroimage::ImageConverter;
 
 const BIN: &str = env!("CARGO_BIN_EXE_rustafits");
 
@@ -295,6 +298,79 @@ fn analyze_csv(dir: &Path, args: &[&str]) -> (Vec<String>, Vec<Vec<String>>) {
     (header, lines.collect())
 }
 
+/// The CSV header: the 19 columns the CLI always had, in their order, then the six `analysis_mode` adds.
+const CSV_COLUMNS: [&str; 25] = [
+    "file", "width", "height", "stars_detected", "stars_measured", "median_fwhm", "median_hfr",
+    "median_eccentricity", "median_snr", "median_beta", "snr_weight", "psf_signal", "frame_snr",
+    "background", "noise", "trail_r_squared", "possibly_trailed", "median_fwhm_arcsec", "median_hfr_arcsec",
+    "channels", "stars_refused", "frame_verdict", "measure_version", "detection_threshold", "psf_model",
+];
+
+/// What the library says about `path`: `read_raw_frame` + `measure_raw_frame` + `FrameSummary::from_measurement`.
+/// No result reads a thread count (G-6), so `None` for the pool equals the CLI's.
+fn lib_measure(path: &Path, opts: &FrameOptions) -> (RawFrame, PlaneMeasurement, FrameSummary) {
+    let frame = read_raw_frame(path).unwrap();
+    let pm = measure_raw_frame(&frame, opts, None);
+    let summary = FrameSummary::from_measurement(&pm, opts);
+    (frame, pm, summary)
+}
+
+/// `FrameOptions` from the three CLI knobs (it is `#[non_exhaustive]`: no struct literal outside the crate).
+fn frame_options(detection_threshold: f64, psf_model: PsfModel, max_stars: usize) -> FrameOptions {
+    let mut opts = FrameOptions::default();
+    opts.detection_threshold = detection_threshold;
+    opts.psf_model = psf_model;
+    opts.max_stars = max_stars;
+    opts
+}
+
+/// The CSV row the library's numbers make (no optics: the two arcsec cells are empty), cell by cell as
+/// `f64::to_string()`. `file` is the first cell as the CLI prints it.
+fn lib_row(file: &str, path: &Path, opts: &FrameOptions, psf_model: &str) -> Vec<String> {
+    let (frame, pm, s) = lib_measure(path, opts);
+    let verdict = match s.verdict {
+        Some(Verdict::Trailed) => "trailed",
+        Some(Verdict::Defocused) => "defocused",
+        Some(Verdict::NoStars) => "no_stars",
+        None => "",
+    };
+    vec![
+        file.to_string(),
+        frame.w.to_string(),
+        frame.h.to_string(),
+        s.stars_detected.to_string(),
+        pm.stars.len().to_string(),
+        s.median_fwhm.to_string(),
+        s.median_hfr.to_string(),
+        s.median_eccentricity.to_string(),
+        s.median_snr.to_string(),
+        s.median_beta.map_or(String::new(), |b| b.to_string()),
+        s.snr_weight.to_string(),
+        s.psf_signal.to_string(),
+        s.frame_snr.to_string(),
+        s.background.to_string(),
+        s.noise.to_string(),
+        s.trail_r_squared.to_string(),
+        pm.trailed.to_string(),
+        String::new(),
+        String::new(),
+        frame.channels.to_string(),
+        s.stars_refused.to_string(),
+        verdict.to_string(),
+        MEASURE_VERSION.to_string(),
+        opts.detection_threshold.to_string(),
+        psf_model.to_string(),
+    ]
+}
+
+/// Compare a CLI row with the library's, cell by cell, naming the column that differs.
+fn assert_row_eq(got: &[String], want: &[String], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: {got:?}");
+    for ((g, w), name) in got.iter().zip(want).zip(CSV_COLUMNS) {
+        assert_eq!(g, w, "{what}: column {name}");
+    }
+}
+
 #[test]
 fn analyze_reports_exactly_what_the_library_measures() {
     let dir = scratch("analyze");
@@ -302,16 +378,18 @@ fn analyze_reports_exactly_what_the_library_measures() {
     write_star_field(&dir.join("soft.fits"), 2.2, &[]);
 
     let (header, rows) = analyze_csv(&dir, &["sharp.fits", "soft.fits"]);
-    let col = |name: &str| header.iter().position(|h| h == name).unwrap();
+    assert_eq!(header, CSV_COLUMNS);
+    let opts = FrameOptions::default();
     for (row, file) in rows.iter().zip(["sharp.fits", "soft.fits"]) {
-        let lib = ImageAnalyzer::new().analyze(dir.join(file)).unwrap();
-        assert!(lib.stars_detected > 20, "{file}: the field must be measurable");
-        assert_eq!(row[col("file")], file);
-        assert_eq!(row[col("stars_detected")], lib.stars_detected.to_string());
-        assert_eq!(row[col("median_fwhm")], lib.median_fwhm.to_string());
-        assert_eq!(row[col("median_hfr")], lib.median_hfr.to_string());
-        assert_eq!(row[col("median_eccentricity")], lib.median_eccentricity.to_string());
-        assert_eq!(row[col("snr_weight")], lib.snr_weight.to_string());
+        let (_, pm, s) = lib_measure(&dir.join(file), &opts);
+        assert!(pm.stars.len() >= 20 && s.verdict.is_none(), "{file}: the field must be measurable ({s:?})");
+        assert_row_eq(row, &lib_row(file, &dir.join(file), &opts, "moffat4"), file);
+        // Named, so a drift in the defaults shows here and not only in the row comparison.
+        let col = |name: &str| header.iter().position(|h| h == name).unwrap();
+        assert_eq!(row[col("median_beta")], "");
+        assert_eq!(row[col("frame_verdict")], "");
+        assert_eq!(row[col("measure_version")], "8");
+        assert_eq!(row[col("psf_model")], "moffat4");
     }
 
     // Best-first by FWHM puts the sharp field first whatever the input order.
@@ -320,12 +398,199 @@ fn analyze_reports_exactly_what_the_library_measures() {
     let (_, rows) = analyze_csv(&dir, &["sharp.fits", "soft.fits", "--sort", "fwhm", "--reverse"]);
     assert_eq!(rows[0][0], "soft.fits");
 
-    // Table and JSON carry the same frames.
+    // Table and JSON carry the same frames; the table ends in VERDICT.
     let o = run(&dir, &["analyze", "sharp.fits", "soft.fits", "--quiet"]);
     let table = stdout(&o);
     assert!(table.starts_with("FILE") && table.contains("sharp.fits") && table.contains("soft.fits"), "{table}");
+    assert!(table.lines().next().unwrap().ends_with("VERDICT"), "{table}");
+    assert!(!table.contains("TRAIL"), "VERDICT replaces TRAIL: {table}");
     let o = run(&dir, &["analyze", "sharp.fits", "--json"]);
-    assert!(stdout(&o).contains("\"file\": \"sharp.fits\""));
+    let json = stdout(&o);
+    assert!(json.contains("\"file\": \"sharp.fits\""), "{json}");
+    assert!(json.contains("\"frame_verdict\": null") && json.contains("\"psf_model\": \"moffat4\""), "{json}");
+    assert!(json.contains("\"measure_version\": 8") && json.contains("\"detection_threshold\": 6,"), "{json}");
+}
+
+#[test]
+fn analyze_options_reach_the_measurement() {
+    let dir = scratch("analyze-options");
+    write_star_field(&dir.join("sharp.fits"), 1.2, &[]);
+    let path = dir.join("sharp.fits");
+
+    // --psf-model auto: the frame's own beta, whatever the library says (Some only for a fitted source).
+    let auto = frame_options(6.0, PsfModel::Auto, 500);
+    let (_, rows) = analyze_csv(&dir, &["sharp.fits", "--psf-model", "auto"]);
+    assert_row_eq(&rows[0], &lib_row("sharp.fits", &path, &auto, "auto"), "--psf-model auto");
+    let (_, _, s) = lib_measure(&path, &auto);
+    eprintln!("median_beta under auto on sharp.fits: {:?}", s.median_beta);
+
+    // --detection-threshold: the library's detection at 12.0.
+    let high = frame_options(12.0, PsfModel::Moffat4, 500);
+    let (_, rows) = analyze_csv(&dir, &["sharp.fits", "--detection-threshold", "12"]);
+    assert_row_eq(&rows[0], &lib_row("sharp.fits", &path, &high, "moffat4"), "--detection-threshold 12");
+    assert_eq!(rows[0][CSV_COLUMNS.iter().position(|c| *c == "detection_threshold").unwrap()], "12");
+
+    // --max-stars: the budget. The default keeps more than 20 on this field, so 20 bites.
+    let (_, rows) = analyze_csv(&dir, &["sharp.fits"]);
+    let measured = CSV_COLUMNS.iter().position(|c| *c == "stars_measured").unwrap();
+    assert!(rows[0][measured].parse::<usize>().unwrap() > 20, "{:?}", rows[0]);
+    let small = frame_options(6.0, PsfModel::Moffat4, 20);
+    let (_, rows) = analyze_csv(&dir, &["sharp.fits", "--max-stars", "20"]);
+    assert_row_eq(&rows[0], &lib_row("sharp.fits", &path, &small, "moffat4"), "--max-stars 20");
+    assert!(rows[0][measured].parse::<usize>().unwrap() <= 20, "{:?}", rows[0]);
+
+    // Optics add the arcsec cells: px x pixel size / focal length x 206.265.
+    let (_, rows) = analyze_csv(&dir, &["sharp.fits", "--focal-length", "448", "--pixel-size", "3.76"]);
+    let (_, _, s) = lib_measure(&path, &FrameOptions::default());
+    let scale = 3.76 / 448.0 * 206.265;
+    let cell = |name: &str| rows[0][CSV_COLUMNS.iter().position(|c| *c == name).unwrap()].parse::<f64>().unwrap();
+    assert!((cell("median_fwhm_arcsec") - s.median_fwhm * scale).abs() < 1e-9);
+    assert!((cell("median_hfr_arcsec") - s.median_hfr * scale).abs() < 1e-9);
+}
+
+#[test]
+fn analyze_measures_a_mosaic_on_its_green_sites() {
+    let dir = scratch("analyze-mosaic");
+    write_star_field(&dir.join("mosaic.fits"), 1.2, &["BAYERPAT= 'RGGB'".to_string()]);
+    let path = dir.join("mosaic.fits");
+    let opts = FrameOptions::default();
+    let (frame, pm, s) = lib_measure(&path, &opts);
+    assert!(matches!(frame.planes, RawPlanes::Cfa { .. }), "the file reads as a mosaic");
+    assert!(pm.stars.len() >= 20 && s.verdict.is_none(), "the mosaic must be measurable ({s:?})");
+
+    let (_, rows) = analyze_csv(&dir, &["mosaic.fits"]);
+    assert_row_eq(&rows[0], &lib_row("mosaic.fits", &path, &opts, "moffat4"), "mosaic");
+    // The native size, one channel: not the half-size super-pixel render.
+    let cell = |name: &str| rows[0][CSV_COLUMNS.iter().position(|c| *c == name).unwrap()].as_str();
+    assert_eq!((cell("width"), cell("height"), cell("channels")), ("320", "240", "1"));
+}
+
+/// A frame of noise and no star: pseudo-random pixels from a hash of the position.
+fn write_noise_frame(path: &Path) {
+    write_fits_with(path, 320, 240, &[], |x, y| {
+        let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        h = (h ^ (h >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 32;
+        1000.0 + ((h % 61) as f64 - 30.0) * 1.5
+    });
+}
+
+#[test]
+fn a_frame_with_a_verdict_prints_dashes_and_sorts_last() {
+    let dir = scratch("analyze-verdict");
+    write_noise_frame(&dir.join("flat.fits"));
+    write_star_field(&dir.join("sharp.fits"), 1.2, &[]);
+    let opts = FrameOptions::default();
+    let (_, _, s) = lib_measure(&dir.join("flat.fits"), &opts);
+    assert_eq!(s.verdict, Some(Verdict::NoStars), "the noise frame has no star ({s:?})");
+
+    let (_, rows) = analyze_csv(&dir, &["flat.fits", "sharp.fits"]);
+    assert_row_eq(&rows[0], &lib_row("flat.fits", &dir.join("flat.fits"), &opts, "moffat4"), "flat");
+    let col = |name: &str| CSV_COLUMNS.iter().position(|c| *c == name).unwrap();
+    assert_eq!(rows[0][col("frame_verdict")], "no_stars");
+    assert_eq!(rows[0][col("median_fwhm")], "0", "the CSV keeps what Athenaeum stores");
+    assert_eq!(rows[1][col("frame_verdict")], "");
+
+    // Table: dashes for the medians of a frame without a statistic, the verdict in words.
+    let o = run(&dir, &["analyze", "flat.fits", "sharp.fits", "--quiet"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let table = stdout(&o);
+    let lines: Vec<Vec<&str>> = table.lines().map(|l| l.split_whitespace().collect()).collect();
+    assert_eq!(lines[0], ["FILE", "STARS", "FWHM", "HFR", "ECC", "SNR", "WEIGHT", "BG", "NOISE", "VERDICT"]);
+    let flat = &lines[1];
+    assert_eq!(flat[0], "flat.fits");
+    assert_eq!(flat[2..=6], ["-", "-", "-", "-", "-"], "FWHM HFR ECC SNR WEIGHT: {table}");
+    assert_eq!(flat[9..].join(" "), "no stars", "{table}");
+    let sharp = &lines[2];
+    assert_eq!(sharp[0], "sharp.fits");
+    assert!(sharp[2..=6].iter().all(|c| *c != "-"), "{table}");
+    assert_eq!(sharp[9..], ["-"], "no verdict: {table}");
+
+    // With optics the arcsec columns dash out too.
+    let o = run(&dir, &["analyze", "flat.fits", "sharp.fits", "--quiet", "--focal-length", "448", "--pixel-size", "3.76"]);
+    let table = stdout(&o);
+    let flat: Vec<&str> = table.lines().nth(1).unwrap().split_whitespace().collect();
+    assert_eq!(flat[2..=8], ["-"; 7], "FWHM HFR FWHM\" HFR\" ECC SNR WEIGHT: {table}");
+
+    // --sort fwhm: a frame with a verdict is never ranked best, with either input order.
+    for order in [["flat.fits", "sharp.fits"], ["sharp.fits", "flat.fits"]] {
+        let (_, rows) = analyze_csv(&dir, &[order[0], order[1], "--sort", "fwhm"]);
+        assert_eq!((rows[0][0].as_str(), rows[1][0].as_str()), ("sharp.fits", "flat.fits"), "{order:?}");
+    }
+}
+
+#[test]
+fn old_flags_still_run_with_a_warning() {
+    let dir = scratch("analyze-old-flags");
+    write_star_field(&dir.join("sharp.fits"), 1.2, &[]);
+
+    let o = run(&dir, &["analyze", "sharp.fits", "--sigma", "8", "--measure-cap", "0", "--no-debayer", "--csv", "--quiet"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let new = run(&dir, &["analyze", "sharp.fits", "--detection-threshold", "8", "--csv", "--quiet"]);
+    assert!(new.status.success(), "{}", stderr(&new));
+    assert_eq!(stdout(&o), stdout(&new), "--sigma 8 is --detection-threshold 8");
+    assert!(new.stderr.is_empty(), "the new spelling is silent: {}", stderr(&new));
+
+    let err = stderr(&o);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "warning: --sigma is --detection-threshold since 1.8.0: another detector, default 6.0",
+            "warning: --measure-cap has no effect since 1.8.0: the star budget is --max-stars",
+            "warning: --no-debayer has no effect since 1.8.0: a mosaic is measured on its green sites",
+        ],
+        "{err}"
+    );
+
+    // The old and the new spelling of the same knob are one knob.
+    let both = run(&dir, &["analyze", "sharp.fits", "--sigma", "8", "--detection-threshold", "8", "--quiet"]);
+    assert_eq!(both.status.code(), Some(2), "clap usage error: {}", stderr(&both));
+
+    // The hidden flags stay out of --help.
+    let help = stdout(&run(&dir, &["analyze", "--help"]));
+    assert!(help.contains("--detection-threshold") && help.contains("--psf-model") && help.contains("--max-stars"), "{help}");
+    assert!(!help.contains("--sigma") && !help.contains("--measure-cap") && !help.contains("--no-debayer"), "{help}");
+}
+
+#[test]
+fn out_of_range_options_are_refused() {
+    let dir = scratch("analyze-ranges");
+    write_star_field(&dir.join("sharp.fits"), 1.2, &[]);
+    for (args, message) in [
+        (["--max-stars", "5"], "must be between 10 and 2000"),
+        (["--max-stars", "2001"], "must be between 10 and 2000"),
+        (["--detection-threshold", "1.5"], "must be between 2 and 20"),
+        (["--detection-threshold", "25"], "must be between 2 and 20"),
+        (["--sigma", "25"], "must be between 2 and 20"),
+    ] {
+        let o = run(&dir, &["analyze", "sharp.fits", "--csv", "--quiet", args[0], args[1]]);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(message), "{args:?}: {}", stderr(&o));
+        assert!(o.stdout.is_empty(), "{args:?}: nothing on stdout");
+    }
+}
+
+/// G5-f, the claim of port phase 5: on the real frames the CLI prints `analysis_mode`'s numbers, every column at
+/// full precision. Real 26 MP frames are slow in a test run: `cargo test --release --test cli -- --ignored`.
+#[test]
+#[ignore = "26 MP frames: run on request, in release mode"]
+fn analyze_matches_the_library_on_the_test_frames() {
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let opts = FrameOptions::default();
+    let mut checked = 0;
+    for name in ["mono.fits", "osc.fits", "cocoon.fits", "test.xisf"] {
+        let path = tests.join(name);
+        if !path.exists() {
+            // cocoon.fits is not tracked (the other three are); say so rather than pass silently.
+            eprintln!("Skipping: tests/{name} not found");
+            continue;
+        }
+        let (_, rows) = analyze_csv(&tests, &[name]);
+        assert_row_eq(&rows[0], &lib_row(name, &path, &opts, "moffat4"), name);
+        checked += 1;
+    }
+    assert!(checked >= 3, "mono.fits, osc.fits and test.xisf are tracked: {checked} frames checked");
 }
 
 #[test]
