@@ -1,6 +1,8 @@
 # star_measure port, phase 4: the Analysis-mode entry — task plan
 
-> **Status:** draft r2 (2026-11-04): plan review r1 folded, every question of section 6 decided (Q-2 by the owner).
+> **Status:** implemented and gated; G-1h owed; merges pending (§4 steps 6–7). Gate results: the port plan's phase 4
+> (`2026-11-03-star-measure-port.md`) and Athenaeum's `docs/stacking/README.md`, R-OSP-19. Plan history: draft r2
+> (2026-11-04), plan review r1 folded, every question of section 6 decided (Q-2 by the owner).
 > Fix round 1 (2026-11-05, ruling R-P4-C1) replaced the residual-edge-case lists of sections 0, 1.1 and 1.2 and
 > decisions P4-1 and P4-3 by parity: Athenaeum's own header-value rules are ported into `formats::stored_keys`.
 > It details items 4.1–4.5 of the port plan

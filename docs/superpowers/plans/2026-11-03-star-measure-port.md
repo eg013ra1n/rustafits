@@ -352,24 +352,44 @@ R-OSP-19 in its `docs/stacking/README.md`).
 ### Phase 4: the Analysis-mode entry (rustafits, then Athenaeum)
 
 The task plan is `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md`; each item below names its task.
-Status (2026-11-05): T1–T5 (items 4.1–4.4 and the docs) are written on the rustafits branch `feat/star-measure-phase-4`;
-T6 (4.5), T7, the lab harness change (L1) and the gates (its section 4: G-1a … G-1h, G-3) are pending. The results are
-added here after the gates, as phase 3's were.
+Status (2026-11-05): implemented and gated, G-1a … G-3 pass; G-1h (the app smoke) is owed; the merges are pending (task
+plan section 4, steps 6–7). Branch `feat/star-measure-phase-4` is at 9c5e75d; Athenaeum's `star-measure-port-phase-4` is at 484361ac.
 
-- [ ] 4.1 (T1) The XISF reader folds `XBAYROFF` / `YBAYROFF` from its FITS keywords, as #7 did for FITS. Athenaeum's own
-  XISF fold must go in the same submodule bump: two folds would cancel on an odd offset.
-- [ ] 4.2 (T2) `star_measure::raw` from `input.rs`. Header facts come from `ImageConverter::read_header`; the domain
-  rules (PC-2, R-PC-2) and the tests are unchanged.
-- [ ] 4.3 (T3) `star_measure::green` and `star_measure::trail` from `cfa.rs` and `trail.rs`.
-- [ ] 4.4 (T4) `star_measure::analysis_mode`:
+- [x] 4.1 (T1) The XISF reader folds `XBAYROFF` / `YBAYROFF` from its FITS keywords, as #7 did for FITS. Athenaeum's own
+  XISF fold went in the same submodule bump: two folds would cancel on an odd offset. Done: the offsets are read by
+  `formats::stored_keys`' rule (fix round 1, R-P4-C1), and `star_measure::raw` folds nothing.
+- [x] 4.2 (T2) `star_measure::raw` from `input.rs`. Done; the header facts come from `formats::stored_keys`, Athenaeum's
+  own header-value rules ported verbatim (R-P4-C1), not from `ImageConverter::read_header`; the domain rules (PC-2,
+  R-PC-2) and the tests are unchanged.
+- [x] 4.3 (T3) `star_measure::green` and `star_measure::trail` from `cfa.rs` and `trail.rs`. Done.
+- [x] 4.4 (T4) `star_measure::analysis_mode`. Done:
   - `FrameOptions { detection_threshold: 6.0, psf_model: Moffat4, max_stars: 500 }`;
   - `measure_raw_frame(_with)`;
   - `FrameSummary` with `map_measurement`'s frame arithmetic (2.3).
-- [ ] 4.5 (T6) Athenaeum: `analysis/` keeps `config.rs` and the mapping from `FrameSummary` to `FrameAnalysis` /
-  `StarMetric`; `input.rs`, `cfa.rs` and `trail.rs` go.
+- [x] 4.5 (T6) Athenaeum: `analysis/` keeps `config.rs` and the mapping from `FrameSummary` to `FrameAnalysis` /
+  `StarMetric`; `input.rs`, `cfa.rs` and `trail.rs` went (and `raw_seam.rs` holds the test-only seam). Done.
 - Verify: G-1 on the analysis-mode arm (every row of the corpus identical, verdicts included), and Athenaeum's
   `analysis` tests. The phase's gates and their bars are section 4 of its task plan; `scripts/star_measure_port/mac_check.sh`
   takes `MAC_CHECK_BRANCH=star-measure-port-phase-4` and `MAC_CHECK_MAIN=e6344ddd` for G-1a.
+
+  Results (dev Mac aarch64, 2026-11-05; before = Athenaeum `main` e6344ddd with rustafits 8ecca88, after = 484361ac with
+  rustafits 9c5e75d; athenaeum-lab 9264396 and 9977f31, pushed, `star-lab/results/star-measure-port/phase-4/` and
+  `phase-4-fold/`; the full account is Athenaeum's `docs/stacking/README.md`, R-OSP-19 phase 4):
+  - G-1a: the digest is byte-identical (`a07688d0…`, as in phase 3); rustafits `--features serde` 581 / 0 / 3; athenaeum-core
+    all targets 4549 / 0 / 15.
+  - G-1b: `SMPORT: PASS`, 152 analysis-mode image-arms identical, 0 moved, 1 481 994 lines. EGAIN is on 59 of the 152
+    files and DATAMAX on none, so the `DATAMAX` rule rests on the unit parity tests and Athenaeum's `raw_seam.rs`.
+  - G-1c: the fold control passes, 3 identical before / after; against the unpatched file the X1 and Y1 copies differ
+    and XY1 is equal; `rustafits info` reads GRBG / GBRG / BGGR after.
+  - G-1d: renders, `info` and `analyze` on `mono.fits`, `osc.fits` and `test.xisf` are byte-identical (9 outputs); the
+    fold copies' JPEGs differ. G-1e: `MEASURE_VERSION` 8. G-1f: `ts_contract` passes, `src/types` is unchanged, the
+    no-default-features and web builds are clean.
+  - G-1g: the release `rustafits` is 3 082 944 B before and 3 035 792 B after (-47 152 B; the cause was not investigated).
+  - G-3: default 573 / 0 / 3, `--features serde` 581 / 0 / 3, `--features debug-pipeline` 573 / 0 / 5; clippy prints the same
+    11 lines as `main`.
+  - Round 1 stopped at G-1b: a shared cargo target made the after side reuse the before side's rustafits, so `smport.sh`
+    now builds one target per side (lab 469cc89).
+  - G-1h, the app smoke of the wiring, is **OWED**.
 
 ### Phase 5: rustafits' own consumers
 
