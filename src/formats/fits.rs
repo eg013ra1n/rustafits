@@ -160,7 +160,7 @@ fn layout(hdr: &FitsHeader) -> Result<(usize, BayerPattern, bool)> {
     };
     // BAYERPAT names the cell that starts XBAYROFF / YBAYROFF sites into the
     // stored frame; fold the offsets in so the pattern addresses pixel (0, 0).
-    let bayer_pattern = shift_bayer_pattern(bayer_pattern, hdr.xbayroff % 2 != 0, hdr.ybayroff % 2 != 0);
+    let bayer_pattern = super::shift_bayer_pattern(bayer_pattern, hdr.xbayroff % 2 != 0, hdr.ybayroff % 2 != 0);
 
     // Astronomical convention (PixInsight, ds9, Siril, AstroImageJ):
     //   ROWORDER = 'TOP-DOWN'  → row 0 is the top of the displayed image,
@@ -174,35 +174,6 @@ fn layout(hdr: &FitsHeader) -> Result<(usize, BayerPattern, bool)> {
     let flip_vertical = !hdr.roworder.eq_ignore_ascii_case("TOP-DOWN");
 
     Ok((channels, bayer_pattern, flip_vertical))
-}
-
-/// `pattern` as seen from one site further right (`odd_x`: the 2×2 cell's
-/// columns swap, RGGB → GRBG) and/or one site further down (`odd_y`: its rows
-/// swap, RGGB → GBRG).
-fn shift_bayer_pattern(pattern: BayerPattern, odd_x: bool, odd_y: bool) -> BayerPattern {
-    use BayerPattern as P;
-    let pattern = if odd_x {
-        match pattern {
-            P::Rggb => P::Grbg,
-            P::Grbg => P::Rggb,
-            P::Gbrg => P::Bggr,
-            P::Bggr => P::Gbrg,
-            P::None => P::None,
-        }
-    } else {
-        pattern
-    };
-    if odd_y {
-        match pattern {
-            P::Rggb => P::Gbrg,
-            P::Gbrg => P::Rggb,
-            P::Grbg => P::Bggr,
-            P::Bggr => P::Grbg,
-            P::None => P::None,
-        }
-    } else {
-        pattern
-    }
 }
 
 /// Header-only read: layout and every keyword, no pixel data.

@@ -1,4 +1,5 @@
 pub mod fits;
+pub(crate) mod stored_keys;
 pub mod xisf;
 
 use std::fs::File;
@@ -7,7 +8,7 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 
-use crate::types::{ImageHeader, ImageMetadata, PixelData};
+use crate::types::{BayerPattern, ImageHeader, ImageMetadata, PixelData};
 
 pub fn read_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     if is_xisf(path) {
@@ -38,6 +39,35 @@ pub fn read_header(path: &Path) -> Result<ImageHeader> {
                 .and_then(|e| e.to_str())
                 .unwrap_or("unknown")
         )
+    }
+}
+
+/// `pattern` as seen from one site further right (`odd_x`: the 2×2 cell's
+/// columns swap, RGGB → GRBG) and/or one site further down (`odd_y`: its rows
+/// swap, RGGB → GBRG).
+pub(crate) fn shift_bayer_pattern(pattern: BayerPattern, odd_x: bool, odd_y: bool) -> BayerPattern {
+    use BayerPattern as P;
+    let pattern = if odd_x {
+        match pattern {
+            P::Rggb => P::Grbg,
+            P::Grbg => P::Rggb,
+            P::Gbrg => P::Bggr,
+            P::Bggr => P::Gbrg,
+            P::None => P::None,
+        }
+    } else {
+        pattern
+    };
+    if odd_y {
+        match pattern {
+            P::Rggb => P::Gbrg,
+            P::Gbrg => P::Rggb,
+            P::Grbg => P::Bggr,
+            P::Bggr => P::Grbg,
+            P::None => P::None,
+        }
+    } else {
+        pattern
     }
 }
 
