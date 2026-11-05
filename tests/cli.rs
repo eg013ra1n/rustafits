@@ -8,7 +8,9 @@ use std::process::{Command, Output};
 use astroimage::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary, Verdict};
 use astroimage::star_measure::raw::{read_raw_frame, RawFrame, RawPlanes};
 use astroimage::star_measure::{PlaneMeasurement, PsfModel, MEASURE_VERSION};
-use astroimage::ImageConverter;
+use astroimage::{
+    annotate_image_with, encode_png, AnnotationConfig, ImageConverter, PngCompression, StarOverlay,
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_rustafits");
 
@@ -600,8 +602,170 @@ fn analyze_reports_a_broken_file_and_keeps_the_rest() {
     std::fs::write(dir.join("broken.fits"), b"SIMPLE  =                    T").unwrap();
     let o = run(&dir, &["analyze", "good.fits", "broken.fits", "--csv", "--quiet"]);
     assert_eq!(o.status.code(), Some(1));
-    assert!(stderr(&o).contains("broken.fits"));
+    assert_error_line_names_once(&stderr(&o), "broken.fits");
     assert_eq!(stdout(&o).lines().count(), 2, "header + the good frame");
+}
+
+/// The one `error:` line about `file` names it exactly once (the reader's own message already carries the path).
+fn assert_error_line_names_once(err: &str, file: &str) {
+    let lines: Vec<&str> = err.lines().filter(|l| l.starts_with("error:") && l.contains(file)).collect();
+    assert_eq!(lines.len(), 1, "one error line for {file}: {err}");
+    assert_eq!(lines[0].matches(file).count(), 1, "{file} appears once in: {}", lines[0]);
+}
+
+// ---------------------------------------------------------------- convert --annotate
+
+/// `write_star_field`'s stars, but only in the file's first three grid rows (file y = 12, 36, 60): the picture is
+/// bottom-up, so they render in its bottom rows, and an overlay that forgot the flip would draw in the top ones.
+fn write_top_star_field(path: &Path, sigma: f64, extra: &[String]) {
+    write_fits_with(path, 320, 240, extra, |x, y| {
+        let noise = (((x * 7919 + y * 104_729) % 61) as f64 - 30.0) * 1.5;
+        let (cx, cy) = (((x / 24) * 24 + 12) as f64, ((y / 24) * 24 + 12) as f64);
+        let amp = if cy <= 60.0 { 4000.0 + ((x / 24 * 7 + y / 24 * 13) % 9) as f64 * 1500.0 } else { 0.0 };
+        let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
+        1000.0 + noise + amp * (-r2 / (2.0 * sigma * sigma)).exp()
+    });
+}
+
+const GREEN: [u8; 3] = [0, 255, 0];
+
+fn read_png(path: &Path) -> image::RgbImage {
+    image::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())).to_rgb8()
+}
+
+fn green_pixels(img: &image::RgbImage, x: std::ops::Range<u32>, y: std::ops::Range<u32>) -> usize {
+    y.flat_map(|y| x.clone().map(move |x| (x, y))).filter(|&(x, y)| img.get_pixel(x, y).0 == GREEN).count()
+}
+
+/// Exactly `[0, 255, 0]` anywhere within `r` px of (x, y).
+fn green_near(img: &image::RgbImage, x: u32, y: u32, r: u32) -> bool {
+    green_pixels(img, x.saturating_sub(r)..(x + r + 1).min(img.width()), y.saturating_sub(r)..(y + r + 1).min(img.height())) > 0
+}
+
+/// What `rustafits in.fits out.png -a` must write: the library's render, the library's measurement of the file
+/// (`analysis_mode` defaults, budget 500) drawn through `StarOverlay`, PNG at the CLI's default compression.
+fn lib_annotated_png(path: &Path) -> Vec<u8> {
+    let (frame, pm, summary) = lib_measure(path, &FrameOptions::default());
+    let overlay = StarOverlay::from_measurement(frame.w, frame.h, &pm, &summary);
+    let mut image = ImageConverter::new().process(path).unwrap();
+    annotate_image_with(&mut image, &overlay, &AnnotationConfig::default());
+    encode_png(&image.data, image.width, image.height, image.channels as usize, PngCompression::Fast).unwrap()
+}
+
+#[test]
+fn annotate_draws_on_the_stars() {
+    let dir = scratch("annotate-stars");
+    let path = dir.join("sharp.fits");
+    write_top_star_field(&path, 1.2, &[]);
+    // The library sees a star at file (12, 12): its ring must be where the render put that star.
+    let (_, pm, s) = lib_measure(&path, &FrameOptions::default());
+    assert!(s.verdict.is_none() && pm.stars.len() >= 20, "the fixture must be measurable ({s:?})");
+    assert!(pm.stars.iter().any(|st| (st.x - 12.0).abs() < 1.0 && (st.y - 12.0).abs() < 1.0), "no fit at (12, 12)");
+
+    for out in ["a.png", "plain.png"] {
+        let args: Vec<&str> = if out == "a.png" { vec!["sharp.fits", out, "-a"] } else { vec!["sharp.fits", out] };
+        let o = run(&dir, &args);
+        assert!(o.status.success(), "{args:?}: {}", stderr(&o));
+    }
+    let (annotated, plain) = (read_png(&dir.join("a.png")), read_png(&dir.join("plain.png")));
+    assert_eq!((annotated.width(), annotated.height()), (320, 240));
+    let (w, h) = (320, 240);
+    assert_eq!(green_pixels(&plain, 0..w, 0..h), 0, "a plain render has no green");
+    assert!(green_pixels(&annotated, 0..w, 0..h) >= 20, "the rings are drawn in exact [0, 255, 0]");
+
+    // The file is bottom-up: file row 12 renders at row 227. Round stars: a ring of 6 px (the minimum radius).
+    assert!(green_near(&annotated, 18, 227, 1), "the ring of the star at file (12, 12) lands at (12, 227)");
+    assert!(!green_near(&annotated, 12, 227, 1), "a ring, not a disc");
+    assert_eq!(green_pixels(&annotated, 0..w, 0..120), 0, "nothing is drawn on the empty top half");
+
+    // And it is exactly what the library draws.
+    assert!(
+        std::fs::read(dir.join("a.png")).unwrap() == lib_annotated_png(&path),
+        "the CLI draws the library's overlay"
+    );
+}
+
+#[test]
+fn annotate_scales_a_mosaic() {
+    let dir = scratch("annotate-mosaic");
+    let path = dir.join("mosaic.fits");
+    write_top_star_field(&path, 1.2, &["BAYERPAT= 'RGGB'".to_string()]);
+    let (frame, pm, s) = lib_measure(&path, &FrameOptions::default());
+    assert!(matches!(frame.planes, RawPlanes::Cfa { .. }), "the file reads as a mosaic");
+    assert!(s.verdict.is_none() && pm.stars.len() >= 20, "the mosaic must be measurable ({s:?})");
+
+    let o = run(&dir, &["mosaic.fits", "a.png", "-a"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let annotated = read_png(&dir.join("a.png"));
+    // The render is the half-size super-pixel image; the stars were measured on the native grid.
+    assert_eq!((annotated.width(), annotated.height()), (160, 120));
+    // Native (12, 12) -> (6, 6) -> flipped (6, 113); the ring has radius 6: right (12, 113), top (6, 107).
+    assert!(green_near(&annotated, 12, 113, 1), "right of the ring at (6, 113)");
+    assert!(green_near(&annotated, 6, 107, 1), "top of the ring at (6, 113)");
+    assert!(!green_near(&annotated, 6, 113, 1), "a ring, not a disc");
+    assert_eq!(green_pixels(&annotated, 0..160, 0..60), 0, "nothing is drawn on the empty top half");
+
+    assert!(
+        std::fs::read(dir.join("a.png")).unwrap() == lib_annotated_png(&path),
+        "the CLI draws the library's overlay"
+    );
+}
+
+#[test]
+fn annotate_verbose_line_reports_the_measurement() {
+    let dir = scratch("annotate-verbose");
+    let path = dir.join("sharp.fits");
+    write_star_field(&path, 1.2, &[]);
+    let (_, _, s) = lib_measure(&path, &FrameOptions::default());
+    let o = run(&dir, &["sharp.fits", "out.jpg", "-a", "-v"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let err = stderr(&o);
+    let want = format!("({} stars, FWHM {:.2})", s.stars_detected, s.median_fwhm);
+    assert!(err.contains("| analysis ") && err.contains(&want), "want {want} in: {err}");
+    assert!(err.contains("read ") && err.contains("| process "), "the line keeps its shape: {err}");
+}
+
+#[test]
+fn annotate_old_flags_still_run() {
+    let dir = scratch("annotate-old-flags");
+    write_star_field(&dir.join("sharp.fits"), 1.2, &[]);
+
+    let o = run(&dir, &["sharp.fits", "a.jpg", "-a", "--measure-cap", "0"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stderr(&o).lines().collect::<Vec<_>>(),
+        ["warning: --measure-cap has no effect since 1.8.0: the star budget is --max-stars"],
+        "{}",
+        stderr(&o)
+    );
+    assert!(dir.join("a.jpg").is_file());
+    // The hidden flag stays out of --help.
+    let help = stdout(&run(&dir, &["convert", "--help"]));
+    assert!(help.contains("--max-stars") && !help.contains("--measure-cap"), "{help}");
+
+    // The budget is checked with or without -a: 10 to 2000.
+    for args in [["-a", "--max-stars", "5"], ["-a", "--max-stars", "2001"], ["-n", "--max-stars", "5"]] {
+        let mut full = vec!["sharp.fits", "b.jpg"];
+        full.extend_from_slice(&args);
+        let o = run(&dir, &full);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains("must be between 10 and 2000"), "{args:?}: {}", stderr(&o));
+    }
+    assert!(!dir.join("b.jpg").exists());
+}
+
+#[test]
+fn annotate_reports_a_broken_file_and_keeps_the_rest() {
+    let dir = scratch("annotate-broken");
+    write_star_field(&dir.join("good.fits"), 1.5, &[]);
+    std::fs::write(dir.join("broken.fits"), b"SIMPLE  =                    T").unwrap();
+    let o = run(&dir, &["good.fits", "broken.fits", "-a", "-o", "out", "-j", "1"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(dir.join("out/good.jpg").is_file(), "the good file is written");
+    assert!(!dir.join("out/broken.jpg").exists());
+    let err = stderr(&o);
+    assert_error_line_names_once(&err, "broken.fits");
+    assert!(err.contains("1 converted, 1 failed"), "{err}");
 }
 
 #[test]

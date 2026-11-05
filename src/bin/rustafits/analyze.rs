@@ -15,7 +15,7 @@ use clap::{Args, ValueEnum};
 use crate::batch::{self, file_name};
 use crate::convert::DEFAULT_MAX_JOBS_ANALYSIS;
 use crate::measure::{
-    budget_parser, measure_file, threshold_parser, warn_ignored, Measured, MEASURE_CAP_WHY,
+    budget_parser, measure_file, report_file_error, threshold_parser, warn_ignored, Measured, MEASURE_CAP_WHY,
 };
 use crate::report::{json_num, json_str, print_csv, print_table};
 
@@ -179,7 +179,7 @@ pub fn run(args: AnalyzeArgs) -> Result<bool> {
         |input| measure_file(&input.path, &opts, &pool),
         |input, result| {
             if let Err(e) = result {
-                eprintln!("error: {}: {e:#}", input.path.display());
+                report_file_error(&input.path, e);
             }
         },
     );

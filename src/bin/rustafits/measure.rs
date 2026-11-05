@@ -27,8 +27,6 @@ pub(crate) struct Measured {
     pub frame_h: usize,
     pub channels: usize,
     /// The file is bottom-up; star positions are in file row order, so a render flips them.
-    // Read by `convert --annotate` (a later change); `analyze` prints the table, not a picture.
-    #[allow(dead_code)]
     pub flip_vertical: bool,
     pub pm: PlaneMeasurement,
     pub summary: FrameSummary,
@@ -74,4 +72,34 @@ pub(crate) fn threshold_parser(s: &str) -> Result<f64, String> {
 /// asked for something that did not happen.
 pub(crate) fn warn_ignored(flag: &str, why: &str) {
     eprintln!("warning: {flag} has no effect since 1.8.0: {why}");
+}
+
+/// The line for a file that failed: `error: {e:#}`, with `{path}: ` in front only when the message does not already
+/// name the file (`read_raw_frame` puts the path in its errors, and the file would otherwise appear twice).
+fn file_error_line(path: &Path, e: &anyhow::Error) -> String {
+    let message = format!("{e:#}");
+    if message.contains(&path.display().to_string()) {
+        format!("error: {message}")
+    } else {
+        format!("error: {}: {message}", path.display())
+    }
+}
+
+/// Print [`file_error_line`] to stderr: every command that goes file by file reports a failure this way.
+pub(crate) fn report_file_error(path: &Path, e: &anyhow::Error) {
+    eprintln!("{}", file_error_line(path, e));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_path_appears_once_in_an_error_line() {
+        let path = Path::new("dir/broken.fits");
+        let own = anyhow::anyhow!("short read").context("dir/broken.fits: Failed to read header");
+        assert_eq!(file_error_line(path, &own), "error: dir/broken.fits: Failed to read header: short read");
+        let bare = anyhow::anyhow!("short read").context("Failed to read image");
+        assert_eq!(file_error_line(path, &bare), "error: dir/broken.fits: Failed to read image: short read");
+    }
 }
