@@ -27,6 +27,8 @@
 //! convolution slow enough to dominate everything:
 //!     cargo test -p rustafits --test fast_detect_real --release -- --nocapture
 
+// This file exercises the legacy ImageAnalyzer::analyze*, deprecated since 1.8.0 and removed in 2.0.
+#![allow(deprecated)]
 use std::path::Path;
 
 use astroimage::{ImageAnalyzer, StarMetrics};

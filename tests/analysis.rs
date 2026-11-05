@@ -1,3 +1,5 @@
+// This file exercises the legacy ImageAnalyzer::analyze*, deprecated since 1.8.0 and removed in 2.0.
+#![allow(deprecated)]
 use astroimage::ImageAnalyzer;
 use std::path::Path;
 
