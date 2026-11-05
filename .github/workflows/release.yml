@@ -8,34 +8,62 @@ on:
 permissions:
   contents: write
 
+env:
+  GH_REPO: ${{ github.repository }}
+
 jobs:
   create-release:
     runs-on: ubuntu-latest
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      version: ${{ steps.get_version.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Get version from tag
-        id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      - uses: actions/checkout@v5
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      # The tag must name the version in Cargo.toml, or crates.io would get another version than the release.
+      - name: Check the tag against Cargo.toml
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$version" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The release notes are the version's CHANGELOG.md section: from its `## [X.Y.Z]` heading to the next `## [`.
+      - name: Release notes from CHANGELOG.md
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          awk -v head="## [$VERSION]" '
+            index($0, head) == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $VERSION"
+            exit 1
+          fi
+
+      # A re-run of the workflow edits the release it made the first time.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "rustafits $VERSION" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "rustafits $VERSION" --notes-file notes.md
+          fi
 
   build-binaries:
     needs: create-release
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -53,31 +81,18 @@ jobs:
         run: |
           sha256sum rustafits-linux-x86_64.tar.gz > rustafits-linux-x86_64.tar.gz.sha256
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+      - name: Upload the binary and its checksum
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./rustafits-linux-x86_64.tar.gz
-          asset_name: rustafits-linux-x86_64.tar.gz
-          asset_content_type: application/gzip
-
-      - name: Upload Checksum
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./rustafits-linux-x86_64.tar.gz.sha256
-          asset_name: rustafits-linux-x86_64.tar.gz.sha256
-          asset_content_type: text/plain
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            rustafits-linux-x86_64.tar.gz rustafits-linux-x86_64.tar.gz.sha256
 
   build-deb:
     needs: create-release
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -105,27 +120,33 @@ jobs:
           EOF
 
           dpkg-deb --build debian-pkg
-          mv debian-pkg.deb rustafits_${{ needs.create-release.outputs.version }}_amd64.deb
+          mv debian-pkg.deb rustafits-${{ needs.create-release.outputs.version }}-amd64.deb
 
       - name: Upload .deb to release
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./rustafits_${{ needs.create-release.outputs.version }}_amd64.deb
-          asset_name: rustafits-${{ needs.create-release.outputs.version }}-amd64.deb
-          asset_content_type: application/vnd.debian.binary-package
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            rustafits-${{ needs.create-release.outputs.version }}-amd64.deb
 
   publish-crates-io:
     needs: create-release
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # A failed publish fails the job (it used to pass silently). A re-run skips a version crates.io already has.
       - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CARGO_TOKEN }}
-        continue-on-error: true
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          if curl -sf -A "rustafits-release (github.com/${{ github.repository }})" \
+              "https://crates.io/api/v1/crates/rustafits/$VERSION" > /dev/null; then
+            echo "::notice::rustafits $VERSION is already on crates.io; nothing to publish"
+          else
+            cargo publish
+          fi
