@@ -19,6 +19,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use crate::formats::fits::routed_image_header;
 use crate::formats::stored_keys::{self, FitsHeader};
 use crate::formats::xisf::read_xisf_stored_keys;
 use crate::star_measure::Domain;
@@ -92,7 +93,11 @@ fn header_facts(path: &Path, xisf: bool) -> Result<HeaderFacts> {
             egain: stored_keys::num(&map, "EGAIN"),
         })
     } else {
-        let h = FitsHeader::from_path(path)?;
+        // A gzipped, tile-compressed or extension-HDU image: the header of the image the pixel reader decodes.
+        let h = match routed_image_header(path)? {
+            Some(blocks) => FitsHeader::from_bytes(&blocks)?,
+            None => FitsHeader::from_path(path)?,
+        };
         Ok(HeaderFacts {
             bitpix: h.get_i32("BITPIX"),
             bzero: h.get_f64("BZERO").unwrap_or(0.0),
@@ -797,6 +802,68 @@ mod tests {
                 RawPlanes::Cfa { pattern, .. } => assert_eq!(pattern, expected, "{label}"),
                 other => panic!("{label}: expected Cfa, got {other:?}"),
             }
+        }
+    }
+
+    /// A gzipped or tile-compressed frame reads as its plain form does: the header facts come from the image's own
+    /// header, not from the gzip bytes or the empty primary in front of the compressed image.
+    #[test]
+    fn gzipped_and_tile_compressed_fits_read_as_the_plain_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let stored: Vec<i16> = (0..64).map(|i| (i * 900 - 20000) as i16).collect();
+        let extra = [
+            ("BZERO", "32768".to_string()),
+            ("DATAMAX", "60000".to_string()),
+            ("EGAIN", "0.8".to_string()),
+        ];
+        let plain = dir.path().join("a.fits");
+        write_fits(&plain, 16, &[8, 8], &extra, &be16(&stored));
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&std::fs::read(&plain).unwrap()).unwrap();
+        let gz_path = dir.path().join("a.fits.gz");
+        std::fs::write(&gz_path, gz.finish().unwrap()).unwrap();
+
+        let mut fz = format!(
+            "{}{}{}{}{:<80}",
+            format_args!("{:<80}", format!("SIMPLE  = {:>20}", "T")),
+            card("BITPIX", "8"),
+            card("NAXIS", "0"),
+            card("EXTEND", "T"),
+            "END"
+        )
+        .into_bytes();
+        fz.resize(2880, b' ');
+        let cards: Vec<_> = extra
+            .iter()
+            .map(|(k, v)| {
+                fitsio_pure::header::parse_card(card(k, v).as_bytes().try_into().unwrap()).unwrap()
+            })
+            .collect();
+        let tile = fitsio_pure::compress::TileCompression::rice();
+        fz.extend(
+            fitsio_pure::compress::compress_image_hdu(&[8, 8], &stored, &tile, &cards).unwrap(),
+        );
+        let fz_path = dir.path().join("a.fz");
+        std::fs::write(&fz_path, fz).unwrap();
+
+        let want = read_raw_frame(&plain).unwrap();
+        assert_eq!(
+            raw(&want),
+            (60000.0, 65535.0, Some(0.8)),
+            "the premise: the plain file's facts"
+        );
+        for p in [gz_path, fz_path] {
+            let got = read_raw_frame(&p).unwrap_or_else(|e| panic!("{}: {e:#}", p.display()));
+            assert_eq!(mono(&got), mono(&want), "{}", p.display());
+            assert_eq!(raw(&got), raw(&want), "{}", p.display());
+            assert_eq!(
+                (got.w, got.h, got.flip_vertical),
+                (want.w, want.h, want.flip_vertical),
+                "{}",
+                p.display()
+            );
         }
     }
 
