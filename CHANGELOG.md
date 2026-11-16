@@ -11,15 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `star_measure::PlaneMeasurement::reported_aperture_correction`, `reported_aperture_stars` and
   `reported_aperture_se`: the aperture correction a Bayer mosaic measures on its green sites, reported apart and never
-  applied. The growth flux at `5F` sums the green sites within the disc and scales by the disc's pixel count over its
-  green count (a disc whose green share is outside 0.45 to 0.55 refuses the star); every candidate screen is the mono
-  path's. `None` / 0 on every other path.
+  applied. The growth flux at `5F` sums the green sites within the disc and divides by the green lattice density 0.5
+  (a disc whose green share is outside 0.45 to 0.55 refuses the star); every candidate screen is the mono path's.
+  `None` / 0 on every other path.
 - `star_measure::CFA_APERTURE_VERSION` (1): the version of that number, bumped when only it changes.
   `MEASURE_VERSION` stays 8.
 
 No existing output moves: `measure_green_sites` still returns `aperture_correction` `None`, no star's `signal`
 changes, and `aperture_stars`, `aperture_se`, `aperture_ratios` and the population's `aperture_se` are as before.
-`MeasureOptions` and `FitStarsOptions` gain no field.
+`MeasureOptions` and `FitStarsOptions` gain no field. `PlaneMeasurement` gains three public fields, so it can no
+longer be built by a struct literal outside the crate (no known caller does).
 
 ## [1.8.0] — 2026-11-05
 

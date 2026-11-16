@@ -586,7 +586,8 @@ pub struct PlaneMeasurement {
     /// `None` on that path. `None` on every other path, and where fewer than 5 stars qualified. See
     /// [`CFA_APERTURE_VERSION`].
     pub reported_aperture_correction: Option<f64>,
-    /// The stars `reported_aperture_correction` is the median over (at most 64; 0 on every other path).
+    /// The stars `reported_aperture_correction` is the median over (at most 64); the qualifier count (1 to 4) when
+    /// fewer than 5 qualified and the correction is `None`; 0 on every other path.
     pub reported_aperture_stars: usize,
     /// The standard error of `reported_aperture_correction`, from its ratios' MAD as [`Self::aperture_se`] is.
     pub reported_aperture_se: Option<f64>,

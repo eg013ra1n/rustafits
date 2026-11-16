@@ -29,7 +29,7 @@
 //!
 //! The star flux (F-5, Task 10, ruling R-OSP-7): a fit's `signal` is [`model_flux_in_fwtm`] (the fitted model's
 //! analytic flux inside its own FWTM ellipse) times the plane's [`aperture_correction`] `c`, the median ratio of the
-//! [`growth_curve`] flux at `5F` to the model flux over the 64 brightest isolated unsaturated fits — so the flux no
+//! [`growth_curve_in`] flux at `5F` to the model flux over the 64 brightest isolated unsaturated fits — so the flux no
 //! longer depends on how much of a profile its FWTM ellipse holds. The growth curve's sky is the star's stored B_i,
 //! and a candidate whose fitted amplitude tops the plane's range is screened out (F-3's amplitude clause, on every
 //! path; owner ruling R6, 2026-10-11). Round 4: off the measure path the screen's full scale is the caller's
@@ -686,7 +686,7 @@ impl NearIndex {
 }
 
 /// One growth / model ratio of the aperture correction's sample: the candidate's [`model_flux_in_fwtm`] (the sort key)
-/// and its [`growth_curve`] flux over it. Reported (the probe's `--dump-ratios`), never read.
+/// and its [`growth_curve_in`] flux over it. Reported (the probe's `--dump-ratios`), never read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ApertureRatio {
     pub model: f64,
@@ -987,14 +987,14 @@ pub(crate) fn growth_curve(
     growth_curve_in(data, mask, footprint, w, h, x, y, fwhm, b, false, inside)
 }
 
-/// [`growth_curve`] with a choice of form. `masked` (OSC zero point, spec §5.1): the plane is a Bayer mosaic read on one colour's sites. A pixel within `5F`
+/// The growth flux with a choice of form. `masked` (OSC zero point, spec §5.1): the plane is a Bayer mosaic read on one colour's sites. A pixel within `5F`
 /// that `mask` marks absent is counted in the disc (`N_all`) and skipped, a present pixel that is not finite still
 /// refuses the star, and the sum is divided by the lattice's density [`MASKED_GROWTH_DENSITY`] (the green quincunx
 /// holds exactly half the pixels); a disc whose present share `N_present / N_all` is outside [`MASKED_GROWTH_SHARE`]
 /// refuses the star. The scale is the lattice's, not the disc's own count ratio: a star's light sits near its centre,
 /// while `N_all / N_present` moves with the disc's rim (±1.3 % per phase at FWHM 2 px, a jitter the flux does not
 /// carry; controller ruling on Task 1, 2026-11-16). Footprint, `12F` disc and `B_i` rules are unchanged. `false` is
-/// the path above, bit for bit ([`growth_curve`]).
+/// today's growth, bit for bit (the `#[cfg(test)]` `growth_curve` wraps it).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn growth_curve_in(
     data: &[f32],
@@ -1112,7 +1112,7 @@ pub(crate) fn unverdicted_clip_range(
 
 /// The plane's aperture correction (F-5, ruling R-OSP-7; rim and screen by owner ruling R6, 2026-10-11; the rim read
 /// once per star from Task 10b, ruling B2): `c = median(growth / model)` over the [`CORRECTION_STARS`] brightest
-/// qualifying fits by [`model_flux_in_fwtm`] (ties by seed index), the growth the [`growth_curve`] flux at `5F` against
+/// qualifying fits by [`model_flux_in_fwtm`] (ties by seed index), the growth the [`growth_curve_in`] flux at `5F` against
 /// the fit's stored B_i ([`StarFit::sky_ring`], [`ring_skies`]), `F` = `ring_fwhm`, the ring width the B_i were read at
 /// (the plane's frame FWHM over the fits neither saturated nor extended, or the caller's
 /// [`super::FitStarsOptions::ring_fwhm`]). A qualifying fit is accepted (`fits` = the kept fits after the duplicate
@@ -1120,7 +1120,7 @@ pub(crate) fn unverdicted_clip_range(
 /// back, below), has a finite positive model flux, passes the clip screen (its fitted amplitude not above the range, F-3's amplitude
 /// clause: `saturation`'s [`SaturationPlane::range`] on the measure path, else [`unverdicted_clip_range`] under the
 /// caller's `full_scale`), has no other seed of `seeds` within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`]` · field_fwhm`
-/// of its fitted centre, and a [`growth_curve`] (its B_i present, its `12F` disc inside the plane and the caller's
+/// of its fitted centre, and a [`growth_curve_in`] (its B_i present, its `12F` disc inside the plane and the caller's
 /// `footprint`, no absent pixel within `5F`). Returns `(c, n, se, screens)`: `c` is `None` with no fit at all (`debug!`)
 /// or with fewer than [`CORRECTION_MIN_RATIOS`] ratios (one `warn!`: the model flux is used uncorrected, `c = 1`); both
 /// per-plane events count the clip-screened candidates (`skipped`) beside the two Plan B B4 screens (`point_source`,

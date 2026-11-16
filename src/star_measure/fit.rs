@@ -371,8 +371,8 @@ impl StarFit {
 }
 
 /// The aperture correction a mosaic's green sites measured, reported apart from the fits (OSC zero point, spec §5.1):
-/// the median `c`, the stars it is over (at most 64) and its standard error; `None` / 0 when it was not asked for or
-/// fewer than 5 stars qualified.
+/// the median `c`, the stars it is over (at most 64) and its standard error; `None` / 0 when it was not asked for;
+/// `c` `None` with the qualifier count (1 to 4) when fewer than 5 stars qualified.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct ReportedAperture {
     pub(crate) correction: Option<f64>,
@@ -2531,7 +2531,7 @@ fn fit_at_width(
 /// [`super::photometry::aperture_correction`] at the same ring width) or the caller's (`correction.flux`). Every fit's
 /// SNR is read between the two (Plan B B4: the `c` sample's floor, [`super::photometry::CORRECTION_MIN_SNR`], reads it;
 /// the SNR reads the ring sky and the pixels, never `c` or `signal`). Returns
-/// `(c, qualifiers, se, ring_sky_missing, ring_fwhm, screens)`; no `signal` is touched. One body for the fit call and for a later re-read at
+/// `(c, qualifiers, se, ring_sky_missing, ring_fwhm, screens, reported)`; no `signal` is touched. One body for the fit call and for a later re-read at
 /// another ring width ([`correct_at_ring`]).
 #[allow(clippy::too_many_arguments)]
 fn ring_and_correction(

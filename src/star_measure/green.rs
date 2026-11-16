@@ -5,7 +5,8 @@
 //! seed; the sum's noise is white); every seed is mapped to native pixels, and those the matched filter flagged
 //! extended (knots, R-PC-8) are handed to the fit flagged: fitted, and kept out of the frame statistic as on the mono
 //! path; the fit runs on the native mosaic with the green-site mask; the plane's sky and noise are read from one
-//! green phase. `c` = 1 here (no qualifier, the B4 carry): Analysis star fluxes on an OSC frame are uncorrected, a recorded limit.
+//! green phase. `c` is not applied here (Analysis star fluxes on an OSC frame stay uncorrected, PC-4); since the OSC zero point it is
+//! measured on the green sites and reported apart (`PlaneMeasurement::reported_aperture_correction`).
 //!
 //! Positions are in FILE row order (the pattern addresses that order, see `raw::RawPlanes`): the caller flips them
 //! for display.
@@ -696,7 +697,7 @@ mod tests {
                 ratios.len()
             );
             assert!(
-                (med - 1.0).abs() < 0.02,
+                (med - 1.0).abs() < 0.01,
                 "FWHM {fwhm} gains {gains:?} pedestal {ped2}: median signal*c / true flux = {med:.4}"
             );
         }
