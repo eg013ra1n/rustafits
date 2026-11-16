@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use crate::star_measure::frame::finite_median;
 use crate::star_measure::green::{measure_green_sites, measure_green_sites_and_seeds};
-use crate::star_measure::list::{measure_list, ListPlane};
+use crate::star_measure::list::{measure_list, ListPlane, Prebuilt};
 use crate::star_measure::raw::{RawFrame, RawPlanes};
 use crate::star_measure::trail::trail_r_squared;
 use crate::star_measure::{
@@ -417,9 +417,6 @@ where
             Some(ListMeasurement::refused_layout(ListRefusal::ColourFrame)),
         );
     }
-    let Some(request) = list(&pm) else {
-        return (pm, None);
-    };
     let input = ListPlane {
         plane,
         w: frame.w,
@@ -428,8 +425,35 @@ where
         mask: mask.as_deref(),
     };
     let detected: &[Seed] = detected_native.as_deref().unwrap_or(&pm.detected);
-    let measured = measure_list(&input, &pm, detected, &request, place, pool);
+    // What the passes need of the plane and the detected seeds does not read the request, so it is built on the pool
+    // while `list` (a sequential callback on this thread) builds the list. A `list` that returns no request leaves it
+    // unused.
+    let mut pre = None;
+    let mut request = None;
+    {
+        let (pm_ref, input_ref) = (&pm, &input);
+        let pre_slot = &mut pre;
+        in_place_on(pool, |s| {
+            s.spawn(move |_| *pre_slot = Prebuilt::new(input_ref, pm_ref, detected));
+            request = list(&pm);
+        });
+    }
+    let Some(request) = request else {
+        return (pm, None);
+    };
+    let measured = measure_list(&input, &pm, detected, &request, place, pool, pre);
     (pm, measured)
+}
+
+/// `op` on this thread, with a scope whose spawned tasks run on `pool` (the global pool when there is none).
+fn in_place_on<'scope, R>(
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    op: impl FnOnce(&rayon::Scope<'scope>) -> R,
+) -> R {
+    match pool {
+        Some(p) => p.in_place_scope(op),
+        None => rayon::in_place_scope(op),
+    }
 }
 
 /// The frame verdict of a measurement (PC-13): trailed / defocused as the module judged, else no stars when no fit stands
@@ -1476,7 +1500,7 @@ mod tests {
                 mask: None,
             };
             let req = ListRequest::new(positions.clone(), 1.0);
-            measure_list(&input, &pm, detected, &req, |_| None, None).expect("measured")
+            measure_list(&input, &pm, detected, &req, |_| None, None, None).expect("measured")
         };
         // The reference: the companion-free plane, the companion frame's detections (the same discs masked at the same F).
         let reference = measure_on(&frame_of(&[]), &pm.detected);
@@ -1736,7 +1760,7 @@ mod tests {
         };
         let req = ListRequest::new(stars.iter().map(|s| (s.0, s.1)).collect(), 1.0);
         let run = |pm: &PlaneMeasurement| {
-            measure_list(&input, pm, &pm.detected, &req, |_| None, None).expect("measured")
+            measure_list(&input, pm, &pm.detected, &req, |_| None, None, None).expect("measured")
         };
         let plain = run(&pm);
         assert!(plain.clip_level.is_none());
@@ -1807,7 +1831,7 @@ mod tests {
             "premise: F_field {}",
             pm.field_width.fwhm_px
         );
-        let list = measure_list(&input, &pm, &moved, &req, |_| None, None).expect("measured");
+        let list = measure_list(&input, &pm, &moved, &req, |_| None, None, None).expect("measured");
         let blends = list
             .refused
             .by_reason
@@ -2000,7 +2024,7 @@ mod tests {
             domain: RAW,
             mask: None,
         };
-        let ctx = PassContext::new(&input, &pm, &pm.detected, 1.0, None).expect("a context");
+        let ctx = PassContext::new(&input, &pm, &pm.detected, 1.0, None, None).expect("a context");
         let positions: Vec<(f64, f64)> = stars.iter().map(|s| (s.0, s.1)).collect();
         let pass = ctx.fit(&positions);
         assert!(pass.fits.iter().filter(|f| f.accepted).count() >= 20);

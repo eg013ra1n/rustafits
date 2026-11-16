@@ -505,6 +505,7 @@ impl FitStarsOptions<'_> {
             gain: self.gain_e_per_working_adu,
             noise: self.aperture_noise,
             neighbours: None,
+            split: None,
             population: None,
             siblings: None,
             point_siblings: None,
@@ -2204,12 +2205,28 @@ fn saturation_plane(
         Domain::RawAdu { full_scale, .. } => (1.0, *full_scale),
     };
     // The maximum of the finite, unmasked values and how many pixels equal it (an exact clip has two or more): both
-    // order-free, so read in one parallel reduce.
+    // order-free, so read in one parallel reduce over blocks of rows' worth of pixels, each block one tight loop.
+    const BLOCK: usize = 1 << 16;
+    let scan = |(b, block): (usize, &[f32])| -> (f64, usize) {
+        let base = b * BLOCK;
+        let (mut max, mut count) = (f64::NEG_INFINITY, 0usize);
+        for (k, &v) in block.iter().enumerate() {
+            if v.is_finite() && mask.map_or(true, |m| m[base + k]) {
+                let v = v as f64;
+                if v > max {
+                    max = v;
+                    count = 1;
+                } else if v == max {
+                    count += 1;
+                }
+            }
+        }
+        (max, count)
+    };
     let (plane_max, max_count) = working
-        .par_iter()
+        .par_chunks(BLOCK)
         .enumerate()
-        .filter(|&(i, v)| v.is_finite() && mask.map_or(true, |m| m[i]))
-        .map(|(_, &v)| (v as f64, 1usize))
+        .map(scan)
         .reduce(
             || (f64::NEG_INFINITY, 0),
             |a, b| match a.0.partial_cmp(&b.0) {
@@ -2335,6 +2352,64 @@ mod tests {
     use super::*;
     use crate::test_support::fixture_field;
     use crate::test_support::{moffat_field, MoffatStar};
+
+    /// The saturation plane's maximum and its count of pixels at the maximum are the plain loop's over the finite,
+    /// unmasked pixels, whichever blocks the parallel scan cuts the plane into (the maximum sits in the last block, in
+    /// the first, in several, in none; a masked or non-finite pixel is above it).
+    #[test]
+    fn the_saturation_scan_is_the_plain_loop_over_any_blocks() {
+        let noise = NoiseModel { sigma: 5.0, source: NoiseSource::None, m_star: 0.0, n_star: 0.0 };
+        let sky = SkyLevel {
+            median: 1000.0,
+            mad: 1.0,
+            median_mean_dev: 1.0,
+            location: 1000.0,
+            scale: 1.0,
+            noise_scale_low: 1.0,
+            noise_scale_high: 1.0,
+        };
+        let domain = Domain::RawAdu { clip: 65535.0, full_scale: 65535.0, gain_e_per_adu: None };
+        let n = (1usize << 16) * 3 + 12345;
+        let make = |top_at: &[usize], above: &[(usize, f32)]| {
+            let mut plane: Vec<f32> = (0..n).map(|i| 900.0 + (i % 977) as f32).collect();
+            for &i in top_at {
+                plane[i] = 60000.0;
+            }
+            for &(i, v) in above {
+                plane[i] = v;
+            }
+            plane
+        };
+        let mut mask = vec![true; n];
+        mask[7] = false;
+        let cases: Vec<Vec<f32>> = vec![
+            make(&[n - 1], &[]),
+            make(&[0], &[]),
+            make(&[0, 65535, 65536, 131071, 131072, n - 1], &[]),
+            make(&[5, 100_000], &[(7, 65000.0), (9, f32::NAN), (11, f32::INFINITY)]),
+            make(&[], &[]),
+        ];
+        for (c, plane) in cases.iter().enumerate() {
+            for with_mask in [false, true] {
+                let m = with_mask.then_some(mask.as_slice());
+                let (mut max, mut count) = (f64::NEG_INFINITY, 0usize);
+                for (i, &v) in plane.iter().enumerate() {
+                    if v.is_finite() && m.map_or(true, |m| m[i]) {
+                        let v = v as f64;
+                        if v > max {
+                            max = v;
+                            count = 1;
+                        } else if v == max {
+                            count += 1;
+                        }
+                    }
+                }
+                let got = saturation_plane(plane, m, &noise, &sky, &domain, false);
+                assert_eq!(got.plane_max.to_bits(), max.to_bits(), "case {c} mask {with_mask}");
+                assert_eq!(got.max_count, count, "case {c} mask {with_mask}");
+            }
+        }
+    }
 
     /// Plan A Task 11c, ruling F28 (a pin, outside RED): the first-pass artifact's body is postcard, which is not
     /// self-describing, so this fails on ANY layout change of a serialised type (a `PlanePrep` field, `RefusalReason`'s

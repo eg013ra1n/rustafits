@@ -12,16 +12,16 @@
 //! still do). The sums are [`photometry::aperture_sums`], on the same working plane.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use rayon::prelude::*;
 
+use crate::geometry::kdtree::KdTree2;
 use crate::star_measure::analysis_mode::{
     ListAperture, ListFit, ListMeasurement, ListPlacement, ListRequest, ListTimings,
 };
-use crate::star_measure::fit::{self, Correction, Neighbours};
+use crate::star_measure::fit::{self, Correction, NeighbourSplit, Neighbours};
 use crate::star_measure::photometry::SaturationPlane;
 use crate::star_measure::{
     domain, install_in_span, mask_mismatch, photometry, prepare_passes, saturation_plane,
@@ -40,45 +40,35 @@ pub(crate) struct ListPlane<'a> {
     pub(crate) mask: Option<&'a [bool]>,
 }
 
-/// The seeds of `detected` less each list star's own detection: for every seed of `listed`, the NEAREST detected seed
-/// within `radius` px (ties to the lower index). A list star's own detection sits at distance about 0 and would be read
-/// as a neighbour of the star itself, so with `blend_refusal` on every list star would be refused as a `Blend`; `radius`
-/// is larger than the kept tolerance because a mosaic's detection is a `2s + 0.5` centroid of the green-sum plane, up to
+/// Which of `detected` is a list star's own detection: for every seed of `listed`, the NEAREST detected seed within
+/// `radius` px (ties to the lower index). A list star's own detection sits at distance about 0 and would be read as a
+/// neighbour of the star itself, so with `blend_refusal` on every list star would be refused as a `Blend`; `radius` is
+/// larger than the kept tolerance because a mosaic's detection is a `2s + 0.5` centroid of the green-sum plane, up to
 /// about a pixel off the star's true position, which the list position (a catalogue's) is not. Only the nearest is
-/// taken: a second detection near a list star is a neighbour. A cell grid of side `radius` over `detected`, so the cost
-/// is linear.
-fn without_own_detections(detected: &[Seed], listed: &[Seed], radius: f64) -> Vec<Seed> {
-    let cell = |x: f64, y: f64| ((x / radius).floor() as i64, (y / radius).floor() as i64);
-    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-    for (j, d) in detected.iter().enumerate() {
-        grid.entry(cell(d.x, d.y)).or_default().push(j);
-    }
+/// taken: a second detection near a list star is a neighbour. The candidates come from `tree` (over `detected`, asked a
+/// hair wider than `radius`), and the distance and the tie are judged on the candidates as ever: `hypot`, `<= radius`,
+/// the lower index, so the answer does not depend on the tree's own rounding of the boundary.
+fn own_detections(
+    detected: &[Seed],
+    tree: &KdTree2,
+    listed: &[Seed],
+    radius: f64,
+) -> Vec<bool> {
     let mut own = vec![false; detected.len()];
+    let wide = radius * (1.0 + 1e-9) + 1e-9;
     for l in listed {
-        let (cx, cy) = cell(l.x, l.y);
         let mut nearest: Option<(f64, usize)> = None;
-        for gx in cx - 1..=cx + 1 {
-            for gy in cy - 1..=cy + 1 {
-                for &j in grid.get(&(gx, gy)).into_iter().flatten() {
-                    let d = (detected[j].x - l.x).hypot(detected[j].y - l.y);
-                    if d <= radius
-                        && nearest.map_or(true, |(best, bj)| d < best || (d == best && j < bj))
-                    {
-                        nearest = Some((d, j));
-                    }
-                }
+        for (j, _) in tree.within(l.x, l.y, wide) {
+            let d = (detected[j].x - l.x).hypot(detected[j].y - l.y);
+            if d <= radius && nearest.map_or(true, |(best, bj)| d < best || (d == best && j < bj)) {
+                nearest = Some((d, j));
             }
         }
         if let Some((_, j)) = nearest {
             own[j] = true;
         }
     }
-    detected
-        .iter()
-        .zip(&own)
-        .filter(|(_, &o)| !o)
-        .map(|(d, _)| *d)
-        .collect()
+    own
 }
 
 /// A list fit that was not made, or was refused: NaN numbers, both flags false.
@@ -108,6 +98,60 @@ pub(crate) struct Pass {
     pub(crate) aperture_stars: usize,
 }
 
+/// What both passes need of the plane and the detected seeds before the list is known: the working copy, its saturation
+/// plane (a scan of every pixel) and a tree over the detected seeds. None of it reads the request, so
+/// [`measure_raw_frame_and_list`](super::analysis_mode::measure_raw_frame_and_list) builds it on the pool while the
+/// caller's callback builds the list.
+pub(crate) struct Prebuilt<'a> {
+    working: Cow<'a, [f32]>,
+    saturation: SaturationPlane,
+    tree: KdTree2,
+}
+
+impl<'a> Prebuilt<'a> {
+    /// `None` when the plane or its mask does not match its geometry (nothing is scanned; [`PassContext::new`] says
+    /// why when the list is measured).
+    pub(crate) fn new(
+        input: &'a ListPlane<'a>,
+        pm: &PlaneMeasurement,
+        detected: &[Seed],
+    ) -> Option<Self> {
+        let (w, h) = (input.w, input.h);
+        if w == 0
+            || h == 0
+            || input.plane.len() != w * h
+            || input.mask.is_some_and(|m| m.len() != w * h)
+        {
+            return None;
+        }
+        let (working, (saturation, tree)) = {
+            let working = domain::to_working_units(input.plane, &input.domain);
+            let both = rayon::join(
+                || {
+                    saturation_plane(
+                        &working,
+                        input.mask,
+                        &pm.noise,
+                        &pm.sky,
+                        &input.domain,
+                        false,
+                    )
+                },
+                || {
+                    let points: Vec<(f64, f64)> = detected.iter().map(|s| (s.x, s.y)).collect();
+                    KdTree2::build(&points)
+                },
+            );
+            (working, both)
+        };
+        Some(Prebuilt {
+            working,
+            saturation,
+            tree,
+        })
+    }
+}
+
 /// What both passes share: the validated request's tolerance, the working copy of the plane and its saturation plane.
 pub(crate) struct PassContext<'a> {
     input: &'a ListPlane<'a>,
@@ -116,18 +160,21 @@ pub(crate) struct PassContext<'a> {
     tol: f64,
     working: Cow<'a, [f32]>,
     saturation: SaturationPlane,
+    tree: KdTree2,
     pool: Option<&'a Arc<rayon::ThreadPool>>,
 }
 
 impl<'a> PassContext<'a> {
     /// `None` (always with a `warn!` or `debug!` that says why) when nothing can be measured: an empty plane, no usable
-    /// tolerance, a plane or mask that does not match its geometry.
+    /// tolerance, a plane or mask that does not match its geometry. `pre` is [`Prebuilt::new`]'s (built here, on this
+    /// thread's pool, when the caller did not).
     pub(crate) fn new(
         input: &'a ListPlane<'a>,
         pm: &'a PlaneMeasurement,
         detected: &'a [Seed],
         tol: f64,
         pool: Option<&'a Arc<rayon::ThreadPool>>,
+        pre: Option<Prebuilt<'a>>,
     ) -> Option<Self> {
         let (w, h) = (input.w, input.h);
         if w == 0 || h == 0 {
@@ -157,15 +204,14 @@ impl<'a> PassContext<'a> {
         if mask_mismatch(input.mask, w, h) {
             return None;
         }
-        let working = domain::to_working_units(input.plane, &input.domain);
-        let saturation = saturation_plane(
-            &working,
-            input.mask,
-            &pm.noise,
-            &pm.sky,
-            &input.domain,
-            false,
-        );
+        let Prebuilt {
+            working,
+            saturation,
+            tree,
+        } = match pre {
+            Some(p) => p,
+            None => install_in_span(pool, || Prebuilt::new(input, pm, detected))?,
+        };
         Some(PassContext {
             input,
             pm,
@@ -173,6 +219,7 @@ impl<'a> PassContext<'a> {
             tol,
             working,
             saturation,
+            tree,
             pool,
         })
     }
@@ -254,7 +301,14 @@ impl<'a> PassContext<'a> {
         } else {
             tol
         };
-        let mut neighbour_seeds = without_own_detections(self.detected, &seeds, own_radius);
+        let own = own_detections(self.detected, &self.tree, &seeds, own_radius);
+        let mut neighbour_seeds: Vec<Seed> = self
+            .detected
+            .iter()
+            .zip(&own)
+            .filter(|(_, &o)| !o)
+            .map(|(d, _)| *d)
+            .collect();
         let first = neighbour_seeds.len();
         neighbour_seeds.extend_from_slice(&seeds);
         let of_fit: Vec<usize> = (first..first + seeds.len()).collect();
@@ -315,6 +369,11 @@ impl<'a> PassContext<'a> {
                         seeds: &neighbour_seeds,
                         of_fit: &of_fit,
                     }),
+                    split: Some(NeighbourSplit {
+                        detected: self.detected,
+                        tree: &self.tree,
+                        own: &own,
+                    }),
                     blend_refusal: true,
                     report_aperture: false,
                     ..Default::default()
@@ -358,27 +417,45 @@ impl<'a> PassContext<'a> {
         let (w, h) = (self.input.w, self.input.h);
         let working: &[f32] = &self.working;
         let mask = self.input.mask;
+        // The positions are in the list's key order, scattered over the plane; each sum reads a window of rows. Taken in
+        // row order, the stars a worker meets in a row run share those rows' cache lines; every position is summed on its
+        // own, so the order it is taken in moves no number, and the sums are put back in the request's order.
+        let positions = &placement.aperture_positions;
+        let mut order: Vec<usize> = (0..positions.len()).collect();
+        order.sort_unstable_by(|&a, &b| {
+            positions[a].1.total_cmp(&positions[b].1).then(positions[a].0.total_cmp(&positions[b].0)).then(a.cmp(&b))
+        });
         let body = || {
-            placement
-                .aperture_positions
+            order
                 .par_iter()
-                .map(|&xy| {
-                    photometry::aperture_sums(
-                        working,
-                        mask,
-                        w,
-                        h,
-                        xy,
-                        placement.radius_px,
-                        &placement.extra_radii_px,
-                        placement.annulus_start_px,
-                        placement.annulus_area_px,
-                        placement.peak_radius_px,
+                .map_init(photometry::ApertureScratch::default, |scratch, &i| {
+                    (
+                        i,
+                        photometry::aperture_sums_in(
+                            scratch,
+                            working,
+                            mask,
+                            w,
+                            h,
+                            positions[i],
+                            placement.radius_px,
+                            &placement.extra_radii_px,
+                            placement.annulus_start_px,
+                            placement.annulus_area_px,
+                            placement.peak_radius_px,
+                        ),
                     )
                 })
-                .collect::<Vec<ListAperture>>()
+                .collect::<Vec<(usize, ListAperture)>>()
         };
-        install_in_span(self.pool, body)
+        let mut slots: Vec<Option<ListAperture>> = (0..positions.len()).map(|_| None).collect();
+        for (i, sums) in install_in_span(self.pool, body) {
+            slots[i] = Some(sums);
+        }
+        slots
+            .into_iter()
+            .map(|sums| sums.expect("every position was summed once"))
+            .collect()
     }
 }
 
@@ -394,6 +471,7 @@ pub(crate) fn measure_list<P>(
     req: &ListRequest,
     place: P,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    pre: Option<Prebuilt<'_>>,
 ) -> Option<ListMeasurement>
 where
     P: FnOnce(&[ListFit]) -> Option<ListPlacement>,
@@ -402,7 +480,7 @@ where
         tracing::debug!("list: no position asked; nothing measured");
         return None;
     }
-    let ctx = PassContext::new(input, pm, detected, req.max_centre_offset_px, pool)?;
+    let ctx = PassContext::new(input, pm, detected, req.max_centre_offset_px, pool, pre)?;
     let clip_level = ctx.clip_level();
     let mut timings = ListTimings::default();
 
@@ -459,4 +537,84 @@ where
         "list measured"
     );
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The own-detection rule as the cell grid wrote it (cells of side `radius`, the 3 x 3 around a list star), kept as
+    /// the reference of the tree version.
+    fn own_detections_grid(detected: &[Seed], listed: &[Seed], radius: f64) -> Vec<bool> {
+        let cell = |x: f64, y: f64| ((x / radius).floor() as i64, (y / radius).floor() as i64);
+        let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for (j, d) in detected.iter().enumerate() {
+            grid.entry(cell(d.x, d.y)).or_default().push(j);
+        }
+        let mut own = vec![false; detected.len()];
+        for l in listed {
+            let (cx, cy) = cell(l.x, l.y);
+            let mut nearest: Option<(f64, usize)> = None;
+            for gx in cx - 1..=cx + 1 {
+                for gy in cy - 1..=cy + 1 {
+                    for &j in grid.get(&(gx, gy)).into_iter().flatten() {
+                        let d = (detected[j].x - l.x).hypot(detected[j].y - l.y);
+                        if d <= radius
+                            && nearest.map_or(true, |(best, bj)| d < best || (d == best && j < bj))
+                        {
+                            nearest = Some((d, j));
+                        }
+                    }
+                }
+            }
+            if let Some((_, j)) = nearest {
+                own[j] = true;
+            }
+        }
+        own
+    }
+
+    fn seed(x: f64, y: f64) -> Seed {
+        Seed {
+            x,
+            y,
+            peak: 1.0,
+            flux: 1.0,
+        }
+    }
+
+    /// The tree finds the same own detections as the cell grid: on a half-pixel lattice (many equal distances, points
+    /// exactly on the radius), with repeated points and a list star on top of several detections.
+    #[test]
+    fn the_own_detections_of_the_tree_are_the_grids() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (radius, step) in [(2.0, 0.5), (3.0, 0.5), (1.0, 0.25), (2.5, 1.0)] {
+            let lattice = |r: u64| (r % 80) as f64 * step;
+            let detected: Vec<Seed> = (0..4000)
+                .map(|_| {
+                    let r = next();
+                    seed(lattice(r), lattice(r >> 20))
+                })
+                .collect();
+            let listed: Vec<Seed> = (0..600)
+                .map(|_| {
+                    let r = next();
+                    seed(lattice(r) + 0.25 * ((r >> 40) % 3) as f64, lattice(r >> 20))
+                })
+                .collect();
+            let points: Vec<(f64, f64)> = detected.iter().map(|s| (s.x, s.y)).collect();
+            let tree = KdTree2::build(&points);
+            let got = own_detections(&detected, &tree, &listed, radius);
+            let want = own_detections_grid(&detected, &listed, radius);
+            assert_eq!(got, want, "radius {radius}, step {step}");
+            assert!(want.iter().any(|&o| o) && want.iter().any(|&o| !o));
+        }
+    }
 }

@@ -1820,11 +1820,44 @@ fn refuse_blends(
     outcomes: &mut [Outcome],
     seeds: &[Seed],
     neighbours: Option<Neighbours<'_>>,
+    split: Option<NeighbourSplit<'_>>,
     field_fwhm: f64,
     enabled: bool,
 ) -> Vec<(f64, f64)> {
     let mut refused_at: Vec<(f64, f64)> = Vec::new();
     if !enabled || accepted.is_empty() {
+        return refused_at;
+    }
+    if let Some(split) = split {
+        // The neighbours are the detected seeds less the own detections, and the fit call's seeds: two trees, the first
+        // built once for the plane. A fit is a blend when ANY neighbour but its own seed passes the test, whatever the
+        // order the trees list them in, so the verdict is the one tree over both parts gives.
+        let list_points: Vec<(f64, f64)> = seeds.iter().map(|s| (s.x, s.y)).collect();
+        let list_tree = crate::geometry::kdtree::KdTree2::build(&list_points);
+        let guard = BLEND_SEED_GUARD * field_fwhm;
+        accepted.retain(|(i, f)| {
+            let own = &seeds[*i];
+            let (semi_x, semi_y) = (0.5 * f.fwhm_x, 0.5 * f.fwhm_y);
+            let radius = semi_x.max(semi_y);
+            let test = |s: &Seed| {
+                inside_half_max(s.x - f.x, s.y - f.y, semi_x, semi_y, f.theta)
+                    && (s.x - own.x).hypot(s.y - own.y) >= guard
+            };
+            let blend = split
+                .tree
+                .within(f.x, f.y, radius)
+                .into_iter()
+                .any(|(j, _)| !split.own[j] && test(&split.detected[j]))
+                || list_tree
+                    .within(f.x, f.y, radius)
+                    .into_iter()
+                    .any(|(j, _)| j != *i && test(&seeds[j]));
+            if blend {
+                outcomes[*i] = Outcome::Refused(RefusalReason::Blend);
+                refused_at.push((f.x, f.y));
+            }
+            !blend
+        });
         return refused_at;
     }
     let (plane, of_fit): (&[Seed], Option<&[usize]>) = match neighbours {
@@ -2008,6 +2041,10 @@ pub(super) struct Correction<'a> {
     /// The seeds the ring sky masks and `c`'s isolation reads when the fitted seeds are a subset of the detected ones
     /// (the budget's candidates, Task 12, R12-5); `None` = the fitted seeds themselves.
     pub(super) neighbours: Option<Neighbours<'a>>,
+    /// The same neighbours as [`Neighbours`] hands them, for the blend refusal, in two parts a list pass builds without a
+    /// copy of the detected seeds: when set, the blend test reads this instead of building a tree over `neighbours`
+    /// (the answer is the same; only the structure differs). `None` = the tree is built over `neighbours` or the seeds.
+    pub(super) split: Option<NeighbourSplit<'a>>,
     /// Population (a) among the fit call's seeds (Plan A Task 13b, [`super::population`]): the ring width reads its
     /// fits alone and `c` is the median of the 64 brightest qualifying fits of (a). `None` = every fit counts, as before.
     pub(super) population: Option<super::population::PopulationView<'a>>,
@@ -2040,6 +2077,18 @@ pub(super) struct Correction<'a> {
 pub(super) struct Neighbours<'a> {
     pub(super) seeds: &'a [Seed],
     pub(super) of_fit: &'a [usize],
+}
+
+/// The neighbours of a list pass as the detected seeds (a tree built once for the plane) less the ones that are a list
+/// star's own detection, plus the pass's list seeds (the fit call's own `seeds`, each leaving out itself): the set
+/// [`Neighbours`] spells out as one slice, held in two parts so the tree over the detected seeds is not rebuilt per pass.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NeighbourSplit<'a> {
+    pub(super) detected: &'a [Seed],
+    /// A tree over `detected`' positions (indices are `detected`'s).
+    pub(super) tree: &'a crate::geometry::kdtree::KdTree2,
+    /// `own[j]`: `detected[j]` is a list star's own detection and is not a neighbour.
+    pub(super) own: &'a [bool],
 }
 
 /// The field width a fit call starts from and reports (Task 6a; read by every star's width-start box from Task 6b):
@@ -2406,6 +2455,7 @@ fn fit_at_width(
         &mut outcomes,
         seeds,
         correction.neighbours,
+        correction.split,
         field.fwhm_px,
         correction.blend_refusal,
     );
@@ -2570,6 +2620,7 @@ fn ring_and_correction(
             kept,
             correction.ring_fwhm,
             correction.population.map(|p| p.statistic),
+            correction.split.as_ref().map(|split| (split, seeds)),
             pool,
             correction.timers,
         )
@@ -4877,5 +4928,91 @@ mod tests {
                 vec![30, 31]
             );
         }
+    }
+
+    /// The blend test over a list pass's two-part neighbours (a tree over the detected seeds, built once, less the own
+    /// detections; the pass's list seeds beside it) refuses the fits, and only the fits, that one tree over the whole
+    /// set refuses, with the same refusals in the same order.
+    #[test]
+    fn the_split_blend_test_equals_the_one_tree_over_both_parts() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1_000_000) as f64 / 1_000_000.0
+        };
+        let (mut refused_in_all, mut fits_in_all) = (0usize, 0usize);
+        for spacing in [1.6, 2.0, 2.6] {
+            // The detected seeds: a jittered lattice; the list stars: a share of them, offset a little; the own
+            // detections: the detected seed nearest each list star.
+            let mut detected: Vec<Seed> = Vec::new();
+            for gy in 0..40 {
+                for gx in 0..40 {
+                    let (x, y) = (gx as f64 * spacing + next(), gy as f64 * spacing + next());
+                    detected.push(Seed { x, y, peak: 1.0, flux: 1.0 });
+                }
+            }
+            let list: Vec<Seed> = detected
+                .iter()
+                .step_by(3)
+                .map(|d| Seed { x: d.x + 0.3 * next(), y: d.y + 0.3 * next(), peak: 1.0, flux: 1.0 })
+                .collect();
+            let mut own = vec![false; detected.len()];
+            for l in &list {
+                let nearest = detected
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| (a.1.x - l.x).hypot(a.1.y - l.y).total_cmp(&(b.1.x - l.x).hypot(b.1.y - l.y)))
+                    .map(|(j, _)| j)
+                    .unwrap();
+                own[nearest] = true;
+            }
+            let mut neighbours: Vec<Seed> =
+                detected.iter().zip(&own).filter(|(_, &o)| !o).map(|(d, _)| *d).collect();
+            let first = neighbours.len();
+            neighbours.extend_from_slice(&list);
+            let of_fit: Vec<usize> = (first..first + list.len()).collect();
+            let points: Vec<(f64, f64)> = detected.iter().map(|s| (s.x, s.y)).collect();
+            let tree = crate::geometry::kdtree::KdTree2::build(&points);
+            let accepted: Vec<(usize, StarFit)> = list
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let mut f = StarFit::test_at(l.x + 0.1 * next(), l.y + 0.1 * next(), 1000.0);
+                    f.fwhm_x = 2.0 + 3.0 * next();
+                    f.fwhm_y = f.fwhm_x * (0.7 + 0.3 * next());
+                    f.theta = 3.0 * next();
+                    (i, f)
+                })
+                .collect();
+            let fresh = || vec![Outcome::Refused(RefusalReason::Duplicate); list.len()];
+            let (mut a1, mut o1) = (accepted.clone(), fresh());
+            let r1 = refuse_blends(
+                &mut a1,
+                &mut o1,
+                &list,
+                Some(Neighbours { seeds: &neighbours, of_fit: &of_fit }),
+                None,
+                3.0,
+                true,
+            );
+            let (mut a2, mut o2) = (accepted.clone(), fresh());
+            let r2 = refuse_blends(
+                &mut a2,
+                &mut o2,
+                &list,
+                None,
+                Some(NeighbourSplit { detected: &detected, tree: &tree, own: &own }),
+                3.0,
+                true,
+            );
+            refused_in_all += r1.len();
+            fits_in_all += list.len();
+            assert_eq!(r1, r2, "spacing {spacing}");
+            assert_eq!(a1.iter().map(|a| a.0).collect::<Vec<_>>(), a2.iter().map(|a| a.0).collect::<Vec<_>>());
+            assert_eq!(o1, o2);
+        }
+        assert!(refused_in_all > 20 && refused_in_all < fits_in_all, "{refused_in_all} refused of {fits_in_all}");
     }
 }
