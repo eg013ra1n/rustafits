@@ -52,6 +52,7 @@ pub mod domain;
 pub mod fit;
 pub mod frame;
 pub mod green;
+mod list;
 pub mod photometry;
 pub mod population;
 pub mod raw;
@@ -512,6 +513,9 @@ impl FitStarsOptions<'_> {
             // `MEASURE_VERSION` 5); the `measure_plane` paths set it themselves ([`finish_working`], [`measure_budget`]).
             blend_refusal: false,
             report_aperture: false,
+            masked_growth: false,
+            max_c_stars: photometry::CORRECTION_STARS,
+            warn_short_c: true,
         }
     }
 }
@@ -1346,7 +1350,8 @@ fn prepare_working(
         working,
         w,
         h,
-        opts,
+        &opts.fit,
+        opts.mask.as_deref(),
         pool,
         &pass_seeds,
         head.field_width,
@@ -1619,13 +1624,13 @@ fn prepare_passes(
     working: &[f32],
     w: usize,
     h: usize,
-    opts: &MeasureOptions,
+    fit_params: &FitParams,
+    mask: Option<&[bool]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     seeds: &[Seed],
     field_width: FieldWidth,
     saturation: SaturationPlane,
 ) -> Passes {
-    let mask = opts.mask.as_deref();
     let t = Instant::now();
     let pass_call = || {
         fit::verdict_pass(
@@ -1633,7 +1638,7 @@ fn prepare_passes(
             w,
             h,
             seeds,
-            &opts.fit,
+            fit_params,
             mask,
             Some(field_width.fwhm_px),
             &saturation,
@@ -1765,6 +1770,7 @@ fn finish_working(
                 // (LN's refits, every `fit_stars_at` caller) still leaves it off.
                 blend_refusal: true,
                 report_aperture,
+                masked_growth: report_aperture,
                 ..Default::default()
             },
             None,
@@ -1969,7 +1975,17 @@ fn measure_budget(
             .map(|&i| all_extended.get(i).copied().unwrap_or(false))
             .collect()
     };
-    let prepared = prepare_passes(working, w, h, opts, pool, &sub, field_width, saturation);
+    let prepared = prepare_passes(
+        working,
+        w,
+        h,
+        &opts.fit,
+        opts.mask.as_deref(),
+        pool,
+        &sub,
+        field_width,
+        saturation,
+    );
     let Passes {
         fit_field,
         passes,
@@ -2008,6 +2024,7 @@ fn measure_budget(
                 // R-PC-10: the Blend refusal (the Analysis path's since 7; `finish_working` sets it too since Plan D D3).
                 blend_refusal: true,
                 report_aperture,
+                masked_growth: report_aperture,
                 ..Default::default()
             },
             None,

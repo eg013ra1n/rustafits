@@ -13,6 +13,13 @@
 //! [`measure_raw_frame`]) and [`PsfModel`] (the type of `FrameOptions::psf_model`) appear in the signatures but keep
 //! the status of `star_measure`'s other public items, outside the stable entry.
 //!
+//! A list entry sits beside it ([`measure_raw_frame_and_list`], forced-list zero point): the same measurement, then a
+//! caller's list of native-pixel positions fitted on the same plane with the measurement's own β, field width and mask,
+//! and an aperture correction `c` measured over the list's own bright members. The list adds to the measurement and
+//! never moves it: every [`StarFit`], [`FrameSummary`] and [`PlaneMeasurement`] field but the wall-clock `timings` /
+//! `sub_steps` is bit-identical with and without a list. [`ListRequest`], [`ListFit`] and [`ListMeasurement`] are
+//! `#[non_exhaustive]` like [`FrameOptions`].
+//!
 //! The row mapping (the per-star rows, the frame row's ids, `config_hash`, `analyzed_at`,
 //! `quality_score`, the detection threshold, the frame's size and channel count, `possibly_trailed` and the measurement
 //! version) stays in Athenaeum, which builds a [`FrameOptions`] from its own `AnalysisConfig`.
@@ -28,12 +35,13 @@
 use std::sync::Arc;
 
 use crate::star_measure::frame::finite_median;
-use crate::star_measure::green::measure_green_sites;
+use crate::star_measure::green::{measure_green_sites, measure_green_sites_and_seeds};
+use crate::star_measure::list::{measure_list, ListPlane};
 use crate::star_measure::raw::{RawFrame, RawPlanes};
 use crate::star_measure::trail::trail_r_squared;
 use crate::star_measure::{
-    self, BetaSource, MeasureOptions, Mode, PixelNoise, PlaneMeasurement, PsfModel, SeedSpec, StarFit,
-    DEFAULT_THRESHOLD,
+    self, BetaSource, MeasureOptions, Mode, PixelNoise, PlaneMeasurement, PsfModel, RefusalCounts, Seed,
+    SeedSpec, StarFit, StarFlags, DEFAULT_THRESHOLD,
 };
 
 /// What the Analysis-mode measurement is asked: the three knobs of Athenaeum's `AnalysisConfig` that reach the
@@ -78,18 +86,7 @@ pub fn measure_raw_frame_with(
     pool: Option<&Arc<rayon::ThreadPool>>,
     diagnostics: bool,
 ) -> PlaneMeasurement {
-    let base = MeasureOptions {
-        domain: frame.domain,
-        psf_model: opts.psf_model,
-        seeds: SeedSpec::MatchedFilter {
-            threshold: opts.detection_threshold,
-        },
-        mode: Mode::Budget {
-            budget: opts.max_stars,
-        },
-        diagnostics,
-        ..Default::default()
-    };
+    let base = base_options(frame, opts, diagnostics);
     match &frame.planes {
         RawPlanes::Mono(plane) => {
             let opts = MeasureOptions {
@@ -102,15 +99,183 @@ pub fn measure_raw_frame_with(
             measure_green_sites(mosaic, frame.w, frame.h, *pattern, &base, pool)
         }
         RawPlanes::Rgb(planes) => {
-            let opts = MeasureOptions {
-                colour: true,
-                pixel_noise: PixelNoise::Mixed,
-                cfa_site_share: Some(0.5),
-                ..base
-            };
+            let opts = rgb_options(base);
             star_measure::measure_plane(&planes[1], frame.w, frame.h, &opts, pool)
         }
     }
+}
+
+fn base_options(frame: &RawFrame, opts: &FrameOptions, diagnostics: bool) -> MeasureOptions {
+    MeasureOptions {
+        domain: frame.domain,
+        psf_model: opts.psf_model,
+        seeds: SeedSpec::MatchedFilter {
+            threshold: opts.detection_threshold,
+        },
+        mode: Mode::Budget {
+            budget: opts.max_stars,
+        },
+        diagnostics,
+        ..Default::default()
+    }
+}
+
+fn rgb_options(base: MeasureOptions) -> MeasureOptions {
+    MeasureOptions {
+        colour: true,
+        pixel_noise: PixelNoise::Mixed,
+        cfa_site_share: Some(0.5),
+        ..base
+    }
+}
+
+/// The default cap of [`ListRequest::max_c_stars`]: the aperture correction is the median over at most this many of the
+/// list's kept fits, the brightest by model flux.
+pub const LIST_C_STARS: usize = 256;
+
+/// A list of positions to fit beside the Analysis measurement ([`measure_raw_frame_and_list`]).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ListRequest {
+    /// Native pixel positions in FILE row order, pixel centres at integer coordinates (the positions
+    /// [`PlaneMeasurement::stars`] carries).
+    pub positions: Vec<(f64, f64)>,
+    /// A fit is kept when its fitted centre is within this many px of its position. Must be positive.
+    pub max_centre_offset_px: f64,
+    /// The aperture correction is the median over at most this many kept fits ([`LIST_C_STARS`] from
+    /// [`ListRequest::new`]). Must be positive.
+    pub max_c_stars: usize,
+}
+
+impl ListRequest {
+    /// A request for `positions` with the centre tolerance `max_centre_offset_px` and the default `c` cap
+    /// ([`LIST_C_STARS`]).
+    pub fn new(positions: Vec<(f64, f64)>, max_centre_offset_px: f64) -> Self {
+        ListRequest {
+            positions,
+            max_centre_offset_px,
+            max_c_stars: LIST_C_STARS,
+        }
+    }
+}
+
+/// One list position's fit, in request order. A position that was refused (outside the plane, not finite, or a fit the
+/// module refused) carries NaN numbers and both flags false.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct ListFit {
+    /// The fitted centre, native pixels.
+    pub x: f64,
+    pub y: f64,
+    /// The fit's model flux inside its FWTM (what a star's `signal` is at `c = 1`).
+    pub model_flux: f64,
+    /// `model_flux` times the list's aperture correction; NaN when that is `None`.
+    pub flux: f64,
+    /// The star's aperture SNR (NaN without a ring sky).
+    pub snr: f64,
+    pub flags: StarFlags,
+    /// The fit was accepted (no refusal, not a duplicate, not a blend).
+    pub accepted: bool,
+    /// Accepted, not saturated or near the clip, and centred within the request's tolerance. No SNR cut.
+    pub kept: bool,
+    /// Distance of the fitted centre from the position, px.
+    pub centre_offset_px: f64,
+}
+
+/// What the list measured, apart from the frame's own measurement.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ListMeasurement {
+    /// One per requested position, in request order.
+    pub fits: Vec<ListFit>,
+    /// The list's aperture correction: the median growth / model-flux ratio over the kept fits that pass Analysis' own
+    /// `c` screens (isolation, footprint, clip, SNR 20), at most the request's cap; the masked, phase-matched growth on
+    /// a mosaic. `None` under 5 qualifiers.
+    pub aperture_correction: Option<f64>,
+    /// The qualifiers `aperture_correction` is over; the count (0 to 4) when it is `None`.
+    pub aperture_stars: usize,
+    /// The standard error of `aperture_correction`, from its ratios' MAD.
+    pub aperture_se: Option<f64>,
+    /// The β the list was fitted at (the frame's).
+    pub beta: f64,
+    /// The ring width `F` the list's ring skies and growth were read at; `None` without one.
+    pub ring_fwhm: Option<f64>,
+    /// The list's seeds not accepted, by reason (the positions refused without a fit are not counted).
+    pub refused: RefusalCounts,
+}
+
+/// [`measure_raw_frame`], then the caller's list fitted on the same plane. The measurement is exactly
+/// `measure_raw_frame(frame, opts, pool)`'s (every number bit-identical but the wall-clock `timings` / `sub_steps`).
+/// `list` is called at most once, with that measurement, and returns the request built from it (the catalogue stars
+/// projected into the frame, say); it is not called on a trailed or defocused plane. The second value is `None` when the
+/// callback returns `None` or an empty request, when the plane is trailed or defocused, or when the request or the
+/// plane's mask cannot be measured (each says why in the log).
+///
+/// The list is fitted at the measurement's β and field width with its saturation verdict and the plane's mask (a
+/// mosaic's green sites); the frame's detected seeds, except one within the tolerance of a list position, keep their
+/// `3F` discs out of every list star's ring sky. Cost: one more fit pass over the list and at most `max_c_stars` growth
+/// curves beside the budget's.
+pub fn measure_raw_frame_and_list<F>(
+    frame: &RawFrame,
+    opts: &FrameOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    list: F,
+) -> (PlaneMeasurement, Option<ListMeasurement>)
+where
+    F: FnOnce(&PlaneMeasurement) -> Option<ListRequest>,
+{
+    let base = base_options(frame, opts, false);
+    // The measurement, as `measure_raw_frame_with(.., false)` makes it, plus what the list needs of it: the plane it ran
+    // on, its mask and the seeds that stay in the ring sky.
+    let (pm, plane, mask, detected_native): (PlaneMeasurement, &[f32], Option<Vec<bool>>, Option<Vec<Seed>>) =
+        match &frame.planes {
+            RawPlanes::Mono(plane) => {
+                let o = MeasureOptions {
+                    pixel_noise: PixelNoise::White,
+                    ..base
+                };
+                (star_measure::measure_plane(plane, frame.w, frame.h, &o, pool), plane, None, None)
+            }
+            RawPlanes::Cfa { mosaic, pattern } => {
+                let (pm, seeds) =
+                    measure_green_sites_and_seeds(mosaic, frame.w, frame.h, *pattern, &base, pool);
+                let mask = crate::processing::cfa::green_mask(frame.w, frame.h, *pattern);
+                (pm, mosaic.as_slice(), Some(mask), Some(seeds))
+            }
+            RawPlanes::Rgb(planes) => {
+                let o = rgb_options(base);
+                (
+                    star_measure::measure_plane(&planes[1], frame.w, frame.h, &o, pool),
+                    planes[1].as_slice(),
+                    None,
+                    None,
+                )
+            }
+        };
+    if pm.trailed || pm.defocused {
+        tracing::debug!(
+            trailed = pm.trailed,
+            defocused = pm.defocused,
+            "list: the plane is trailed or defocused; no list measured"
+        );
+        return (pm, None);
+    }
+    let Some(request) = list(&pm) else {
+        return (pm, None);
+    };
+    let mosaic = matches!(frame.planes, RawPlanes::Cfa { .. });
+    let input = ListPlane {
+        plane,
+        w: frame.w,
+        h: frame.h,
+        domain: frame.domain,
+        mask: mask.as_deref(),
+        mosaic,
+        colour: matches!(frame.planes, RawPlanes::Rgb(_)),
+    };
+    let detected: &[Seed] = detected_native.as_deref().unwrap_or(&pm.detected);
+    let measured = measure_list(&input, &pm, detected, &request, pool);
+    (pm, measured)
 }
 
 /// The frame verdict of a measurement (PC-13): trailed / defocused as the module judged, else no stars when no fit stands
@@ -642,5 +807,399 @@ mod tests {
         let near = |s: &MoffatStar| pm.stars.iter().any(|m| (m.x - s.x).hypot(m.y - s.y) < 0.5);
         assert!(near(&g_only), "the G star is measured");
         assert!(!near(&r_only), "the R star is absent");
+    }
+
+    // ---- The list entry (forced-list zero point, R-OSP-19) ----
+
+    /// `n` isolated stars (`(x, y, amplitude)`) at seeded positions at least `sep` px apart and `margin` from the edge.
+    fn scattered(n: usize, w: usize, h: usize, sep: f64, margin: f64, amp: (f64, f64), seed: u64) -> Vec<(f64, f64, f64)> {
+        let mut rng = crate::geometry::ransac::SplitMix64(seed);
+        let mut out: Vec<(f64, f64, f64)> = Vec::new();
+        let mut tries = 0;
+        while out.len() < n {
+            tries += 1;
+            assert!(tries < 200_000, "{n} stars do not fit");
+            let x = margin + rng.next_f64() * (w as f64 - 2.0 * margin);
+            let y = margin + rng.next_f64() * (h as f64 - 2.0 * margin);
+            if out.iter().any(|s| (s.0 - x).hypot(s.1 - y) < sep) {
+                continue;
+            }
+            out.push((x, y, amp.0 + rng.next_f64() * (amp.1 - amp.0)));
+        }
+        out
+    }
+
+    fn integrated(w: usize, h: usize, stars: &[(f64, f64, f64)], fwhm: f64) -> Vec<f32> {
+        use crate::test_support::{integrated_field, IntegratedProfile};
+        integrated_field(w, h, stars, IntegratedProfile::Moffat { fwhm, beta: 2.5 }, 5, 0.0)
+    }
+
+    /// An RGGB (or GBRG) mosaic of the scene: R / B gains 0.5 / 0.4, greens `g` on even rows and odd rows, sky 1000 per
+    /// site (+ `ped2` on the odd-row greens), noise 4.
+    fn mosaic_of(scene: &[f32], w: usize, h: usize, pattern: BayerPattern, g: (f64, f64), ped2: f64, seed: u64) -> Vec<f32> {
+        let mut m: Vec<f32> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let green_row = |row: usize| if row % 2 == 0 { (g.0, 1000.0) } else { (g.1, 1000.0 + ped2) };
+                let (gain, sky) = match pattern {
+                    BayerPattern::Rggb => match (x % 2, y % 2) {
+                        (0, 0) => (0.5, 900.0),
+                        (1, 1) => (0.4, 800.0),
+                        _ => green_row(y),
+                    },
+                    _ => match (x % 2, y % 2) {
+                        (1, 0) => (0.5, 900.0),
+                        (0, 1) => (0.4, 800.0),
+                        _ => green_row(y),
+                    },
+                };
+                (f64::from(scene[i]) * gain + sky) as f32
+            })
+            .collect();
+        add_noise(&mut m, 4.0, seed);
+        m
+    }
+
+    fn raw(planes: RawPlanes, w: usize, h: usize, channels: usize) -> RawFrame {
+        RawFrame {
+            planes,
+            w,
+            h,
+            domain: RAW,
+            flip_vertical: false,
+            channels,
+        }
+    }
+
+    /// Every number of a fit as bits (NaN equals NaN by its bits).
+    fn fit_bits(f: &StarFit) -> Vec<u64> {
+        let mut v: Vec<u64> = [
+            f.x, f.y, f.background, f.amplitude, f.fwhm_x, f.fwhm_y, f.fwtm_x, f.fwtm_y, f.theta, f.beta, f.residual,
+            f.signal, f.area, f.peak5, f.sky_ring, f.sky_ring_sigma, f.snr, f.ap_sum, f.hfr,
+        ]
+        .iter()
+        .map(|x| x.to_bits())
+        .collect();
+        v.push(u64::from(f.sky_ring_n));
+        v.push(u64::from(f.flags.bits()));
+        v
+    }
+
+    /// The measurement with its wall-clock fields reset, as text: `{:?}` prints a float as its shortest round-trip, so
+    /// two equal strings are two equal measurements field by field.
+    fn measurement_text(pm: &PlaneMeasurement) -> String {
+        let mut pm = pm.clone();
+        pm.timings = Default::default();
+        pm.sub_steps = Default::default();
+        format!("{pm:?}")
+    }
+
+    /// B9's rustafits half: the Analysis measurement is bit-identical with and without a list, on a mono frame, an RGGB
+    /// and a GBRG mosaic and a 3-plane file; the list is 200 positions, which are fitted.
+    #[test]
+    fn the_analysis_measurement_is_identical_with_and_without_a_list() {
+        let (w, h) = (400, 400);
+        let stars = scattered(30, w, h, 50.0, 45.0, (1500.0, 5000.0), 5);
+        let scene = integrated(w, h, &stars, 3.0);
+        let mut mono_plane: Vec<f32> = scene.iter().map(|&v| v + 1000.0).collect();
+        add_noise(&mut mono_plane, 4.0, 6);
+        let plane = |seed| {
+            let mut p: Vec<f32> = scene.iter().map(|&v| v + 1000.0).collect();
+            add_noise(&mut p, 4.0, seed);
+            p
+        };
+        let frames = vec![
+            ("mono", raw(RawPlanes::Mono(mono_plane), w, h, 1)),
+            (
+                "rggb",
+                raw(
+                    RawPlanes::Cfa {
+                        mosaic: mosaic_of(&scene, w, h, BayerPattern::Rggb, (1.0, 0.98), 3.0, 7),
+                        pattern: BayerPattern::Rggb,
+                    },
+                    w,
+                    h,
+                    1,
+                ),
+            ),
+            (
+                "gbrg",
+                raw(
+                    RawPlanes::Cfa {
+                        mosaic: mosaic_of(&scene, w, h, BayerPattern::Gbrg, (1.0, 0.98), 3.0, 8),
+                        pattern: BayerPattern::Gbrg,
+                    },
+                    w,
+                    h,
+                    1,
+                ),
+            ),
+            ("rgb", raw(RawPlanes::Rgb([plane(1), plane(2), plane(3)]), w, h, 3)),
+        ];
+        let o = FrameOptions::default();
+        let mut rng = crate::geometry::ransac::SplitMix64(99);
+        let positions: Vec<(f64, f64)> = (0..200)
+            .map(|i| {
+                if i < stars.len() {
+                    (stars[i].0 + 0.1, stars[i].1 - 0.1)
+                } else {
+                    (20.0 + rng.next_f64() * 360.0, 20.0 + rng.next_f64() * 360.0)
+                }
+            })
+            .collect();
+        for (name, frame) in &frames {
+            let plain = measure_raw_frame(frame, &o, None);
+            let (with, list) = measure_raw_frame_and_list(frame, &o, None, |_| {
+                Some(ListRequest::new(positions.clone(), 1.0))
+            });
+            let list = list.unwrap_or_else(|| panic!("{name}: the list was not measured"));
+            assert_eq!(list.fits.len(), 200, "{name}");
+            assert!(list.fits.iter().filter(|f| f.accepted).count() >= 20, "{name}: the list is fitted");
+            assert_eq!(plain.stars.len(), with.stars.len(), "{name}");
+            for (a, b) in plain.stars.iter().zip(&with.stars) {
+                assert_eq!(fit_bits(a), fit_bits(b), "{name}: a star moved");
+            }
+            assert_eq!(measurement_text(&plain), measurement_text(&with), "{name}");
+            let (sa, sb) = (
+                format!("{:?}", FrameSummary::from_measurement(&plain, &o)),
+                format!("{:?}", FrameSummary::from_measurement(&with, &o)),
+            );
+            assert_eq!(sa, sb, "{name}: the summary moved");
+        }
+    }
+
+    /// A list's `flux` over the true total flux of each star: `(median ratio, median centre offset)`.
+    fn recovery(frame: &RawFrame, stars: &[(f64, f64, f64)], fwhm: f64, truth_gain: f64) -> (f64, f64, ListMeasurement) {
+        let positions: Vec<(f64, f64)> = stars.iter().map(|s| (s.0 + 0.1, s.1 - 0.1)).collect();
+        let (_, list) = measure_raw_frame_and_list(frame, &FrameOptions::default(), None, |_| {
+            Some(ListRequest::new(positions.clone(), 1.0))
+        });
+        let list = list.expect("the list is measured");
+        let alpha = fwhm / (2.0 * (2f64.powf(0.4) - 1.0).sqrt());
+        let mut ratios = Vec::new();
+        let mut offsets = Vec::new();
+        for (lf, s) in list.fits.iter().zip(stars) {
+            if lf.kept {
+                let total = std::f64::consts::PI * alpha * alpha * s.2 / 1.5 * truth_gain;
+                ratios.push(lf.flux / total);
+                offsets.push((lf.x - s.0).hypot(lf.y - s.1));
+            }
+        }
+        assert!(ratios.len() >= 20, "kept {} of {}: {:?}", ratios.len(), stars.len(), list.aperture_stars);
+        (
+            crate::star_measure::tests::median(ratios.iter().copied()),
+            crate::star_measure::tests::median(offsets.iter().copied()),
+            list,
+        )
+    }
+
+    #[test]
+    fn a_list_on_a_mono_field_recovers_its_fluxes() {
+        let (w, h) = (400, 400);
+        for fwhm in [2.0, 3.0] {
+            let stars = scattered(30, w, h, 50.0, 45.0, (1500.0, 5000.0), 5);
+            let mut p: Vec<f32> = integrated(w, h, &stars, fwhm).iter().map(|&v| v + 1000.0).collect();
+            add_noise(&mut p, 4.0, 6);
+            let (ratio, offset, list) = recovery(&raw(RawPlanes::Mono(p), w, h, 1), &stars, fwhm, 1.0);
+            assert!((ratio - 1.0).abs() < 0.01, "fwhm {fwhm}: median flux / truth {ratio}");
+            assert!(offset < 0.2, "fwhm {fwhm}: median centre offset {offset}");
+            assert!(list.aperture_correction.is_some_and(|c| c > 1.0 && c < 1.5), "{:?}", list.aperture_correction);
+        }
+    }
+
+    #[test]
+    fn a_list_on_a_mosaic_recovers_its_fluxes() {
+        let (w, h) = (400, 400);
+        for fwhm in [2.0, 3.0] {
+            let stars = scattered(30, w, h, 50.0, 45.0, (1500.0, 5000.0), 5);
+            let scene = integrated(w, h, &stars, fwhm);
+            let m = mosaic_of(&scene, w, h, BayerPattern::Rggb, (1.00, 0.98), 3.0, 7);
+            let frame = raw(
+                RawPlanes::Cfa {
+                    mosaic: m,
+                    pattern: BayerPattern::Rggb,
+                },
+                w,
+                h,
+                1,
+            );
+            // The two greens carry gains 1.00 and 0.98: the fit and the growth see their mean.
+            let (ratio, offset, _) = recovery(&frame, &stars, fwhm, 0.99);
+            assert!((ratio - 1.0).abs() < 0.02, "fwhm {fwhm}: median flux / truth {ratio}");
+            assert!(offset < 0.2, "fwhm {fwhm}: median centre offset {offset}");
+        }
+    }
+
+    #[test]
+    fn a_list_star_whose_own_detection_coincides_still_qualifies_for_c() {
+        let (w, h) = (400, 400);
+        let stars = scattered(30, w, h, 50.0, 45.0, (1500.0, 5000.0), 5);
+        let mut p: Vec<f32> = integrated(w, h, &stars, 3.0).iter().map(|&v| v + 1000.0).collect();
+        add_noise(&mut p, 4.0, 6);
+        let frame = raw(RawPlanes::Mono(p), w, h, 1);
+        let positions: Vec<(f64, f64)> = stars.iter().map(|s| (s.0, s.1)).collect();
+        let (pm, list) = measure_raw_frame_and_list(&frame, &FrameOptions::default(), None, |_| {
+            Some(ListRequest::new(positions.clone(), 1.0))
+        });
+        let detected_at = |x: f64, y: f64| pm.detected.iter().any(|d| (d.x - x).hypot(d.y - y) < 0.5);
+        assert!(positions.iter().all(|&(x, y)| detected_at(x, y)), "premise: every list star is also detected");
+        let list = list.expect("measured");
+        assert!(list.aperture_stars >= 5, "{}", list.aperture_stars);
+        assert!(list.aperture_correction.is_some());
+    }
+
+    #[test]
+    fn the_c_cap_is_the_requests() {
+        let (w, h) = (1100, 900);
+        let mut stars = Vec::new();
+        for j in 0..18 {
+            for i in 0..22 {
+                stars.push((40.0 + 48.0 * i as f64 + 6.0 * ((i * 7 + j * 3) % 5) as f64, 40.0 + 48.0 * j as f64 + 5.0 * ((i * 3 + j * 11) % 5) as f64, 4000.0 + 30.0 * ((i + 3 * j) % 17) as f64));
+            }
+        }
+        assert!(stars.len() >= 300);
+        let mut p: Vec<f32> = integrated(w, h, &stars, 2.5).iter().map(|&v| v + 1000.0).collect();
+        add_noise(&mut p, 4.0, 6);
+        let frame = raw(RawPlanes::Mono(p), w, h, 1);
+        let positions: Vec<(f64, f64)> = stars.iter().map(|s| (s.0, s.1)).collect();
+        let (pm, list) = measure_raw_frame_and_list(&frame, &FrameOptions::default(), None, |_| {
+            Some(ListRequest::new(positions.clone(), 1.0))
+        });
+        let list = list.expect("measured");
+        assert_eq!(list.aperture_stars, 256, "the request's cap");
+        assert!(pm.aperture_stars <= 64, "Analysis' own cap: {}", pm.aperture_stars);
+        let capped = measure_raw_frame_and_list(&frame, &FrameOptions::default(), None, |_| {
+            let mut r = ListRequest::new(positions.clone(), 1.0);
+            r.max_c_stars = 40;
+            Some(r)
+        })
+        .1
+        .expect("measured");
+        assert_eq!(capped.aperture_stars, 40);
+    }
+
+    /// A star's own flux is its model's times the list's `c`, and `c` reads each qualifier's ring sky, so the proof that
+    /// an unlisted bright neighbour does not lift a ring sky is on `c`: every one of eight list stars has a bright
+    /// unlisted companion 11 F away (inside its ring), and the list's fluxes match the field without the companions.
+    #[test]
+    fn an_unlisted_neighbour_does_not_lift_the_ring_sky() {
+        let (w, h) = (500, 500);
+        let fwhm = 3.0;
+        let stars = scattered(8, w, h, 100.0, 70.0, (3000.0, 5000.0), 5);
+        let companion = |t: &(f64, f64, f64)| {
+            (0..16)
+                .map(|k| {
+                    let a = k as f64 * std::f64::consts::TAU / 16.0;
+                    (t.0 + 11.0 * fwhm * a.cos(), t.1 + 11.0 * fwhm * a.sin(), 3000.0)
+                })
+                .find(|b| {
+                    b.0 > 40.0
+                        && b.0 < 460.0
+                        && b.1 > 40.0
+                        && b.1 < 460.0
+                        && stars.iter().filter(|s| *s != t).all(|s| (s.0 - b.0).hypot(s.1 - b.1) > 40.0)
+                })
+                .expect("a free spot")
+        };
+        let companions: Vec<_> = stars.iter().map(companion).collect();
+        let frame_of = |extra: &[(f64, f64, f64)]| {
+            let mut all = stars.clone();
+            all.extend_from_slice(extra);
+            let mut p: Vec<f32> = integrated(w, h, &all, fwhm).iter().map(|&v| v + 1000.0).collect();
+            add_noise(&mut p, 4.0, 6);
+            raw(RawPlanes::Mono(p), w, h, 1)
+        };
+        let positions: Vec<(f64, f64)> = stars.iter().map(|s| (s.0, s.1)).collect();
+        let run = |frame: &RawFrame| {
+            let (pm, list) = measure_raw_frame_and_list(frame, &FrameOptions::default(), None, |_| {
+                Some(ListRequest::new(positions.clone(), 1.0))
+            });
+            (pm, list.expect("measured"))
+        };
+        let (_, without) = run(&frame_of(&[]));
+        let (pm, with) = run(&frame_of(&companions));
+        for b in &companions {
+            assert!(
+                pm.detected.iter().any(|d| (d.x - b.0).hypot(d.y - b.1) < 1.0),
+                "premise: the unlisted companion {b:?} is detected"
+            );
+        }
+        let (ca, cb) = (without.aperture_correction.expect("c"), with.aperture_correction.expect("c"));
+        assert!(without.aperture_stars >= 5 && with.aperture_stars >= 5);
+        assert!((cb / ca - 1.0).abs() < 0.005, "c {cb} against {ca} without the companions");
+        // (The field's brightest star can read as clipped by the plane-max amplitude clause, in both runs alike.)
+        let mut compared = 0;
+        for (a, b) in without.fits.iter().zip(&with.fits) {
+            assert_eq!(a.kept, b.kept, "{a:?} {b:?}");
+            if a.kept {
+                compared += 1;
+                assert!((b.flux / a.flux - 1.0).abs() < 0.005, "flux {} against {}", b.flux, a.flux);
+            }
+        }
+        assert!(compared >= 6, "{compared} kept");
+    }
+
+    #[test]
+    fn a_saturated_list_star_is_not_kept() {
+        let (w, h) = (400, 400);
+        let mut stars = scattered(30, w, h, 50.0, 45.0, (1500.0, 5000.0), 5);
+        stars[0].2 = 90000.0;
+        let mut p: Vec<f32> = integrated(w, h, &stars, 3.0).iter().map(|&v| (v + 1000.0).min(65535.0)).collect();
+        add_noise(&mut p, 4.0, 6);
+        p.iter_mut().for_each(|v| *v = v.min(65535.0));
+        let positions: Vec<(f64, f64)> = stars.iter().map(|s| (s.0, s.1)).collect();
+        let (_, list) = measure_raw_frame_and_list(&raw(RawPlanes::Mono(p), w, h, 1), &FrameOptions::default(), None, |_| {
+            Some(ListRequest::new(positions.clone(), 1.0))
+        });
+        let list = list.expect("measured");
+        let sat = list.fits[0];
+        assert!(!sat.kept, "{sat:?}");
+        assert!(!sat.accepted || sat.flags.saturated(), "{sat:?}");
+        assert!(list.fits[1..].iter().filter(|f| f.kept).count() >= 20);
+    }
+
+    #[test]
+    fn a_far_centre_is_not_kept() {
+        let (w, h) = (400, 400);
+        let stars = scattered(30, w, h, 50.0, 45.0, (1500.0, 5000.0), 5);
+        let mut p: Vec<f32> = integrated(w, h, &stars, 3.0).iter().map(|&v| v + 1000.0).collect();
+        add_noise(&mut p, 4.0, 6);
+        let mut positions: Vec<(f64, f64)> = stars.iter().map(|s| (s.0, s.1)).collect();
+        positions[0].0 += 3.0;
+        let (_, list) = measure_raw_frame_and_list(&raw(RawPlanes::Mono(p), w, h, 1), &FrameOptions::default(), None, |_| {
+            Some(ListRequest::new(positions.clone(), 1.0))
+        });
+        let list = list.expect("measured");
+        let far = list.fits[0];
+        assert!(!far.kept, "{far:?}");
+        assert!(!far.accepted || far.centre_offset_px > 1.0, "{far:?}");
+        assert!(list.fits[1..].iter().filter(|f| f.kept).count() >= 20);
+    }
+
+    #[test]
+    fn a_trailed_plane_measures_no_list() {
+        let p: Vec<f32> = crate::test_support::trailed_field(600, 450, 9)
+            .iter()
+            .map(|v| v * 65535.0)
+            .collect();
+        let frame = mono(p, 600, 450);
+        let asked = std::cell::Cell::new(false);
+        let (pm, list) = measure_raw_frame_and_list(&frame, &FrameOptions::default(), None, |_| {
+            asked.set(true);
+            Some(ListRequest::new(vec![(100.0, 100.0)], 1.0))
+        });
+        assert!(pm.trailed);
+        assert!(list.is_none());
+        assert!(!asked.get(), "a trailed plane does not build a list");
+    }
+
+    #[test]
+    fn an_empty_request_measures_no_list() {
+        let frame = mono_frame(120, 640, 480, 1000.0, 11);
+        let o = FrameOptions::default();
+        let (_, a) = measure_raw_frame_and_list(&frame, &o, None, |_| Some(ListRequest::new(Vec::new(), 1.0)));
+        let (_, b) = measure_raw_frame_and_list(&frame, &o, None, |_| None);
+        let (_, c) = measure_raw_frame_and_list(&frame, &o, None, |_| Some(ListRequest::new(vec![(50.0, 50.0)], 0.0)));
+        assert!(a.is_none() && b.is_none() && c.is_none());
     }
 }

@@ -63,11 +63,27 @@ pub fn measure_green_sites(
     base: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
-    measure_green(mosaic, w, h, pattern, base, true, pool)
+    measure_green(mosaic, w, h, pattern, base, true, false, pool).0
+}
+
+/// [`measure_green_sites`] that also hands back the native seeds it handed the fit (every detected seed, `extended`
+/// included, in native pixels): what the list entry ([`super::analysis_mode`]) keeps out of
+/// a list star's ring sky. The measurement is the same bit for bit. Crate-private.
+pub(crate) fn measure_green_sites_and_seeds(
+    mosaic: &[f32],
+    w: usize,
+    h: usize,
+    pattern: BayerPattern,
+    base: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (PlaneMeasurement, Vec<Seed>) {
+    measure_green(mosaic, w, h, pattern, base, true, true, pool)
 }
 
 /// [`measure_green_sites`]' body. `report_aperture` selects the green-site `c` (reported, never applied); `false` is the
-/// path as it was, which `reporting_moves_no_fit` measures the reporting path against.
+/// path as it was, which `reporting_moves_no_fit` measures the reporting path against. `keep_seeds` returns a copy of
+/// the native seeds beside the measurement (empty otherwise); nothing it does reaches a number.
+#[allow(clippy::too_many_arguments)]
 fn measure_green(
     mosaic: &[f32],
     w: usize,
@@ -75,8 +91,9 @@ fn measure_green(
     pattern: BayerPattern,
     base: &MeasureOptions,
     report_aperture: bool,
+    keep_seeds: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> PlaneMeasurement {
+) -> (PlaneMeasurement, Vec<Seed>) {
     assert_eq!(mosaic.len(), w * h, "mosaic does not match its geometry");
     let threshold = match base.seeds {
         SeedSpec::MatchedFilter { threshold } => threshold,
@@ -115,6 +132,7 @@ fn measure_green(
     // Knots (ruling A3, amended by R-PC-8) ride with their flag: `SeedSpec::Given` + `given_extended` fits them like the
     // mono path and keeps them out of `c`'s qualifiers and the frame statistic. Then native pixels, `native_seed`.
     let native: Vec<Seed> = found.iter().map(native_seed).collect();
+    let kept_seeds = if keep_seeds { native.clone() } else { Vec::new() };
     let given_extended = report.extended;
     let field_width = FieldWidth {
         fwhm_px: 2.0 * width.fwhm_px,
@@ -141,11 +159,12 @@ fn measure_green(
         sky: Some(sky),
         given_extended,
     };
-    if report_aperture {
+    let pm = if report_aperture {
         star_measure::measure_plane_reporting_aperture(mosaic, w, h, &opts, pool)
     } else {
         star_measure::measure_plane(mosaic, w, h, &opts, pool)
-    }
+    };
+    (pm, kept_seeds)
 }
 
 #[cfg(test)]
@@ -937,7 +956,7 @@ mod tests {
         let p = BayerPattern::Rggb;
         let (m, _) = integrated_mosaic(2.4, (1.0, 0.98), 3.0, 77);
         let new = measure_green_sites(&m, 400, 400, p, &base(), None);
-        let old = measure_green(&m, 400, 400, p, &base(), false, None);
+        let old = measure_green(&m, 400, 400, p, &base(), false, false, None).0;
         assert!(!new.stars.is_empty());
         assert!(new.stars.iter().chain(&old.stars).all(|f| f.ap_sum.is_nan()));
         assert_same_but_the_report(&new, &old, "mosaic");

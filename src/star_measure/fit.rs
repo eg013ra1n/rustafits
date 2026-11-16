@@ -1991,7 +1991,7 @@ pub fn fit_stars(
 /// under `full_scale`, [`super::photometry::unverdicted_clip_range`]), the footprint a qualifier's `12F` disc must
 /// lie in and (Task 10b) the ring width every fit's B_i is read at. `Default`: measured on the plane, uncapped, the
 /// whole plane, the plane's own frame FWHM.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct Correction<'a> {
     pub(super) flux: super::FluxCorrection,
     pub(super) saturation: Option<&'a SaturationPlane>,
@@ -2027,10 +2027,43 @@ pub(super) struct Correction<'a> {
     /// the SNR-gain crops); `false` for LN's refits and every [`super::fit_stars_at`] caller, which fit as at
     /// `MEASURE_VERSION` 5.
     pub(super) blend_refusal: bool,
-    /// Measure `c` on the masked growth (a Bayer mosaic read on its green sites) and hand it back apart
-    /// ([`FitOutcome::reported_aperture`]) without applying it: no fit's `signal`, no `aperture_correction`, no ratio
-    /// moves (OSC zero point, spec §5.1, O3). Set by [`super::green::measure_green_sites`] alone; `false` = as before.
+    /// Hand `c` back apart ([`FitOutcome::reported_aperture`]) without applying it: no fit's `signal`, no
+    /// `aperture_correction`, no ratio moves (OSC zero point, spec §5.1, O3). Set by
+    /// [`super::green::measure_green_sites`] and the list entry ([`super::list`]) alone; `false` = as before. Until the
+    /// list entry (R-OSP-19) this also meant the masked growth; that is [`Correction::masked_growth`] now.
     pub(super) report_aperture: bool,
+    /// Every growth is [`super::photometry::growth_curve_in`]'s masked form (a Bayer mosaic read on its green sites).
+    /// Set with `report_aperture` by the green-site path and by the list entry on a mosaic; `false` = as before.
+    pub(super) masked_growth: bool,
+    /// `c` is the median over at most this many qualifiers ([`super::photometry::CORRECTION_STARS`], 64, for every
+    /// caller but the list entry, whose request says how many).
+    pub(super) max_c_stars: usize,
+    /// Fewer than 5 qualifiers is one `warn!` per plane (`true`, as before); the list entry says it in a `debug!`.
+    pub(super) warn_short_c: bool,
+}
+
+impl Default for Correction<'_> {
+    fn default() -> Self {
+        Correction {
+            flux: super::FluxCorrection::default(),
+            saturation: None,
+            full_scale: None,
+            footprint: None,
+            ring_fwhm: None,
+            gain: None,
+            noise: super::photometry::ApertureNoise::default(),
+            neighbours: None,
+            population: None,
+            siblings: None,
+            point_siblings: None,
+            timers: None,
+            blend_refusal: false,
+            report_aperture: false,
+            masked_growth: false,
+            max_c_stars: super::photometry::CORRECTION_STARS,
+            warn_short_c: true,
+        }
+    }
 }
 
 /// Every detected seed and where the fitted ones sit among them (Task 12, R12-5): `of_fit[k]` is the index into `seeds`
@@ -2629,7 +2662,9 @@ fn ring_and_correction(
                 correction.population,
                 correction.siblings,
                 correction.point_siblings.is_some(),
-                correction.report_aperture,
+                correction.masked_growth,
+                correction.max_c_stars,
+                correction.warn_short_c,
             );
             if correction.report_aperture {
                 // Reported, never applied (OSC zero point, O3): the plane's applied `c` stays `None`, 0 stars, no

@@ -19,6 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path's. `None` / 0 on every other path.
 - `star_measure::CFA_APERTURE_VERSION` (2): the version of that number, bumped when only it changes. 1 divided the
   green sum by the constant lattice density 0.5; 2 is the phase-matched growth above. `MEASURE_VERSION` stays 8.
+- `star_measure::analysis_mode::measure_raw_frame_and_list`, `ListRequest`, `ListFit` and `ListMeasurement` (the last
+  three `#[non_exhaustive]`), and the constant `LIST_C_STARS` (256): the Analysis measurement, then a caller's list of
+  native-pixel positions fitted on the same plane (mono, a mosaic's green sites, a debayered file's G plane). The
+  caller's closure builds the request from the measurement; the list is fitted at the measurement's β and field width
+  with the saturation verdict and the plane's mask, a detected star other than a list star's own detection keeps its
+  `3F` disc out of the ring sky, and the list's own aperture correction `c` is measured over up to 256 kept fits
+  (accepted, not saturated or near the clip, centred within the request's tolerance) through Analysis' own `c`
+  screens, the masked phase-matched growth on a mosaic. Each fit returns its fitted centre, model flux, `flux` (model
+  flux times `c`), SNR, flags and whether it was kept; `c` returns apart with its stars and error. No list is measured
+  on a trailed or defocused plane (the closure is not called), for an empty request or for a tolerance or cap that is
+  not positive.
+
+The Analysis measurement is bit-identical with and without a list (a test pins every `StarFit` field, every
+`FrameSummary` field and every `PlaneMeasurement` field but the wall-clock `timings` / `sub_steps`, on a mono frame,
+an RGGB and a GBRG mosaic and a 3-plane file); `MEASURE_VERSION` stays 8. Internally the aperture correction's
+masked growth, its qualifier cap (64) and its short-sample `warn!` are three crate-private inputs of the fit call
+instead of one flag; every existing caller keeps its old values.
 
 No existing output moves: `measure_green_sites` still returns `aperture_correction` `None`, no star's `signal`
 changes, and `aperture_stars`, `aperture_se`, `aperture_ratios` and the population's `aperture_se` are as before.

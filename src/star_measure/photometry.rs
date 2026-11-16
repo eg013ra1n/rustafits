@@ -1209,6 +1209,11 @@ pub(crate) fn unverdicted_clip_range(
 ///
 /// `masked` (OSC zero point, spec §5.1): every growth is [`growth_curve_in`]'s masked form (a Bayer mosaic read on its
 /// green sites); every candidate screen above is unchanged, and the caller reports the result, never applies it.
+///
+/// `max_stars` (forced-list zero point, R-OSP-19): the median is over at most this many qualifiers, the brightest by
+/// model flux; [`CORRECTION_STARS`] for every caller but the list entry. `warn_short` says whether fewer than
+/// [`CORRECTION_MIN_RATIOS`] ratios is one `warn!` per plane (every caller but the list entry, whose caller stores the
+/// refusal and which says it in one `debug!`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aperture_correction(
     data: &[f32],
@@ -1227,6 +1232,8 @@ pub(crate) fn aperture_correction(
     siblings: Option<&[Seed]>,
     rescue_extended: bool,
     masked: bool,
+    max_stars: usize,
+    warn_short: bool,
 ) -> (Option<f64>, usize, Option<f64>, ApertureScreens) {
     if fits.is_empty() {
         tracing::debug!(
@@ -1310,7 +1317,7 @@ pub(crate) fn aperture_correction(
             candidates.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
             let mut inside = Vec::new();
             for (seed, f, model) in candidates {
-                if ratios.len() == CORRECTION_STARS {
+                if ratios.len() == max_stars {
                     break;
                 }
                 if !isolated(seed, f) {
@@ -1341,7 +1348,16 @@ pub(crate) fn aperture_correction(
     let n = ratios.len();
     screens.ratios = taken;
     if n < CORRECTION_MIN_RATIOS {
-        if masked {
+        if !warn_short {
+            tracing::debug!(
+                count = n,
+                skipped = screened,
+                point_source = screens.point_source,
+                below_snr = screens.below_snr,
+                fwhm_px = ring_fwhm,
+                "aperture correction: fewer than 5 isolated unsaturated stars; none measured"
+            );
+        } else if masked {
             tracing::warn!(
                 count = n,
                 skipped = screened,
