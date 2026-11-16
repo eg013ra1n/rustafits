@@ -238,8 +238,8 @@ pub const MEASURE_VERSION: u32 = 8;
 
 /// The version of the aperture correction a Bayer mosaic reports from its green sites
 /// ([`PlaneMeasurement::reported_aperture_correction`], OSC zero point): bumped when only that number changes, so
-/// [`MEASURE_VERSION`] and every stored star keep their meaning. 1 = the green-site growth at `5F` scaled by
-/// `N_all / N_green`, the median over up to 64 bright isolated stars.
+/// [`MEASURE_VERSION`] and every stored star keep their meaning. 1 = the green-site growth at `5F` divided by
+/// the green lattice density 0.5, the median over up to 64 bright isolated stars.
 pub const CFA_APERTURE_VERSION: u32 = 1;
 
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
@@ -581,8 +581,8 @@ pub struct PlaneMeasurement {
     /// The standard error of `aperture_correction` as the median of its ratios ([`FitOutcome::aperture_se`]).
     pub aperture_se: Option<f64>,
     /// The aperture correction a Bayer mosaic measured on its green sites and REPORTED, never applied (OSC zero point,
-    /// ruling O3): the median over up to 64 bright isolated stars of the green-site growth flux at `5F` (scaled by
-    /// `N_all / N_green`) over the fit's model flux. No fit's `signal` carries it and `aperture_correction` stays
+    /// ruling O3): the median over up to 64 bright isolated stars of the green-site growth flux at `5F` (over the green
+    /// lattice density 0.5) over the fit's model flux. No fit's `signal` carries it and `aperture_correction` stays
     /// `None` on that path. `None` on every other path, and where fewer than 5 stars qualified. See
     /// [`CFA_APERTURE_VERSION`].
     pub reported_aperture_correction: Option<f64>,

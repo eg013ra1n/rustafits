@@ -989,9 +989,12 @@ pub(crate) fn growth_curve(
 
 /// [`growth_curve`] with a choice of form. `masked` (OSC zero point, spec §5.1): the plane is a Bayer mosaic read on one colour's sites. A pixel within `5F`
 /// that `mask` marks absent is counted in the disc (`N_all`) and skipped, a present pixel that is not finite still
-/// refuses the star, and the sum is scaled by `N_all / N_present`; a disc whose present share is outside
-/// [`MASKED_GROWTH_SHARE`] (the green quincunx is 0.5) refuses the star. Footprint, `12F` disc and `B_i` rules are
-/// unchanged. `false` is the path above, bit for bit ([`growth_curve`]).
+/// refuses the star, and the sum is divided by the lattice's density [`MASKED_GROWTH_DENSITY`] (the green quincunx
+/// holds exactly half the pixels); a disc whose present share `N_present / N_all` is outside [`MASKED_GROWTH_SHARE`]
+/// refuses the star. The scale is the lattice's, not the disc's own count ratio: a star's light sits near its centre,
+/// while `N_all / N_present` moves with the disc's rim (±1.3 % per phase at FWHM 2 px, a jitter the flux does not
+/// carry; controller ruling on Task 1, 2026-11-16). Footprint, `12F` disc and `B_i` rules are unchanged. `false` is
+/// the path above, bit for bit ([`growth_curve`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn growth_curve_in(
     data: &[f32],
@@ -1056,8 +1059,11 @@ pub(crate) fn growth_curve_in(
     if !MASKED_GROWTH_SHARE.contains(&share) {
         return None;
     }
-    Some(sum * (n_all as f64 / inside.len() as f64))
+    Some(sum / MASKED_GROWTH_DENSITY)
 }
+
+/// The share of the plane's pixels a masked growth reads: the green sites of a Bayer mosaic are exactly half.
+pub(crate) const MASKED_GROWTH_DENSITY: f64 = 0.5;
 
 /// The present share of a masked growth disc that is accepted (the green sites of a Bayer mosaic are half of any
 /// disc; a share outside this range is a mask the growth does not know how to scale).
@@ -2575,12 +2581,10 @@ mod tests {
             * (1.0 - (1.0 + r * r / (alpha * alpha)).powf(1.0 - beta))
     }
 
-    /// OSC zero point, spec §5.1 / O2: on a pixel-integrated star the masked growth (the checkerboard's sites, scaled by
-    /// `N_all / N_present`) is the analytic flux inside `5F`: the median over a 4 x 4 grid of sub-pixel phases within
+    /// OSC zero point, spec §5.1 / O2: on a pixel-integrated star the masked growth (the checkerboard's sites over the
+    /// lattice density 0.5) is the analytic flux inside `5F`: the median over a 4 x 4 grid of sub-pixel phases within
     /// 1 % at FWHM 2 and 3 px and within 3 % at 1.4 px, and each phase within the lattice's own bound
-    /// `4·exp(−π²σ²)` plus 0.5 % (σ the Gaussian width of the same FWHM, native px) plus `2 / N_present`, the
-    /// departure of the disc's own count ratio `N_all / N_present` from the lattice's exact 2 (the spec's bound omits
-    /// it; at FWHM 2 it is 1.3 % on the worst phase).
+    /// `4·exp(−π²σ²)` plus 0.5 % (σ the Gaussian width of the same FWHM, native px).
     #[test]
     fn masked_growth_matches_the_analytic_flux() {
         use crate::test_support::{integrated_field, IntegratedProfile};
@@ -2624,17 +2628,6 @@ mod tests {
                     )
                     .unwrap_or_else(|| panic!("FWHM {fwhm} phase ({i}, {j}): refused"));
                     let err = g / truth - 1.0;
-                    // The disc's own counts: `N_all / N_present` departs from the lattice's exact 2 by up to
-                    // `1 / N_present`, a term the lattice bound does not hold (measured: 1.3 % on one phase at FWHM 2).
-                    let n_present = (0..h)
-                        .flat_map(|py| (0..w).map(move |px| (px, py)))
-                        .filter(|&(px, py)| {
-                            mask[py * w + px]
-                                && (px as f64 - x).powi(2) + (py as f64 - y).powi(2)
-                                    <= (GROWTH_RADIUS_PER_FWHM * fwhm).powi(2)
-                        })
-                        .count();
-                    let per_phase_bar = per_phase_bar + 2.0 / n_present as f64;
                     assert!(
                         err.abs() < per_phase_bar,
                         "FWHM {fwhm} phase ({i}, {j}): masked growth {g} vs analytic {truth}: {err:+.4} (bar {per_phase_bar:.4})"
@@ -2714,19 +2707,18 @@ mod tests {
         let mut go = |data: &[f32], mask: Option<&[bool]>, b: f64| {
             growth_curve_in(data, mask, None, w, h, x, y, fwhm, b, true, &mut scratch)
         };
-        // Flat 10 over a half-present disc: the sum scales to the whole disc, 5 above a sky of 5, per pixel.
-        let n_disc = (0..h)
+        // Flat 10 over a half-present disc: the green sites' sum, 5 above a sky of 5 per site, over the lattice
+        // density 0.5 (never the disc's own count ratio).
+        let n_green = (0..h)
             .flat_map(|py| (0..w).map(move |px| (px, py)))
             .filter(|&(px, py)| {
-                (px as f64 - x).powi(2) + (py as f64 - y).powi(2) <= (5.0 * fwhm).powi(2)
+                checker[py * w + px]
+                    && (px as f64 - x).powi(2) + (py as f64 - y).powi(2) <= (5.0 * fwhm).powi(2)
             })
             .count();
         let g = go(&data, Some(&checker), 5.0).unwrap();
-        assert!(
-            (g / (5.0 * n_disc as f64) - 1.0).abs() < 1e-12,
-            "{g} vs {}",
-            5.0 * n_disc as f64
-        );
+        let want = 5.0 * n_green as f64 / MASKED_GROWTH_DENSITY;
+        assert!((g / want - 1.0).abs() < 1e-12, "{g} vs {want}");
         assert_eq!(go(&data, None, 5.0), None, "no mask: share 1.0");
         assert_eq!(go(&data, Some(&vec![true; w * h]), 5.0), None, "all present");
         let rows: Vec<bool> = (0..w * h).map(|i| (i / w) % 4 != 0).collect();
