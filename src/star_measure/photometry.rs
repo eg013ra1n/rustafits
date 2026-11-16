@@ -984,17 +984,22 @@ pub(crate) fn growth_curve(
     b: f64,
     inside: &mut Vec<f64>,
 ) -> Option<f64> {
-    growth_curve_in(data, mask, footprint, w, h, x, y, fwhm, b, false, inside)
+    growth_curve_in(data, mask, footprint, w, h, x, y, fwhm, b, None, inside)
 }
 
-/// The growth flux with a choice of form. `masked` (OSC zero point, spec §5.1): the plane is a Bayer mosaic read on one colour's sites. A pixel within `5F`
-/// that `mask` marks absent is counted in the disc (`N_all`) and skipped, a present pixel that is not finite still
-/// refuses the star, and the sum is divided by the lattice's density [`MASKED_GROWTH_DENSITY`] (the green quincunx
-/// holds exactly half the pixels); a disc whose present share `N_present / N_all` is outside [`MASKED_GROWTH_SHARE`]
-/// refuses the star. The scale is the lattice's, not the disc's own count ratio: a star's light sits near its centre,
-/// while `N_all / N_present` moves with the disc's rim (±1.3 % per phase at FWHM 2 px, a jitter the flux does not
-/// carry; controller ruling on Task 1, 2026-11-16). Footprint, `12F` disc and `B_i` rules are unchanged. `false` is
-/// today's growth, bit for bit (the `#[cfg(test)]` `growth_curve` wraps it).
+/// The growth flux with a choice of form. `masked` (OSC zero point, spec §5.1 as amended by task 1b, 2026-11-16): the
+/// plane is a Bayer mosaic read on one colour's sites, and `Some(model)` is the star's own fitted model (point-sampled
+/// at the pixel centres, exactly as the fit evaluated it; `x`, `y` are its centre). A pixel within `5F` that `mask`
+/// marks absent is counted in the disc (`N_all`) and skipped, a present pixel that is not finite still refuses the
+/// star, and a disc whose present share `N_present / N_all` is outside [`MASKED_GROWTH_SHARE`] refuses the star. The
+/// sum `S_d = Σ (v − B_i)` over the present sites is then scaled by the MODEL's own green share, not a constant: the
+/// result is `S_d · S_ma / S_mg`, `S_mg` the model summed over the same present sites and `S_ma` over every pixel
+/// centre within `5F` (no sky in either). A star's green sum depends on where its centre falls on the checkerboard
+/// (±10 % per star at FWHM 1.25 px, ±3 % at 1.5, ±0.5 % at 1.8); the dependence is in `S_d` and `S_mg` alike and
+/// cancels, what remains is the real wings' excess over the model, which `c` is for. A model sum that is not finite
+/// or not positive, or whose green share `S_mg / S_ma` is outside [`MASKED_MODEL_SHARE`], refuses the star. Footprint,
+/// `12F` disc and `B_i` rules are unchanged. `None` is today's growth, bit for bit (the `#[cfg(test)]` `growth_curve`
+/// wraps it).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn growth_curve_in(
     data: &[f32],
@@ -1006,7 +1011,7 @@ pub(crate) fn growth_curve_in(
     y: f64,
     fwhm: f64,
     b: f64,
-    masked: bool,
+    masked: Option<&StarFit>,
     inside: &mut Vec<f64>,
 ) -> Option<f64> {
     let (r_ap, r_out) = (
@@ -1025,6 +1030,8 @@ pub(crate) fn growth_curve_in(
     let (r_ap2, r_out2) = (r_ap * r_ap, r_out * r_out);
     inside.clear();
     let mut n_all = 0usize;
+    let point_model = masked.map(PointModel::new);
+    let (mut s_mg, mut s_ma) = (0.0f64, 0.0f64);
     let (y0, y1) = ((y - r_out).ceil() as usize, (y + r_out).floor() as usize);
     let (x0, x1) = ((x - r_out).ceil() as usize, (x + r_out).floor() as usize);
     for py in y0..=y1 {
@@ -1036,11 +1043,14 @@ pub(crate) fn growth_curve_in(
                 return None;
             }
             if d2 <= r_ap2 {
-                if masked {
+                if let Some(model) = &point_model {
                     n_all += 1;
+                    let m = model.at(px as f64, py as f64);
+                    s_ma += m;
                     if !mask.map_or(true, |m| m[i]) {
                         continue;
                     }
+                    s_mg += m;
                     if !data[i].is_finite() {
                         return None;
                     }
@@ -1052,18 +1062,63 @@ pub(crate) fn growth_curve_in(
         }
     }
     let sum: f64 = inside.iter().map(|v| v - b).sum();
-    if !masked {
+    if point_model.is_none() {
         return Some(sum);
     }
     let share = inside.len() as f64 / n_all as f64;
     if !MASKED_GROWTH_SHARE.contains(&share) {
         return None;
     }
-    Some(sum / MASKED_GROWTH_DENSITY)
+    if !(s_mg.is_finite() && s_ma.is_finite() && s_mg > 0.0 && s_ma > 0.0)
+        || !MASKED_MODEL_SHARE.contains(&(s_mg / s_ma))
+    {
+        return None;
+    }
+    Some(sum * (s_ma / s_mg))
 }
 
-/// The share of the plane's pixels a masked growth reads: the green sites of a Bayer mosaic are exactly half.
-pub(crate) const MASKED_GROWTH_DENSITY: f64 = 0.5;
+/// A fit's model as the fit evaluated it: the Moffat `A (1 + Q)^−β` at a pixel's centre, no sky (the Analysis-mode
+/// green-site fit is point-sampled, `fit_moffat_2d_fixed_beta_conditioned`). `fwhm_x` / `theta` are the major axis's;
+/// `u` runs along `theta`, as the solver's.
+struct PointModel {
+    x: f64,
+    y: f64,
+    amplitude: f64,
+    beta: f64,
+    cos_t: f64,
+    sin_t: f64,
+    inv_ax2: f64,
+    inv_ay2: f64,
+}
+
+impl PointModel {
+    fn new(f: &StarFit) -> PointModel {
+        let per_alpha = 2.0 * (2f64.powf(1.0 / f.beta) - 1.0).sqrt();
+        let (ax, ay) = (f.fwhm_x / per_alpha, f.fwhm_y / per_alpha);
+        PointModel {
+            x: f.x,
+            y: f.y,
+            amplitude: f.amplitude,
+            beta: f.beta,
+            cos_t: f.theta.cos(),
+            sin_t: f.theta.sin(),
+            inv_ax2: 1.0 / (ax * ax),
+            inv_ay2: 1.0 / (ay * ay),
+        }
+    }
+
+    fn at(&self, px: f64, py: f64) -> f64 {
+        let (dx, dy) = (px - self.x, py - self.y);
+        let u = dx * self.cos_t + dy * self.sin_t;
+        let v = -dx * self.sin_t + dy * self.cos_t;
+        let q = u * u * self.inv_ax2 + v * v * self.inv_ay2;
+        self.amplitude * (1.0 + q).powf(-self.beta)
+    }
+}
+
+/// The accepted green share of a star's own model within `5F` (`S_mg / S_ma`, a checkerboard's is 0.5 up to the star's
+/// phase): a share outside this range is a model the phase-matched growth does not trust.
+pub(crate) const MASKED_MODEL_SHARE: std::ops::RangeInclusive<f64> = 0.35..=0.65;
 
 /// The present share of a masked growth disc that is accepted (the green sites of a Bayer mosaic are half of any
 /// disc; a share outside this range is a mask the growth does not know how to scale).
@@ -1271,7 +1326,7 @@ pub(crate) fn aperture_correction(
                     f.y,
                     f_ring,
                     f.sky_ring,
-                    masked,
+                    masked.then_some(f),
                     &mut inside,
                 ) {
                     ratios.push(growth / model);
@@ -2574,45 +2629,59 @@ mod tests {
         );
     }
 
-    /// A round Moffat's analytic flux inside radius `r` (peak `amp`, FWHM `fwhm`, exponent `beta`).
-    fn moffat_flux_within(amp: f64, fwhm: f64, beta: f64, r: f64) -> f64 {
-        let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
-        std::f64::consts::PI * alpha * alpha * amp / (beta - 1.0)
-            * (1.0 - (1.0 + r * r / (alpha * alpha)).powf(1.0 - beta))
+    /// A round, point-sampled Moffat fit for the masked growth's tests: centre `(x, y)`, peak `amp`, `fwhm`, `beta`.
+    fn round_fit(x: f64, y: f64, amp: f64, fwhm: f64, beta: f64) -> StarFit {
+        StarFit {
+            x,
+            y,
+            background: 0.0,
+            amplitude: amp,
+            fwhm_x: fwhm,
+            fwhm_y: fwhm,
+            fwtm_x: 0.0,
+            fwtm_y: 0.0,
+            theta: 0.0,
+            beta,
+            residual: 0.0,
+            signal: 0.0,
+            area: 0.0,
+            peak5: f64::NAN,
+            sky_ring: f64::NAN,
+            sky_ring_sigma: f64::NAN,
+            sky_ring_n: 0,
+            ap_sum: f64::NAN,
+            snr: f64::NAN,
+            hfr: f64::NAN,
+            flags: Default::default(),
+        }
     }
 
-    /// OSC zero point, spec §5.1 / O2: on a pixel-integrated star the masked growth (the checkerboard's sites over the
-    /// lattice density 0.5) is the analytic flux inside `5F`: the median over a 4 x 4 grid of sub-pixel phases within
-    /// 1 % at FWHM 2 and 3 px and within 3 % at 1.4 px, and each phase within the lattice's own bound
-    /// `4·exp(−π²σ²)` plus 0.5 % (σ the Gaussian width of the same FWHM, native px).
+    /// `A (1 + r^2 / alpha^2)^-beta` of a round Moffat of this FWHM, evaluated independently of [`PointModel`].
+    fn round_moffat_at(f: &StarFit, px: f64, py: f64) -> f64 {
+        let alpha = f.fwhm_x / (2.0 * (2f64.powf(1.0 / f.beta) - 1.0).sqrt());
+        let r2 = (px - f.x).powi(2) + (py - f.y).powi(2);
+        f.amplitude * (1.0 + r2 / (alpha * alpha)).powf(-f.beta)
+    }
+
+    /// OSC zero point, spec §5.1 as amended by task 1b: the phase-matched masked growth is exact on the model's own
+    /// light. Data that IS the point-sampled model (no sky): `S_d · S_ma / S_mg` is the model summed over every pixel
+    /// centre within `5F`, at every sub-pixel phase of the checkerboard and every FWHM, to rounding.
     #[test]
-    fn masked_growth_matches_the_analytic_flux() {
-        use crate::test_support::{integrated_field, IntegratedProfile};
+    fn masked_growth_on_the_models_own_light_is_the_models_flux_on_every_phase() {
         let (w, h) = (130usize, 130usize);
         let mask: Vec<bool> = (0..w * h).map(|i| (i % w + i / w) % 2 == 0).collect();
-        let beta = 2.5;
-        for (fwhm, median_bar) in [(1.4, 0.03), (2.0, 0.01), (3.0, 0.01)] {
-            let sigma = fwhm / (2.0 * (2.0 * std::f64::consts::LN_2).sqrt());
-            let per_phase_bar =
-                4.0 * (-std::f64::consts::PI.powi(2) * sigma * sigma).exp() + 0.005;
-            let truth = moffat_flux_within(1.0, fwhm, beta, GROWTH_RADIUS_PER_FWHM * fwhm);
-            let mut errs = Vec::new();
-            let mut scratch = Vec::new();
+        let mut scratch = Vec::new();
+        for fwhm in [1.25, 1.4, 1.6, 2.0, 3.0] {
             for j in 0..4 {
                 for i in 0..4 {
-                    // Half-step phases: cos(πx₀) sums to zero over the grid, as over the random phases of real stars.
                     let (x, y) = (
                         65.0 + (i as f64 + 0.5) / 4.0,
                         65.0 + (j as f64 + 0.5) / 4.0,
                     );
-                    let data = integrated_field(
-                        w,
-                        h,
-                        &[(x, y, 1.0)],
-                        IntegratedProfile::Moffat { fwhm, beta },
-                        5,
-                        0.0,
-                    );
+                    let fit = round_fit(x, y, 1.0, fwhm, 4.0);
+                    let data: Vec<f32> = (0..w * h)
+                        .map(|k| round_moffat_at(&fit, (k % w) as f64, (k / w) as f64) as f32)
+                        .collect();
                     let g = growth_curve_in(
                         &data,
                         Some(&mask),
@@ -2623,24 +2692,23 @@ mod tests {
                         y,
                         fwhm,
                         0.0,
-                        true,
+                        Some(&fit),
                         &mut scratch,
                     )
                     .unwrap_or_else(|| panic!("FWHM {fwhm} phase ({i}, {j}): refused"));
-                    let err = g / truth - 1.0;
+                    let r2 = (GROWTH_RADIUS_PER_FWHM * fwhm).powi(2);
+                    let all: f64 = (0..w * h)
+                        .filter(|k| {
+                            ((k % w) as f64 - x).powi(2) + ((k / w) as f64 - y).powi(2) <= r2
+                        })
+                        .map(|k| round_moffat_at(&fit, (k % w) as f64, (k / w) as f64))
+                        .sum();
                     assert!(
-                        err.abs() < per_phase_bar,
-                        "FWHM {fwhm} phase ({i}, {j}): masked growth {g} vs analytic {truth}: {err:+.4} (bar {per_phase_bar:.4})"
+                        (g / all - 1.0).abs() < 1e-5,
+                        "FWHM {fwhm} phase ({i}, {j}): {g} vs the model's flux within 5F {all}"
                     );
-                    errs.push(err);
                 }
             }
-            let med = median(errs.iter().copied());
-            eprintln!("masked growth, FWHM {fwhm}: median error {med:+.5} over 16 phases");
-            assert!(
-                med.abs() < median_bar,
-                "FWHM {fwhm}: median error {med:+.4} over the phases (bar {median_bar})"
-            );
         }
     }
 
@@ -2677,7 +2745,7 @@ mod tests {
             }
             sum
         };
-        let plain = growth_curve_in(&data, None, None, w, h, x, y, fwhm, b, false, &mut scratch)
+        let plain = growth_curve_in(&data, None, None, w, h, x, y, fwhm, b, None, &mut scratch)
             .unwrap();
         assert_eq!(plain.to_bits(), by_hand.to_bits(), "the plain disc sum");
         assert_eq!(
@@ -2689,47 +2757,74 @@ mod tests {
         let mut all = vec![true; w * h];
         all[60 * w + 60] = false;
         assert_eq!(
-            growth_curve_in(&data, Some(&all), None, w, h, x, y, fwhm, b, false, &mut scratch),
+            growth_curve_in(&data, Some(&all), None, w, h, x, y, fwhm, b, None, &mut scratch),
             None,
             "unmasked: an absent pixel within 5F refuses the star"
         );
     }
 
     /// The masked form's refusals: a mask that is not half the disc, no mask at all, a present pixel that is not
-    /// finite (while an absent one holding NaN is skipped), a missing B_i.
+    /// finite (while an absent one holding NaN is skipped), a missing B_i, and a model that cannot scale the sum (a
+    /// green share outside 0.35 to 0.65, no light, a NaN amplitude). The scale is the model's own green share, never a
+    /// constant and never the disc's count ratio.
     #[test]
     fn masked_growth_refuses_what_it_cannot_scale() {
         let (w, h) = (120usize, 120usize);
         let (x, y, fwhm) = (60.0, 60.0, 2.0);
+        let fit = round_fit(x, y, 7.0, 2.0, 4.0);
         let mut data = vec![10.0f32; w * h];
         let checker: Vec<bool> = (0..w * h).map(|i| (i % w + i / w) % 2 == 0).collect();
         let mut scratch = Vec::new();
-        let mut go = |data: &[f32], mask: Option<&[bool]>, b: f64| {
-            growth_curve_in(data, mask, None, w, h, x, y, fwhm, b, true, &mut scratch)
+        let mut go = |data: &[f32], mask: Option<&[bool]>, b: f64, model: &StarFit| {
+            growth_curve_in(data, mask, None, w, h, x, y, fwhm, b, Some(model), &mut scratch)
         };
-        // Flat 10 over a half-present disc: the green sites' sum, 5 above a sky of 5 per site, over the lattice
-        // density 0.5 (never the disc's own count ratio).
-        let n_green = (0..h)
-            .flat_map(|py| (0..w).map(move |px| (px, py)))
-            .filter(|&(px, py)| {
-                checker[py * w + px]
-                    && (px as f64 - x).powi(2) + (py as f64 - y).powi(2) <= (5.0 * fwhm).powi(2)
-            })
-            .count();
-        let g = go(&data, Some(&checker), 5.0).unwrap();
-        let want = 5.0 * n_green as f64 / MASKED_GROWTH_DENSITY;
-        assert!((g / want - 1.0).abs() < 1e-12, "{g} vs {want}");
-        assert_eq!(go(&data, None, 5.0), None, "no mask: share 1.0");
-        assert_eq!(go(&data, Some(&vec![true; w * h]), 5.0), None, "all present");
+        // Flat 10 over a half-present disc: the green sites' sum, 5 above a sky of 5 per site, scaled by the model's
+        // own all-sites over green-sites ratio within 5F, evaluated here independently.
+        let (mut n_green, mut s_mg, mut s_ma) = (0usize, 0.0f64, 0.0f64);
+        for py in 0..h {
+            for px in 0..w {
+                if (px as f64 - x).powi(2) + (py as f64 - y).powi(2) <= (5.0 * fwhm).powi(2) {
+                    let m = round_moffat_at(&fit, px as f64, py as f64);
+                    s_ma += m;
+                    if checker[py * w + px] {
+                        n_green += 1;
+                        s_mg += m;
+                    }
+                }
+            }
+        }
+        let g = go(&data, Some(&checker), 5.0, &fit).unwrap();
+        let want = 5.0 * n_green as f64 * s_ma / s_mg;
+        assert!((g / want - 1.0).abs() < 1e-9, "{g} vs {want}");
+        assert!(
+            (s_mg / s_ma - 0.5).abs() > 1e-4,
+            "premise: the model's green share is not the constant 0.5 ({})",
+            s_mg / s_ma
+        );
+        assert_eq!(go(&data, None, 5.0, &fit), None, "no mask: share 1.0");
+        assert_eq!(go(&data, Some(&vec![true; w * h]), 5.0, &fit), None, "all present");
         let rows: Vec<bool> = (0..w * h).map(|i| (i / w) % 4 != 0).collect();
-        assert_eq!(go(&data, Some(&rows), 5.0), None, "three quarters present");
-        assert_eq!(go(&data, Some(&checker), f64::NAN), None, "no B_i");
+        assert_eq!(go(&data, Some(&rows), 5.0, &fit), None, "three quarters present");
+        assert_eq!(go(&data, Some(&checker), f64::NAN, &fit), None, "no B_i");
+        // A model on one lattice alone (a centre pixel narrower than the sampling): green share far above 0.65.
+        assert_eq!(
+            go(&data, Some(&checker), 5.0, &round_fit(x, y, 7.0, 0.3, 4.0)),
+            None,
+            "a model almost wholly on the green sites"
+        );
+        assert_eq!(
+            go(&data, Some(&checker), 5.0, &round_fit(x + 1.0, y, 7.0, 0.3, 4.0)),
+            None,
+            "a model almost wholly on the absent sites"
+        );
+        assert_eq!(go(&data, Some(&checker), 5.0, &round_fit(x, y, 0.0, 2.0, 4.0)), None, "no light");
+        assert_eq!(go(&data, Some(&checker), 5.0, &round_fit(x, y, f64::NAN, 2.0, 4.0)), None, "NaN light");
         let present = (60 * w + 60, 60 * w + 61);
         let (on, off) = if checker[present.0] { present } else { (present.1, present.0) };
         data[off] = f32::NAN;
-        assert!(go(&data, Some(&checker), 5.0).is_some(), "an absent NaN is skipped");
+        assert!(go(&data, Some(&checker), 5.0, &fit).is_some(), "an absent NaN is skipped");
         data[on] = f32::NAN;
-        assert_eq!(go(&data, Some(&checker), 5.0), None, "a present NaN refuses");
+        assert_eq!(go(&data, Some(&checker), 5.0, &fit), None, "a present NaN refuses");
     }
 
     /// A pin (C0's qualifying rules; rim and edge by owner ruling R6; the rim read by `ring_sky` and handed in as B_i

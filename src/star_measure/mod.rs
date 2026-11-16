@@ -239,8 +239,12 @@ pub const MEASURE_VERSION: u32 = 8;
 /// The version of the aperture correction a Bayer mosaic reports from its green sites
 /// ([`PlaneMeasurement::reported_aperture_correction`], OSC zero point): bumped when only that number changes, so
 /// [`MEASURE_VERSION`] and every stored star keep their meaning. 1 = the green-site growth at `5F` divided by
-/// the green lattice density 0.5, the median over up to 64 bright isolated stars.
-pub const CFA_APERTURE_VERSION: u32 = 1;
+/// the green lattice density 0.5, the median over up to 64 bright isolated stars. 2 = each star's growth is
+/// phase-matched to its own fitted model: the green-site sum is scaled by the model's all-sites over green-sites sum
+/// within `5F` (the model point-sampled at the pixel centres, as the fit evaluated it) in place of the constant 0.5,
+/// so the dependence of a green sum on where the star's centre falls on the checkerboard cancels (it was ±10 % per
+/// star at FWHM 1.25 px); a star whose model's green share is outside 0.35 to 0.65 is refused.
+pub const CFA_APERTURE_VERSION: u32 = 2;
 
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
 /// gain, `PsfModel::Auto`, 24 576 stars, no seeds, `FitParams::default()`, no precomputed noise, `Bwmv` (ruling F14:
@@ -581,8 +585,8 @@ pub struct PlaneMeasurement {
     /// The standard error of `aperture_correction` as the median of its ratios ([`FitOutcome::aperture_se`]).
     pub aperture_se: Option<f64>,
     /// The aperture correction a Bayer mosaic measured on its green sites and REPORTED, never applied (OSC zero point,
-    /// ruling O3): the median over up to 64 bright isolated stars of the green-site growth flux at `5F` (over the green
-    /// lattice density 0.5) over the fit's model flux. No fit's `signal` carries it and `aperture_correction` stays
+    /// ruling O3): the median over up to 64 bright isolated stars of the green-site growth flux at `5F` (scaled by the
+    /// star's own model's all-sites over green-sites share, [`CFA_APERTURE_VERSION`] 2) over the fit's model flux. No fit's `signal` carries it and `aperture_correction` stays
     /// `None` on that path. `None` on every other path, and where fewer than 5 stars qualified. See
     /// [`CFA_APERTURE_VERSION`].
     pub reported_aperture_correction: Option<f64>,

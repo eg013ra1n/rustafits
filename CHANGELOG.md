@@ -11,11 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `star_measure::PlaneMeasurement::reported_aperture_correction`, `reported_aperture_stars` and
   `reported_aperture_se`: the aperture correction a Bayer mosaic measures on its green sites, reported apart and never
-  applied. The growth flux at `5F` sums the green sites within the disc and divides by the green lattice density 0.5
-  (a disc whose green share is outside 0.45 to 0.55 refuses the star); every candidate screen is the mono path's.
-  `None` / 0 on every other path.
-- `star_measure::CFA_APERTURE_VERSION` (1): the version of that number, bumped when only it changes.
-  `MEASURE_VERSION` stays 8.
+  applied. The growth flux at `5F` sums the green sites within the disc and scales the sum by the star's own fitted
+  model's all-sites over green-sites sum within `5F` (the model point-sampled at the pixel centres, as the fit
+  evaluated it), so the dependence of a green sum on where the star's centre falls on the checkerboard cancels
+  (±10 % per star at FWHM 1.25 px, ±3 % at 1.5, ±0.5 % at 1.8). A disc whose green share is outside 0.45 to 0.55, or a
+  model whose green share is outside 0.35 to 0.65 or has no light, refuses the star; every candidate screen is the mono
+  path's. `None` / 0 on every other path.
+- `star_measure::CFA_APERTURE_VERSION` (2): the version of that number, bumped when only it changes. 1 divided the
+  green sum by the constant lattice density 0.5; 2 is the phase-matched growth above. `MEASURE_VERSION` stays 8.
 
 No existing output moves: `measure_green_sites` still returns `aperture_correction` `None`, no star's `signal`
 changes, and `aperture_stars`, `aperture_se`, `aperture_ratios` and the population's `aperture_se` are as before.

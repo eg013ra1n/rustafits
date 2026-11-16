@@ -615,6 +615,17 @@ mod tests {
     /// on the odd-row greens), Gaussian noise 4.
     fn integrated_mosaic(
         fwhm: f64,
+        gains: (f64, f64),
+        ped2: f64,
+        seed: u64,
+    ) -> (Vec<f32>, Vec<(f64, f64, f64)>) {
+        integrated_mosaic_beta(fwhm, 2.5, gains, ped2, seed)
+    }
+
+    /// [`integrated_mosaic`] with the stars' wing exponent `beta` stated.
+    fn integrated_mosaic_beta(
+        fwhm: f64,
+        beta: f64,
         (g1, g2): (f64, f64),
         ped2: f64,
         seed: u64,
@@ -637,7 +648,7 @@ mod tests {
             w,
             h,
             &stars,
-            IntegratedProfile::Moffat { fwhm, beta: 2.5 },
+            IntegratedProfile::Moffat { fwhm, beta },
             5,
             0.0,
         );
@@ -657,14 +668,186 @@ mod tests {
         (m, stars)
     }
 
-    /// OSC zero point, O2 / O3: on pixel-integrated Moffat (β 2.5) stars fitted with Moffat 4, `signal · reported c` is the
-    /// star's true flux: the median over stars within 2 %, at FWHM 2 and 3 px, and with the two green sites at gains
-    /// 1.00 / 0.98 and a +3 ADU pedestal on the second (the truth then is the mean green gain's, 0.99, of the scene).
+    /// A round Moffat's analytic flux inside radius `r` (peak `amp`, FWHM `fwhm`, exponent `beta`).
+    fn moffat_flux_within(amp: f64, fwhm: f64, beta: f64, r: f64) -> f64 {
+        let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+        std::f64::consts::PI * alpha * alpha * amp / (beta - 1.0)
+            * (1.0 - (1.0 + r * r / (alpha * alpha)).powf(1.0 - beta))
+    }
+
+    /// One star's growth flux at `5F` on a mosaic's green sites, twice: `(old, new)`. `old` is task 1's (the green sum
+    /// over the constant lattice density 0.5), `new` the phase-matched growth the reported `c` is made of. `f_ring` is
+    /// the plane's `F`, B_i the fit's own ring sky.
+    fn green_growth_old_new(
+        m: &[f32],
+        w: usize,
+        h: usize,
+        p: BayerPattern,
+        f: &crate::star_measure::StarFit,
+        f_ring: f64,
+    ) -> Option<(f64, f64)> {
+        let mask = green_mask(w, h, p);
+        let mut scratch = Vec::new();
+        let new = crate::star_measure::photometry::growth_curve_in(
+            m,
+            Some(&mask),
+            None,
+            w,
+            h,
+            f.x,
+            f.y,
+            f_ring,
+            f.sky_ring,
+            Some(f),
+            &mut scratch,
+        )?;
+        let r2 = (crate::star_measure::photometry::GROWTH_RADIUS_PER_FWHM * f_ring).powi(2);
+        let sum: f64 = (0..w * h)
+            .filter(|&i| {
+                mask[i] && ((i % w) as f64 - f.x).powi(2) + ((i / w) as f64 - f.y).powi(2) <= r2
+            })
+            .map(|i| m[i] as f64 - f.sky_ring)
+            .sum();
+        Some((sum / 0.5, new))
+    }
+
+    /// 16 pixel-integrated Moffat stars (peak `amp` over a sky of 1000 per site, noise 3) on an RGGB mosaic, one at each
+    /// of the checkerboard's 4 x 4 sub-pixel phases `((i + 0.5) / 4, (j + 0.5) / 4)`, 60 px apart (an even pitch keeps
+    /// the parity of the integer part). Returns the mosaic and the stars `(x, y, peak)`.
+    fn phase_grid_mosaic(fwhm: f64, beta: f64, amp: f64, seed: u64) -> (Vec<f32>, Vec<(f64, f64, f64)>) {
+        use crate::test_support::{integrated_field, IntegratedProfile};
+        let (w, h) = (300usize, 300usize);
+        let mut stars = Vec::new();
+        for j in 0..4 {
+            for i in 0..4 {
+                // The peaks differ by a few percent each, so no two pixels share the plane's maximum.
+                let k = (j * 4 + i) as f64;
+                stars.push((
+                    42.0 + 60.0 * i as f64 + (i as f64 + 0.5) / 4.0,
+                    42.0 + 60.0 * j as f64 + (j as f64 + 0.5) / 4.0,
+                    amp * (1.0 - 0.012 * k),
+                ));
+            }
+        }
+        let scene = integrated_field(
+            w,
+            h,
+            &stars,
+            IntegratedProfile::Moffat { fwhm, beta },
+            5,
+            0.0,
+        );
+        let mut m: Vec<f32> = scene.iter().map(|&v| (v as f64 + 1000.0) as f32).collect();
+        add_noise(&mut m, 3.0, seed);
+        (m, stars)
+    }
+
+    /// OSC zero point, spec §5.1 as amended by task 1b: the green sum of a sharp star depends on where its centre falls
+    /// on the checkerboard; the phase-matched growth (the green sum scaled by the star's OWN fitted model's all-sites
+    /// over green-sites sum) does not. Pixel-integrated Moffat stars at FWHM 1.25 to 3 px on a 4 x 4 phase grid, measured
+    /// through the mosaic path, Moffat 4 fits, `c_i = growth / model flux in the FWTM` per star.
+    ///
+    /// The per-star phase spread of `c_i` (largest `|c_i / median − 1|` over the 16 phases) is what `c` is made of, and
+    /// it falls from task 1's 10 % at FWHM 1.25 to under 3 % (and from 6 % to under 3 % at 1.4): old against new is
+    /// printed. The growth against the analytic flux inside `5F` is not the bar for wings the model has: the model is
+    /// fitted on the green sites alone, so `S_d / S_mg` is near 1 and the growth is the MODEL's own total, which a
+    /// point-sampled fit to an undersampled star carries a phase error of (±6 % at FWHM 1.25, in `signal` itself and not
+    /// in `c`). For wings of β 2.5 that error is what is left: within 2 % per phase at FWHM 1.25, median within 1 %.
+    #[test]
+    fn phase_matched_growth_removes_the_checkerboard_phase_from_c() {
+        let p = BayerPattern::Rggb;
+        let spread = |v: &[f64]| {
+            let c = crate::star_measure::tests::median(v.iter().copied());
+            v.iter().fold(0.0f64, |a, x| a.max((x / c - 1.0).abs()))
+        };
+        for beta in [4.0, 2.5] {
+            for fwhm in [1.25, 1.4, 1.6, 2.0, 3.0] {
+                let amp = 8000.0;
+                let (m, stars) = phase_grid_mosaic(fwhm, beta, amp, 17);
+                let pm = measure_green_sites(&m, 300, 300, p, &base(), None);
+                let f_ring = pm.frame.fwhm_px.unwrap_or_else(|| {
+                    panic!(
+                        "β {beta} FWHM {fwhm}: no frame FWHM; seeds {}, fits {}, refused {:?}, frame {:?}",
+                        pm.seeds,
+                        pm.stars.len(),
+                        pm.refused,
+                        pm.frame,
+                    )
+                });
+                let r_ap = crate::star_measure::photometry::GROWTH_RADIUS_PER_FWHM * f_ring;
+                let (mut old_errs, mut new_errs) = (Vec::new(), Vec::new());
+                let (mut cs_old, mut cs_new): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+                for &(sx, sy, peak) in &stars {
+                    let Some((f, (old, new))) = pm
+                        .stars
+                        .iter()
+                        .find(|f| (f.x - sx).hypot(f.y - sy) < 0.7)
+                        .and_then(|f| {
+                            green_growth_old_new(&m, 300, 300, p, f, f_ring).map(|g| (f, g))
+                        })
+                    else {
+                        continue;
+                    };
+                    let truth = moffat_flux_within(peak, fwhm, beta, r_ap);
+                    let model = crate::star_measure::photometry::model_flux_in_fwtm(f);
+                    old_errs.push(old / truth - 1.0);
+                    new_errs.push(new / truth - 1.0);
+                    cs_old.push(old / model);
+                    cs_new.push(new / model);
+                }
+                assert!(
+                    new_errs.len() >= 14,
+                    "β {beta} FWHM {fwhm}: only {} of 16 stars fitted and grown",
+                    new_errs.len()
+                );
+                let max_abs = |v: &[f64]| v.iter().fold(0.0f64, |a, e| a.max(e.abs()));
+                let med = crate::star_measure::tests::median(new_errs.iter().copied());
+                let (so, sn) = (spread(&cs_old), spread(&cs_new));
+                eprintln!(
+                    "phase grid β {beta} FWHM {fwhm} (F {f_ring:.3}, {} phases): c phase spread old (0.5) {so:.4} -> new {sn:.4}; growth/analytic 5F max |error| old {:.4} -> new {:.4}, median new {med:+.5}",
+                    new_errs.len(),
+                    max_abs(&old_errs),
+                    max_abs(&new_errs)
+                );
+                assert!(sn < 0.03, "β {beta} FWHM {fwhm}: c phase spread {sn:.4} (bar 0.03)");
+                if fwhm <= 1.4 {
+                    assert!(
+                        sn < 0.5 * so,
+                        "β {beta} FWHM {fwhm}: c phase spread new {sn:.4} is not under half of the old {so:.4}"
+                    );
+                } else {
+                    assert!(
+                        sn < so + 0.005,
+                        "β {beta} FWHM {fwhm}: c phase spread new {sn:.4} vs old {so:.4}"
+                    );
+                }
+                assert!(
+                    med.abs() < 0.01,
+                    "β {beta} FWHM {fwhm}: median growth / analytic flux {med:+.4} (bar 0.01)"
+                );
+                if beta < 3.0 && fwhm <= 1.25 {
+                    assert!(
+                        max_abs(&new_errs) < 0.02,
+                        "β {beta} FWHM {fwhm}: per-phase growth / analytic flux |error| {:.4} (bar 0.02)",
+                        max_abs(&new_errs)
+                    );
+                }
+            }
+        }
+    }
+
+    /// OSC zero point, O2 / O3 with task 1b: on pixel-integrated Moffat (β 2.5) stars fitted with Moffat 4, `signal ·
+    /// reported c` is the star's true flux: the median over stars within 1 %, at FWHM 1.3, 1.6, 2 and 3 px, and with the
+    /// two green sites at gains 1.00 / 0.98 and a +3 ADU pedestal on the second (the truth then is the mean green gain's,
+    /// 0.99, of the scene). At FWHM 1.3 the per-star spread of the growth over the truth is printed old (task 1's constant
+    /// 0.5) against new.
     #[test]
     fn mosaic_corrected_flux_matches_the_truth() {
         let p = BayerPattern::Rggb;
         let beta = 2.5;
         for (fwhm, gains, ped2) in [
+            (1.3, (1.0, 1.0), 0.0),
+            (1.6, (1.0, 1.0), 0.0),
             (2.0, (1.0, 1.0), 0.0),
             (3.0, (1.0, 1.0), 0.0),
             (2.0, (1.0, 0.98), 3.0),
@@ -677,7 +860,9 @@ mod tests {
             });
             let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
             let mean_gain = 0.5 * (gains.0 + gains.1);
-            let mut ratios: Vec<f64> = Vec::new();
+            let f_ring = pm.frame.fwhm_px.expect("frame FWHM");
+            let (mut ratios, mut old_g, mut new_g): (Vec<f64>, Vec<f64>, Vec<f64>) =
+                (Vec::new(), Vec::new(), Vec::new());
             for f in &pm.stars {
                 let Some(t) = stars
                     .iter()
@@ -687,14 +872,28 @@ mod tests {
                 };
                 let total = std::f64::consts::PI * alpha * alpha * t.2 / (beta - 1.0) * mean_gain;
                 ratios.push(f.signal * c / total);
+                if let Some((old, new)) = green_growth_old_new(&m, 400, 400, p, f, f_ring) {
+                    let model = crate::star_measure::photometry::model_flux_in_fwtm(f);
+                    old_g.push(f.signal * (old / model) / total);
+                    new_g.push(f.signal * (new / model) / total);
+                }
             }
             assert!(ratios.len() >= 10, "FWHM {fwhm}: {} stars matched", ratios.len());
             let med = crate::star_measure::tests::median(ratios.iter().copied());
+            let mad = |v: &[f64]| {
+                let c = crate::star_measure::tests::median(v.iter().copied());
+                crate::star_measure::tests::median(v.iter().map(|x| (x - c).abs()))
+            };
             eprintln!(
-                "mosaic truth, FWHM {fwhm} gains {gains:?} ped {ped2}: c {c:.4} ({} stars, se {:?}), median signal*c/true {med:.4} over {} stars",
+                "mosaic truth, FWHM {fwhm} gains {gains:?} ped {ped2}: c {c:.4} ({} stars, se {:?}), median signal*c/true {med:.4} over {} stars; per-star growth/true MAD old {:.4} new {:.4} (medians {:.4} / {:.4}, {} stars)",
                 pm.reported_aperture_stars,
                 pm.reported_aperture_se,
-                ratios.len()
+                ratios.len(),
+                mad(&old_g),
+                mad(&new_g),
+                crate::star_measure::tests::median(old_g.iter().copied()),
+                crate::star_measure::tests::median(new_g.iter().copied()),
+                new_g.len()
             );
             assert!(
                 (med - 1.0).abs() < 0.01,
