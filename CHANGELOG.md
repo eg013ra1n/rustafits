@@ -19,17 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path's. `None` / 0 on every other path.
 - `star_measure::CFA_APERTURE_VERSION` (2): the version of that number, bumped when only it changes. 1 divided the
   green sum by the constant lattice density 0.5; 2 is the phase-matched growth above. `MEASURE_VERSION` stays 8.
-- `star_measure::analysis_mode::measure_raw_frame_and_list`, `ListRequest`, `ListFit` and `ListMeasurement` (the last
-  three `#[non_exhaustive]`), and the constant `LIST_C_STARS` (256): the Analysis measurement, then a caller's list of
-  native-pixel positions fitted on the same plane (mono, a mosaic's green sites, a debayered file's G plane). The
-  caller's closure builds the request from the measurement; the list is fitted at the measurement's β and field width
-  with the saturation verdict and the plane's mask, a detected star other than a list star's own detection keeps its
-  `3F` disc out of the ring sky, and the list's own aperture correction `c` is measured over up to 256 kept fits
-  (accepted, not saturated or near the clip, centred within the request's tolerance) through Analysis' own `c`
-  screens, the masked phase-matched growth on a mosaic. Each fit returns its fitted centre, model flux, `flux` (model
-  flux times `c`), SNR, flags and whether it was kept; `c` returns apart with its stars and error. No list is measured
-  on a trailed or defocused plane (the closure is not called), for an empty request or for a tolerance or cap that is
-  not positive.
+- `star_measure::analysis_mode::measure_raw_frame_and_list`, `ListRequest`, `ListFit`, `ListMeasurement` and `ListRefusal`
+  (the last four `#[non_exhaustive]`), and the constant `LIST_C_STARS` (256): the Analysis measurement, then a caller's
+  list of native-pixel positions fitted on the same plane (mono, a mosaic's green sites). The caller's closure builds the
+  request from the measurement; the list is fitted at the measurement's β and field width with the saturation verdict and
+  the plane's mask, the near-clip class is the measured plane's own clip floor, and a detected star other than a list
+  star's own detection (the nearest one within the larger of the tolerance and one field FWHM) keeps its `3F` disc out of
+  the ring sky. The list's own aperture correction `c` is measured over up to 256 kept fits (accepted, not saturated or
+  near the clip, centred within the request's tolerance, the tolerance applied before `c`'s own screens) through
+  Analysis' own `c` screens, the masked phase-matched growth on a mosaic. Each fit returns its fitted centre, model flux,
+  `flux` (model flux times `c`), SNR, flags and whether it was kept; `c` returns apart with its stars and error. No list
+  is measured on a trailed or defocused plane (the closure is not called and the result is `None`: the plane's verdict is
+  the reason), for an empty request or for a tolerance or cap that is not positive. A debayered three-plane file returns
+  an empty `ListMeasurement` with `refusal == Some(ListRefusal::ColourFrame)`. With the `test-support` feature,
+  `ListFit::test_kept` / `test_refused` and `ListMeasurement::test_new` build rows for a caller's own tests.
 
 The Analysis measurement is bit-identical with and without a list (a test pins every `StarFit` field, every
 `FrameSummary` field and every `PlaneMeasurement` field but the wall-clock `timings` / `sub_steps`, on a mono frame,

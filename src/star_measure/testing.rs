@@ -35,3 +35,52 @@ impl crate::star_measure::StarFit {
         }
     }
 }
+
+/// The list entry's rows for a caller's own tests (`ListFit` and `ListMeasurement` are `#[non_exhaustive]`, so a caller
+/// outside this crate cannot spell them): build one, then set the public fields a case needs.
+impl crate::star_measure::analysis_mode::ListFit {
+    /// A kept fit at `(x, y)` with `flux`: accepted, kept, unflagged, centred on its position, SNR 50, model flux = `flux`
+    /// (`c = 1`).
+    #[doc(hidden)]
+    pub fn test_kept(x: f64, y: f64, flux: f64) -> Self {
+        crate::star_measure::analysis_mode::ListFit {
+            x,
+            y,
+            model_flux: flux,
+            flux,
+            snr: 50.0,
+            flags: crate::star_measure::StarFlags::default(),
+            accepted: true,
+            kept: true,
+            centre_offset_px: 0.0,
+        }
+    }
+
+    /// A position that was refused: NaN numbers, both flags false.
+    #[doc(hidden)]
+    pub fn test_refused() -> Self {
+        crate::star_measure::list::refused_fit()
+    }
+}
+
+impl crate::star_measure::analysis_mode::ListMeasurement {
+    /// A list of `fits` with aperture correction `aperture_correction` over `aperture_stars` stars: β 4, ring width 3 px,
+    /// no standard error, no refusals.
+    #[doc(hidden)]
+    pub fn test_new(
+        fits: Vec<crate::star_measure::analysis_mode::ListFit>,
+        aperture_correction: Option<f64>,
+        aperture_stars: usize,
+    ) -> Self {
+        crate::star_measure::analysis_mode::ListMeasurement {
+            fits,
+            aperture_correction,
+            aperture_stars,
+            aperture_se: None,
+            beta: 4.0,
+            ring_fwhm: Some(3.0),
+            refused: crate::star_measure::RefusalCounts::default(),
+            refusal: None,
+        }
+    }
+}

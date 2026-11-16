@@ -2040,6 +2040,10 @@ pub(super) struct Correction<'a> {
     pub(super) max_c_stars: usize,
     /// Fewer than 5 qualifiers is one `warn!` per plane (`true`, as before); the list entry says it in a `debug!`.
     pub(super) warn_short_c: bool,
+    /// `c`'s candidates are the fits whose fitted centre is within this many px of their seed (the list entry's kept
+    /// tolerance, applied before `c`'s own screens so `c` is over the kept fits and no second pass is needed); `None` =
+    /// every fit is a candidate, as before.
+    pub(super) max_centre_offset: Option<f64>,
 }
 
 impl Default for Correction<'_> {
@@ -2062,6 +2066,7 @@ impl Default for Correction<'_> {
             masked_growth: false,
             max_c_stars: super::photometry::CORRECTION_STARS,
             warn_short_c: true,
+            max_centre_offset: None,
         }
     }
 }
@@ -2646,12 +2651,19 @@ fn ring_and_correction(
         ),
         None => {
             let _s = super::substeps::span(correction.timers, super::Step::ApertureC);
+            // The list entry's kept tolerance, before `c`'s screens: a fit centred off its position is not a candidate.
+            let centred: Option<Vec<(usize, StarFit)>> = correction.max_centre_offset.map(|tol| {
+                kept.iter()
+                    .filter(|(k, f)| (f.x - seeds[*k].x).hypot(f.y - seeds[*k].y) <= tol)
+                    .copied()
+                    .collect()
+            });
             let (c, stars, se, mut screens) = super::photometry::aperture_correction(
                 data,
                 mask,
                 w,
                 h,
-                kept,
+                centred.as_deref().unwrap_or(kept),
                 all_seeds,
                 own,
                 field_fwhm,

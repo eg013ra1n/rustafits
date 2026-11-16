@@ -516,6 +516,7 @@ impl FitStarsOptions<'_> {
             masked_growth: false,
             max_c_stars: photometry::CORRECTION_STARS,
             warn_short_c: true,
+            max_centre_offset: None,
         }
     }
 }
@@ -1356,6 +1357,7 @@ fn prepare_working(
         &pass_seeds,
         head.field_width,
         head.saturation,
+        None,
     );
     drop(pass_seeds);
     PlanePrep {
@@ -1630,6 +1632,7 @@ fn prepare_passes(
     seeds: &[Seed],
     field_width: FieldWidth,
     saturation: SaturationPlane,
+    given_floor: Option<(Option<f64>, usize)>,
 ) -> Passes {
     let t = Instant::now();
     let pass_call = || {
@@ -1650,13 +1653,18 @@ fn prepare_passes(
     // The plane's near-clip floor (Task 10c, R10c-10) comes from the plane's own verdicts, so clause 3 is re-read here,
     // before the cross-plane rule; level and fit are untouched.
     let mut saturation = saturation;
-    let floor = photometry::derive_clip_floor(
-        &saturation,
-        passes.iter().filter_map(|p| match &p.verdict {
-            Some(Ok(v)) => Some(v),
-            _ => None,
-        }),
-    );
+    // `given_floor` is a plane's own floor handed in (the list entry reads the measured plane's, not one re-derived
+    // from the list's seeds): `(floor in working units, evidence)`, `(None, _)` = the plane has no near-clip class.
+    let floor = match given_floor {
+        Some((floor, evidence)) => floor.map(|f| (f, evidence)),
+        None => photometry::derive_clip_floor(
+            &saturation,
+            passes.iter().filter_map(|p| match &p.verdict {
+                Some(Ok(v)) => Some(v),
+                _ => None,
+            }),
+        ),
+    };
     saturation.clip_floor = floor.map(|(f, _)| f);
     saturation.clip_evidence = floor.map_or(0, |(_, n)| n);
     for pass in passes.iter_mut() {
@@ -1985,6 +1993,7 @@ fn measure_budget(
         &sub,
         field_width,
         saturation,
+        None,
     );
     let Passes {
         fit_field,

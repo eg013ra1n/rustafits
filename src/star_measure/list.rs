@@ -4,8 +4,10 @@
 //!
 //! The list is fitted with the budget path's halves ([`super::measure_budget`]) on the same plane: the saturation plane
 //! from the measurement's own noise and sky, the verdict pass over the list's seeds at the measurement's field width,
-//! then [`fit::fit_after_passes`] at the measurement's β with the plane's mask. [`super::fit_stars_at`] is not used: it
-//! runs no saturation verdict and masks no detected neighbour in the ring sky, and a list star needs both.
+//! then [`fit::fit_after_passes`] at the measurement's β with the plane's mask. The near-clip class reads the
+//! MEASURED plane's clip floor ([`PlaneMeasurement::clip_floor`]), never one re-derived from the list's seeds (a list
+//! holds few or no clipped stars, so its own evidence would miss a floor the plane shows). [`super::fit_stars_at`] is
+//! not used: it runs no saturation verdict and masks no detected neighbour in the ring sky, and a list star needs both.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,12 +16,13 @@ use crate::star_measure::analysis_mode::{ListFit, ListMeasurement, ListRequest};
 use crate::star_measure::fit::{self, Correction, Neighbours};
 use crate::star_measure::{
     domain, install_in_span, mask_mismatch, photometry, prepare_passes, saturation_plane,
-    ApertureNoise, Passes, Domain, FitParams, PlaneMeasurement, PsfModel, Seed, SnrNoise, StarFit, StarFlags,
+    ApertureNoise, Domain, FitParams, Passes, PlaneMeasurement, PsfModel, Seed, SnrNoise,
+    StarFlags,
 };
 
 /// The plane a list is fitted on, as the measurement read it: the pixels, the domain, the mask of the pixels that carry
-/// the plane's own colour (a mosaic's green sites), whether the growth is masked and whether it is one plane of a
-/// debayered colour image.
+/// the plane's own colour (a mosaic's green sites) and whether the growth is masked. A debayered colour file has no
+/// list (the entry refuses it), so the plane is never one plane of a colour image.
 pub(crate) struct ListPlane<'a> {
     pub(crate) plane: &'a [f32],
     pub(crate) w: usize,
@@ -27,37 +30,50 @@ pub(crate) struct ListPlane<'a> {
     pub(crate) domain: Domain,
     pub(crate) mask: Option<&'a [bool]>,
     pub(crate) mosaic: bool,
-    pub(crate) colour: bool,
 }
 
-/// The seeds of `detected` that are not within `tol` px of a seed of `listed`: a list star's own detection sits at
-/// distance about 0 and would fail `c`'s isolation test, so no list star would ever qualify for `c`. A cell grid of side
-/// `tol` over `listed`, so the cost is linear.
-fn without_coinciding(detected: &[Seed], listed: &[Seed], tol: f64) -> Vec<Seed> {
-    let cell = |x: f64, y: f64| ((x / tol).floor() as i64, (y / tol).floor() as i64);
+/// The seeds of `detected` less each list star's own detection: for every seed of `listed`, the NEAREST detected seed
+/// within `radius` px (ties to the lower index). A list star's own detection sits at distance about 0 and would fail `c`'s
+/// isolation test, so no list star would ever qualify for `c`; `radius` is larger than the kept tolerance because a
+/// mosaic's detection is a `2s + 0.5` centroid of the green-sum plane, up to about a pixel off the star's true position,
+/// which the list position (a catalogue's) is not. Only the nearest is taken: a second detection near a list star is a
+/// neighbour. A cell grid of side `radius` over `detected`, so the cost is linear.
+fn without_own_detections(detected: &[Seed], listed: &[Seed], radius: f64) -> Vec<Seed> {
+    let cell = |x: f64, y: f64| ((x / radius).floor() as i64, (y / radius).floor() as i64);
     let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-    for (j, s) in listed.iter().enumerate() {
-        grid.entry(cell(s.x, s.y)).or_default().push(j);
+    for (j, d) in detected.iter().enumerate() {
+        grid.entry(cell(d.x, d.y)).or_default().push(j);
+    }
+    let mut own = vec![false; detected.len()];
+    for l in listed {
+        let (cx, cy) = cell(l.x, l.y);
+        let mut nearest: Option<(f64, usize)> = None;
+        for gx in cx - 1..=cx + 1 {
+            for gy in cy - 1..=cy + 1 {
+                for &j in grid.get(&(gx, gy)).into_iter().flatten() {
+                    let d = (detected[j].x - l.x).hypot(detected[j].y - l.y);
+                    if d <= radius
+                        && nearest.map_or(true, |(best, bj)| d < best || (d == best && j < bj))
+                    {
+                        nearest = Some((d, j));
+                    }
+                }
+            }
+        }
+        if let Some((_, j)) = nearest {
+            own[j] = true;
+        }
     }
     detected
         .iter()
-        .filter(|d| {
-            let (cx, cy) = cell(d.x, d.y);
-            !(cx - 1..=cx + 1).any(|gx| {
-                (cy - 1..=cy + 1).any(|gy| {
-                    grid.get(&(gx, gy)).is_some_and(|at| {
-                        at.iter()
-                            .any(|&j| (listed[j].x - d.x).hypot(listed[j].y - d.y) <= tol)
-                    })
-                })
-            })
-        })
-        .copied()
+        .zip(&own)
+        .filter(|(_, &o)| !o)
+        .map(|(d, _)| *d)
         .collect()
 }
 
 /// A list fit that was not made, or was refused: NaN numbers, both flags false.
-fn refused_fit() -> ListFit {
+pub(crate) fn refused_fit() -> ListFit {
     ListFit {
         x: f64::NAN,
         y: f64::NAN,
@@ -72,9 +88,11 @@ fn refused_fit() -> ListFit {
 }
 
 /// Fit `req`'s positions on `input` (`pm` is the plane's own measurement, `detected` its detected seeds in native
-/// pixels: the matched filter's on a mono or G plane, the green-sum filter's on a mosaic) and measure `c` over the
-/// kept fits. `None` (always with a `warn!` or `debug!` that says why) when the request cannot be measured: no
-/// position, no usable tolerance or `c` cap, a plane or mask that does not match its geometry.
+/// pixels: the matched filter's on a mono plane, the green-sum filter's on a mosaic) and measure `c` over the
+/// kept fits: the centre tolerance is applied to `c`'s candidates before its own screens (isolation, footprint, clip,
+/// SNR), so `c` is over the kept fits and over no other, in the one fit call. `None` (always with a `warn!` or `debug!`
+/// that says why) when the request cannot be measured: no position, no usable tolerance or `c` cap, a plane or mask that
+/// does not match its geometry.
 pub(crate) fn measure_list(
     input: &ListPlane<'_>,
     pm: &PlaneMeasurement,
@@ -83,6 +101,14 @@ pub(crate) fn measure_list(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Option<ListMeasurement> {
     let (w, h) = (input.w, input.h);
+    if w == 0 || h == 0 {
+        tracing::debug!(
+            width = w,
+            height = h,
+            "list: an empty plane; nothing measured"
+        );
+        return None;
+    }
     if req.positions.is_empty() {
         tracing::debug!("list: no position asked; nothing measured");
         return None;
@@ -112,14 +138,20 @@ pub(crate) fn measure_list(
     let mask = input.mask;
     let working = domain::to_working_units(input.plane, &input.domain);
     let working: &[f32] = &working;
-    let saturation = saturation_plane(working, mask, &pm.noise, &pm.sky, &input.domain, input.colour);
+    let saturation = saturation_plane(working, mask, &pm.noise, &pm.sky, &input.domain, false);
 
     // The seeds: a position on the plane (a refused one keeps its NaN row), the working plane at its nearest present
     // pixel less the sky median as its peak and flux, which the verdict pass reads for its plateau tests.
     let mut seeds: Vec<Seed> = Vec::with_capacity(req.positions.len());
     let mut request_of: Vec<usize> = Vec::with_capacity(req.positions.len());
     for (r, &(x, y)) in req.positions.iter().enumerate() {
-        if !(x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 && x <= (w - 1) as f64 && y <= (h - 1) as f64) {
+        if !(x.is_finite()
+            && y.is_finite()
+            && x >= 0.0
+            && y >= 0.0
+            && x <= (w - 1) as f64
+            && y <= (h - 1) as f64)
+        {
             continue;
         }
         let i = y.round() as usize * w + x.round() as usize;
@@ -156,16 +188,24 @@ pub(crate) fn measure_list(
             beta: pm.beta,
             ring_fwhm: None,
             refused: Default::default(),
+            refusal: None,
         });
     }
 
-    // The ring sky and `c`'s isolation read every detected seed except a list star's own detection, then the list.
-    let mut neighbour_seeds = without_coinciding(detected, &seeds, tol);
+    // The ring sky and `c`'s isolation read every detected seed except a list star's own detection (the nearest one
+    // within max(tolerance, 1 F_field), R2), then the list.
+    let own_radius = if pm.field_width.fwhm_px.is_finite() {
+        tol.max(pm.field_width.fwhm_px)
+    } else {
+        tol
+    };
+    let mut neighbour_seeds = without_own_detections(detected, &seeds, own_radius);
     let first = neighbour_seeds.len();
     neighbour_seeds.extend_from_slice(&seeds);
     let of_fit: Vec<usize> = (first..first + seeds.len()).collect();
 
     let fit_params = FitParams::default();
+    let (bg, range) = (saturation.bg, saturation.range);
     let passes = prepare_passes(
         working,
         w,
@@ -176,6 +216,8 @@ pub(crate) fn measure_list(
         &seeds,
         pm.field_width,
         saturation,
+        // R3: the near-clip class is the plane's own floor, `(floor - bg) / range` in range units on the measurement.
+        Some((pm.clip_floor.map(|r| bg + r * range), pm.clip_evidence)),
     );
     let Passes {
         fit_field,
@@ -220,6 +262,7 @@ pub(crate) fn measure_list(
                 masked_growth: input.mosaic,
                 max_c_stars: req.max_c_stars,
                 warn_short_c: false,
+                max_centre_offset: Some(tol),
                 ..Default::default()
             },
             None,
@@ -232,14 +275,11 @@ pub(crate) fn measure_list(
     let outcome = install_in_span(pool, fit_call);
 
     // Kept: accepted, not saturated (the verdict pass's saturated and near-clip classes), centred within the tolerance.
-    let mut kept_fits: Vec<(usize, StarFit)> = Vec::new();
-    let mut accepted_unsaturated = 0usize;
+    // `c` (the fit call's reported one) is over exactly these fits: `max_centre_offset` is the same test.
     for (f, &fit_seed) in outcome.fits.iter().zip(&outcome.fit_seeds) {
         let r = request_of[fit_seed];
         let (px, py) = req.positions[r];
         let offset = (f.x - px).hypot(f.y - py);
-        let kept = !f.flags.saturated() && offset.is_finite() && offset <= tol;
-        accepted_unsaturated += usize::from(!f.flags.saturated());
         fits[r] = ListFit {
             x: f.x,
             y: f.y,
@@ -248,42 +288,12 @@ pub(crate) fn measure_list(
             snr: f.snr,
             flags: f.flags,
             accepted: true,
-            kept,
+            kept: !f.flags.saturated() && offset.is_finite() && offset <= tol,
             centre_offset_px: offset,
         };
-        if kept {
-            kept_fits.push((fit_seed, *f));
-        }
     }
-
-    // `c` over the kept fits. The fit call measured it over every accepted unsaturated fit, which is the same set unless
-    // a fit was centred off its position; then it is measured again over the kept ones alone.
-    let (c, stars, se) = if kept_fits.len() == accepted_unsaturated {
-        let r = outcome.reported_aperture;
-        (r.correction, r.stars, r.se)
-    } else {
-        let (c, stars, se, _) = photometry::aperture_correction(
-            working,
-            mask,
-            w,
-            h,
-            &kept_fits,
-            &neighbour_seeds,
-            Some(&of_fit),
-            fit_field.fwhm_px,
-            outcome.ring_fwhm,
-            Some(&saturation),
-            None,
-            None,
-            None,
-            None,
-            false,
-            input.mosaic,
-            req.max_c_stars,
-            false,
-        );
-        (c, stars, se)
-    };
+    let reported = outcome.reported_aperture;
+    let (c, stars, se) = (reported.correction, reported.stars, reported.se);
     if let Some(c) = c {
         for lf in fits.iter_mut().filter(|lf| lf.accepted) {
             lf.flux = lf.model_flux * c;
@@ -305,5 +315,6 @@ pub(crate) fn measure_list(
         beta: pm.beta,
         ring_fwhm: outcome.ring_fwhm,
         refused: outcome.refused,
+        refusal: None,
     })
 }
