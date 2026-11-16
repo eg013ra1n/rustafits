@@ -166,7 +166,8 @@ pub struct ListPlacement {
     pub radius_px: f64,
     /// The radii of [`ListAperture::extra_sums`], px.
     pub extra_radii_px: Vec<f64>,
-    /// The sky annulus' inner radius, px.
+    /// The sky annulus' inner radius, px. At least the largest radius (`radius_px` and `extra_radii_px`) plus 0.75: a
+    /// placement whose annulus reaches into a disc is unusable, as the disc's pixels would count in the sky.
     pub annulus_start_px: f64,
     /// The sky annulus' area, px² (its pixel count, whatever the plane's colour).
     pub annulus_area_px: f64,
@@ -196,13 +197,16 @@ impl ListPlacement {
         }
     }
 
-    /// Every number a sum needs is a usable one: radii and the annulus positive and finite, the peak radius not
+    /// Every number a sum needs is a usable one: radii and the annulus positive and finite, the annulus clear of every
+    /// disc (it starts at the largest radius plus 0.75, the disc's edge pixels' reach, or beyond), the peak radius not
     /// negative.
     pub(crate) fn is_usable(&self) -> bool {
         let positive = |v: f64| v.is_finite() && v > 0.0;
+        let r_max = self.extra_radii_px.iter().copied().fold(self.radius_px, f64::max);
         positive(self.radius_px)
             && self.extra_radii_px.iter().all(|&r| positive(r))
             && positive(self.annulus_start_px)
+            && self.annulus_start_px >= r_max + 0.75
             && positive(self.annulus_area_px)
             && self.peak_radius_px.is_finite()
             && self.peak_radius_px >= 0.0
@@ -1144,8 +1148,9 @@ mod tests {
     }
 
     /// A placement that reads what `place` is given: the first pass's fitted centre of every accepted star (the request's
-    /// own position for one that was not), refitted and summed. Radii in the stars' FWHM: the disc at `4 F`, extras at
-    /// `3 F` and `6 F`, the sky annulus beyond the rendered stars' reach.
+    /// own position for one that was not) is refitted, and the sums are at the request's own positions (a catalogue's:
+    /// the tests put them 0.1 px off the stars). Radii in the stars' FWHM: the disc at `4 F`, extras at `3 F` and
+    /// `6 F`, the sky annulus beyond the rendered stars' reach.
     fn place_at_fits(
         positions: Vec<(f64, f64)>,
         fwhm: f64,
@@ -1157,8 +1162,8 @@ mod tests {
                 .map(|(f, &p)| if f.accepted { (f.x, f.y) } else { p })
                 .collect();
             Some(ListPlacement::new(
-                moved.clone(),
                 moved,
+                positions.clone(),
                 4.0 * fwhm,
                 vec![3.0 * fwhm, 6.0 * fwhm],
                 (6.0 * fwhm).max(6.0) + 4.0,
@@ -1403,12 +1408,15 @@ mod tests {
     }
 
     /// A list star's ring sky is read with every detected, unlisted star's `3F` disc out of it. Eight list stars each have
-    /// an unlisted companion 11 F away (inside its ring), and the fit's SNR (which reads the ring sky) matches the field
-    /// without the companions: each within 2 % and their median within 1 %, the residue being the companion's own wing
-    /// outside the masked disc (ring scatter up by about 1 %, either sign per star: measured -1.3 % to +0.3 %, median
-    /// -0.7 %). The control, the same frame read with no detected neighbour to mask, loses more than half of every SNR.
+    /// an unlisted companion 11 F away (inside its ring). The reference is the same list measured on the companion-free
+    /// plane with the companion frame's own measurement and detections: the same discs are masked at the same F and the
+    /// ring is the same pixels, so only the companions' light differs, and the fit's SNR (which reads the ring sky) must
+    /// match to the plan's 0.5 % on the median, with no star more than 2 % off (what is left is the companion's own wing
+    /// outside its masked disc: measured 0.988 to 1.003, median 0.995). The control, the companion
+    /// frame read with no detected neighbour to mask, loses more than half of every SNR.
     #[test]
     fn an_unlisted_neighbour_does_not_lift_the_ring_sky() {
+        use crate::star_measure::list::{measure_list, ListPlane};
         let (w, h) = (500, 500);
         let fwhm = 3.0;
         let stars = scattered(8, w, h, 100.0, 70.0, (3000.0, 5000.0), 5);
@@ -1446,8 +1454,8 @@ mod tests {
             raw(RawPlanes::Mono(p), w, h, 1)
         };
         let positions: Vec<(f64, f64)> = stars.iter().map(|s| (s.0, s.1)).collect();
-        let (_, without) = run_list(&frame_of(&[]), &positions, fwhm);
-        let (pm, with) = run_list(&frame_of(&companions), &positions, fwhm);
+        let with_frame = frame_of(&companions);
+        let (pm, with) = run_list(&with_frame, &positions, fwhm);
         for b in &companions {
             assert!(
                 pm.detected
@@ -1456,10 +1464,26 @@ mod tests {
                 "premise: the unlisted companion {b:?} is detected"
             );
         }
+        let measure_on = |frame: &RawFrame, detected: &[crate::star_measure::Seed]| {
+            let RawPlanes::Mono(plane) = &frame.planes else {
+                unreachable!()
+            };
+            let input = ListPlane {
+                plane,
+                w,
+                h,
+                domain: RAW,
+                mask: None,
+            };
+            let req = ListRequest::new(positions.clone(), 1.0);
+            measure_list(&input, &pm, detected, &req, |_| None, None).expect("measured")
+        };
+        // The reference: the companion-free plane, the companion frame's detections (the same discs masked at the same F).
+        let reference = measure_on(&frame_of(&[]), &pm.detected);
         // (The field's brightest star can read as clipped by the plane-max amplitude clause, and a brighter companion
         // lifts the plane max and clears it: only the stars kept in both runs are compared.)
         let mut ratios = Vec::new();
-        for (a, b) in without.fits.iter().zip(&with.fits) {
+        for (a, b) in reference.fits.iter().zip(&with.fits) {
             if a.kept && b.kept {
                 ratios.push(b.snr / a.snr);
                 assert!(
@@ -1472,26 +1496,20 @@ mod tests {
         }
         assert!(ratios.len() >= 6, "{} kept", ratios.len());
         let median = crate::star_measure::tests::median(ratios.iter().copied());
-        assert!((median - 1.0).abs() < 0.01, "median snr ratio {median}");
+        assert!(
+            (median - 1.0).abs() < 0.005,
+            "median snr ratio {median} over {ratios:?}"
+        );
         // Control: with no detected neighbour to keep out of the ring, the companions' cores are in it.
-        use crate::star_measure::list::{measure_list, ListPlane};
-        let RawPlanes::Mono(with_plane) = &frame_of(&companions).planes else {
-            unreachable!()
-        };
-        let input = ListPlane {
-            plane: with_plane,
-            w,
-            h,
-            domain: RAW,
-            mask: None,
-        };
-        let req = ListRequest::new(positions.clone(), 1.0);
-        let bare = measure_list(&input, &pm, &[], &req, |_| None, None).expect("measured");
-        for (a, b) in without.fits.iter().zip(&bare.fits) {
+        let bare = measure_on(&with_frame, &[]);
+        let mut controlled = 0;
+        for (a, b) in reference.fits.iter().zip(&bare.fits) {
             if a.kept && b.accepted {
+                controlled += 1;
                 assert!(b.snr < 0.5 * a.snr, "unmasked snr {} against {}", b.snr, a.snr);
             }
         }
+        assert!(controlled >= 6, "{controlled} controlled");
     }
 
     #[test]
@@ -1871,6 +1889,30 @@ mod tests {
         );
         let bad = bad.expect("measured");
         assert!(bad.refits.is_empty() && bad.apertures.is_empty());
+        // An annulus that starts inside the largest disc (here the extra radius's, 18 + 0.75 > 18.5) is unusable too, and
+        // one that starts at it is not.
+        let placed = |start: f64| {
+            ListPlacement::new(
+                positions.clone(),
+                positions.clone(),
+                12.0,
+                vec![18.0],
+                start,
+                2000.0,
+                4.0,
+            )
+        };
+        assert!(!placed(18.5).is_usable());
+        assert!(placed(18.75).is_usable());
+        let (_, overlapping) = measure_raw_frame_and_list(
+            &frame,
+            &FrameOptions::default(),
+            None,
+            |_| Some(ListRequest::new(positions.clone(), 1.0)),
+            |_| Some(placed(18.5)),
+        );
+        let overlapping = overlapping.expect("measured");
+        assert!(overlapping.refits.is_empty() && overlapping.apertures.is_empty());
         // The request refused (a tolerance that is not positive): `place` is not called.
         let called = std::cell::Cell::new(false);
         let (_, none) = measure_raw_frame_and_list(

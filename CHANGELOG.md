@@ -38,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data, the quantum taken from the data: 1 on a 16-bit camera, 4 or 16 on a 14- or 12-bit one scaled to 16 bits; the
   plain median otherwise), with the annulus' scatter and the highest pixel within a peak radius. `on_frame` is false
   and every number NaN when the annulus or a disc leaves the plane, a site pixel in a disc is not finite or the annulus
-  holds no present pixel. `ListMeasurement` also carries the second pass's fits (`refits`), the plane's near-clip level
+  holds no present pixel. A placement whose annulus starts inside the largest disc (less than its radius plus 0.75 px) is
+  unusable and ends the list with the first fits alone. The quantum is read from the window's gaps, each a whole
+  multiple of it, so a float file's `f32`-coded lattice stays quantised. `ListMeasurement` also carries the second pass's fits (`refits`), the plane's near-clip level
   in working units (`clip_level`), the refusals of both passes and the wall time of the three steps (`ListTimings`). No
   list is measured on a trailed or defocused plane (neither callback is called and the result is `None`: the plane's
   verdict is the reason), for an empty request or for a tolerance that is not positive. A debayered three-plane file

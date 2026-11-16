@@ -41,11 +41,12 @@ pub(crate) struct ListPlane<'a> {
 }
 
 /// The seeds of `detected` less each list star's own detection: for every seed of `listed`, the NEAREST detected seed
-/// within `radius` px (ties to the lower index). A list star's own detection sits at distance about 0 and would fail `c`'s
-/// isolation test, so no list star would ever qualify for `c`; `radius` is larger than the kept tolerance because a
-/// mosaic's detection is a `2s + 0.5` centroid of the green-sum plane, up to about a pixel off the star's true position,
-/// which the list position (a catalogue's) is not. Only the nearest is taken: a second detection near a list star is a
-/// neighbour. A cell grid of side `radius` over `detected`, so the cost is linear.
+/// within `radius` px (ties to the lower index). A list star's own detection sits at distance about 0 and would be read
+/// as a neighbour of the star itself, so with `blend_refusal` on every list star would be refused as a `Blend`; `radius`
+/// is larger than the kept tolerance because a mosaic's detection is a `2s + 0.5` centroid of the green-sum plane, up to
+/// about a pixel off the star's true position, which the list position (a catalogue's) is not. Only the nearest is
+/// taken: a second detection near a list star is a neighbour. A cell grid of side `radius` over `detected`, so the cost
+/// is linear.
 fn without_own_detections(detected: &[Seed], listed: &[Seed], radius: f64) -> Vec<Seed> {
     let cell = |x: f64, y: f64| ((x / radius).floor() as i64, (y / radius).floor() as i64);
     let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
@@ -100,10 +101,10 @@ pub(crate) struct Pass {
     pub(crate) refused: RefusalCounts,
     pub(crate) ring_fwhm: Option<f64>,
     /// The fit call's own aperture correction and the stars it was measured over: `Some(1.0)` over 0 on every pass (the
-    /// given unit correction; no growth curve ran).
-    #[allow(dead_code)]
+    /// given unit correction; no growth curve ran). Read by one test only.
+    #[cfg(test)]
     pub(crate) aperture_correction: Option<f64>,
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) aperture_stars: usize,
 }
 
@@ -239,7 +240,9 @@ impl<'a> PassContext<'a> {
                 fits,
                 refused: RefusalCounts::default(),
                 ring_fwhm: None,
+                #[cfg(test)]
                 aperture_correction: None,
+                #[cfg(test)]
                 aperture_stars: 0,
             };
         }
@@ -343,7 +346,9 @@ impl<'a> PassContext<'a> {
             fits,
             refused: outcome.refused,
             ring_fwhm: outcome.ring_fwhm,
+            #[cfg(test)]
             aperture_correction: outcome.aperture_correction,
+            #[cfg(test)]
             aperture_stars: outcome.aperture_stars,
         }
     }
