@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `measure_raw_frame_and_list`: on a Bayer mosaic the first callback's `PlaneMeasurement::detected` carries the matched
+  filter's seeds, as on a mono plane: in the frame's own pixels (file row order, the pixels of the stars' fits), each
+  peak the green-sum peak halved in the plane's working units (about 0.8 of the star's brightest green site above the
+  sky, on the scale of `noise.sigma`), each flux the green sites' own sum. They are lent to the callback only: the
+  returned measurement and every figure of it are unchanged (`detected` stays empty on a mosaic).
 - `star_measure::PlaneMeasurement::reported_aperture_correction`, `reported_aperture_stars` and
   `reported_aperture_se`: the aperture correction a Bayer mosaic measures on its green sites, reported apart and never
   applied. The growth flux at `5F` sums the green sites within the disc and scales the sum by the star's own fitted

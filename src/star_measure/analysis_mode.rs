@@ -368,7 +368,7 @@ where
     let base = base_options(frame, opts, false);
     // The measurement, as `measure_raw_frame_with(.., false)` makes it, plus what the list needs of it: the plane it ran
     // on, its mask and the seeds that stay in the ring sky.
-    let (pm, plane, mask, detected_native): (
+    let (mut pm, plane, mask, detected_native): (
         PlaneMeasurement,
         &[f32],
         Option<Vec<bool>>,
@@ -424,12 +424,24 @@ where
         domain: frame.domain,
         mask: mask.as_deref(),
     };
-    let detected: &[Seed] = detected_native.as_deref().unwrap_or(&pm.detected);
+    // A mosaic's seeds are the native ones, lent below; a mono plane's are its measurement's own.
+    let lent = detected_native.is_some();
+    if let Some(native) = detected_native {
+        pm.detected = native;
+    }
+    let detected: &[Seed] = &pm.detected;
     // What the passes need of the plane and the detected seeds does not read the request, so it is built on the pool
     // while `list` (a sequential callback on this thread) builds the list. A `list` that returns no request leaves it
     // unused.
     let mut pre = None;
     let mut request = None;
+    // The first callback sees the matched filter's seeds in `detected` on a mosaic as on a mono plane (a mosaic hands
+    // them to its fit as given seeds, so the measurement itself leaves `detected` empty): the native seeds, in the
+    // frame's own pixels (file row order), each peak the green-sum peak halved, in the plane's working units, the units
+    // of `noise.sigma`: about 0.8 of the star's brightest green site above the sky (the 2 x 2 sum smooths the core;
+    // measured by the test below), which is what a peak-over-sigma floor reads; each flux is the green sites' own sum
+    // (about half the star's all-site flux).
+    // Lent for this call only: the returned measurement is the one without a list.
     {
         let (pm_ref, input_ref) = (&pm, &input);
         let pre_slot = &mut pre;
@@ -439,9 +451,15 @@ where
         });
     }
     let Some(request) = request else {
+        if lent {
+            pm.detected = Vec::new();
+        }
         return (pm, None);
     };
     let measured = measure_list(&input, &pm, detected, &request, place, pool, pre);
+    if lent {
+        pm.detected = Vec::new();
+    }
     (pm, measured)
 }
 
@@ -1840,6 +1858,78 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(blends, 0, "{:?}", list.refused);
         assert!(list.fits.iter().filter(|f| f.kept).count() >= 20);
+    }
+
+    /// G8: the first callback's measurement carries a mosaic's matched-filter seeds in `detected`, as on a mono plane, in
+    /// the frame's own pixels (each within 0.5 px of an injected star), each peak about 0.8 of a green site's
+    /// background-subtracted value (the plane's working units, the units of `noise.sigma`). The returned measurement leaves `detected` empty,
+    /// as the measurement without a list does.
+    #[test]
+    fn a_mosaics_first_callback_carries_its_seeds_in_frame_pixels() {
+        let (w, h) = (400, 400);
+        let stars = scattered(30, w, h, 50.0, 45.0, (1500.0, 5000.0), 5);
+        let scene = integrated(w, h, &stars, 3.0);
+        for pattern in [BayerPattern::Rggb, BayerPattern::Gbrg] {
+            let mosaic = mosaic_of(&scene, w, h, pattern, (1.0, 0.98), 3.0, 7);
+            let frame = raw(
+                RawPlanes::Cfa {
+                    mosaic: mosaic.clone(),
+                    pattern,
+                },
+                w,
+                h,
+                1,
+            );
+            let mut seen: Option<(Vec<Seed>, f64)> = None;
+            let (pm, _) = measure_raw_frame_and_list(
+                &frame,
+                &FrameOptions::default(),
+                None,
+                |pm| {
+                    seen = Some((pm.detected.clone(), pm.noise.sigma));
+                    None
+                },
+                |_| None,
+            );
+            let (detected, sigma) = seen.expect("the first callback is called");
+            assert!(pm.detected.is_empty(), "{pattern:?}: the returned `detected` stays empty");
+            assert!(detected.len() >= 30, "{pattern:?}: {} seeds", detected.len());
+            let mut ratios = Vec::new();
+            for st in &stars {
+                let near = detected
+                    .iter()
+                    .filter(|d| (d.x - st.0).hypot(d.y - st.1) < 0.5)
+                    .count();
+                assert_eq!(near, 1, "{pattern:?}: star {st:?} has {near} seeds within 0.5 px");
+                let d = detected
+                    .iter()
+                    .find(|d| (d.x - st.0).hypot(d.y - st.1) < 0.5)
+                    .unwrap();
+                // The brightest green site within 1.5 px, less the green sky (1000 / 1003): a site's own value (measured: the
+                // seed's peak is 0.79 to 0.80 of it).
+                let mut top = f64::NEG_INFINITY;
+                for yy in (st.1 - 1.5).ceil() as usize..=(st.1 + 1.5).floor() as usize {
+                    for xx in (st.0 - 1.5).ceil() as usize..=(st.0 + 1.5).floor() as usize {
+                        let (ex, ey) = (xx % 2 == 0, yy % 2 == 0);
+                        let green = match pattern {
+                            BayerPattern::Rggb => ex != ey,
+                            _ => ex == ey,
+                        };
+                        if green {
+                            let sky = if yy % 2 == 0 { 1000.0 } else { 1003.0 };
+                            top = top.max(f64::from(mosaic[yy * w + xx]) - sky);
+                        }
+                    }
+                }
+                ratios.push(d.peak / top);
+                assert!(d.peak > 10.0 * sigma, "{pattern:?}: peak {} against sigma {sigma}", d.peak);
+            }
+            let median = crate::star_measure::tests::median(ratios.iter().copied());
+            assert!(
+                (0.6..1.2).contains(&median),
+                "{pattern:?}: the seed peak over a green site's value: median {median} over {ratios:?}"
+            );
+        }
     }
 
     #[test]
