@@ -370,6 +370,16 @@ impl StarFit {
     }
 }
 
+/// The aperture correction a mosaic's green sites measured, reported apart from the fits (OSC zero point, spec §5.1):
+/// the median `c`, the stars it is over (at most 64) and its standard error; `None` / 0 when it was not asked for or
+/// fewer than 5 stars qualified.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct ReportedAperture {
+    pub(crate) correction: Option<f64>,
+    pub(crate) stars: usize,
+    pub(crate) se: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FitOutcome {
     pub fits: Vec<StarFit>,
@@ -413,6 +423,10 @@ pub struct FitOutcome {
     /// What the plane's own `aperture_correction` screened out (the point-source and SNR counts) and the ratios it took
     /// its median over (Plan B B4, PB-12' / PB-13'); empty for a caller's `c` and where no ratio was read.
     pub aperture_screens: super::photometry::ApertureScreens,
+    /// The aperture correction measured on a mosaic's green sites and reported, never applied (OSC zero point, spec
+    /// §5.1); empty on every path that did not ask for it ([`Correction::report_aperture`]). Crate-private: the
+    /// public surface is [`super::PlaneMeasurement::reported_aperture_correction`].
+    pub(crate) reported_aperture: ReportedAperture,
     /// The accepted fits without a ring sky B_i (Task 10b, F-10: fewer than 8 present ring pixels, or no ring width on
     /// the plane); their `sky_ring` and `sky_ring_sigma` are NaN and `sky_ring_n` 0.
     pub ring_sky_missing: usize,
@@ -2013,6 +2027,10 @@ pub(super) struct Correction<'a> {
     /// the SNR-gain crops); `false` for LN's refits and every [`super::fit_stars_at`] caller, which fit as at
     /// `MEASURE_VERSION` 5.
     pub(super) blend_refusal: bool,
+    /// Measure `c` on the masked growth (a Bayer mosaic read on its green sites) and hand it back apart
+    /// ([`FitOutcome::reported_aperture`]) without applying it: no fit's `signal`, no `aperture_correction`, no ratio
+    /// moves (OSC zero point, spec §5.1, O3). Set by [`super::green::measure_green_sites`] alone; `false` = as before.
+    pub(super) report_aperture: bool,
 }
 
 /// Every detected seed and where the fitted ones sit among them (Task 12, R12-5): `of_fit[k]` is the index into `seeds`
@@ -2405,8 +2423,15 @@ fn fit_at_width(
     // F-10 (Task 10b, ruling B2) then F-6 and F-5 (Task 10, Plan B B4): every kept fit's ring sky B_i and σ_i, then its
     // SNR (the `c` sample's floor reads it), then the aperture correction from them, after the duplicate drop and
     // before any total reads `signal`; none moves a fit, `c` only every kept fit's flux.
-    let (aperture_correction, aperture_stars, aperture_se, ring_sky_missing, ring_fwhm, screens) =
-        ring_and_correction(
+    let (
+        aperture_correction,
+        aperture_stars,
+        aperture_se,
+        ring_sky_missing,
+        ring_fwhm,
+        screens,
+        reported_aperture,
+    ) = ring_and_correction(
             data,
             mask,
             w,
@@ -2493,6 +2518,7 @@ fn fit_at_width(
         aperture_stars,
         aperture_se,
         aperture_screens: screens,
+        reported_aperture,
         ring_sky_missing,
         fit_seeds,
         ring_fwhm,
@@ -2525,6 +2551,7 @@ fn ring_and_correction(
     usize,
     Option<f64>,
     super::photometry::ApertureScreens,
+    ReportedAperture,
 ) {
     // R12-5: a budgeted call fits a subset; the discs and the isolation read every detected seed.
     let (all_seeds, own) = match correction.neighbours {
@@ -2576,6 +2603,7 @@ fn ring_and_correction(
         }
     }
     snr_pass(data, mask, w, h, kept, correction, pool);
+    let mut reported = ReportedAperture::default();
     let (c, stars, se, screens) = match given {
         Some(c) => (
             Some(c),
@@ -2585,7 +2613,7 @@ fn ring_and_correction(
         ),
         None => {
             let _s = super::substeps::span(correction.timers, super::Step::ApertureC);
-            super::photometry::aperture_correction(
+            let (c, stars, se, mut screens) = super::photometry::aperture_correction(
                 data,
                 mask,
                 w,
@@ -2601,10 +2629,25 @@ fn ring_and_correction(
                 correction.population,
                 correction.siblings,
                 correction.point_siblings.is_some(),
-            )
+                correction.report_aperture,
+            );
+            if correction.report_aperture {
+                // Reported, never applied (OSC zero point, O3): the plane's applied `c` stays `None`, 0 stars, no
+                // error and no ratio, exactly what its fits' absent growth gave before; the screens' counts are the
+                // candidates' own and do not depend on the growth.
+                reported = ReportedAperture {
+                    correction: c,
+                    stars,
+                    se,
+                };
+                screens.ratios.clear();
+                (None, 0, None, screens)
+            } else {
+                (c, stars, se, screens)
+            }
         }
     };
-    (c, stars, se, missing, ring_fwhm, screens)
+    (c, stars, se, missing, ring_fwhm, screens, reported)
 }
 
 /// Every kept fit's aperture SNR (F-6, Task 11, [`super::photometry::star_snr`]) from its stored ring sky and noise
@@ -2691,7 +2734,7 @@ pub(super) fn correct_at_ring(
         .copied()
         .zip(outcome.fits.drain(..))
         .collect();
-    let (c, stars, se, missing, ring_fwhm, screens) = ring_and_correction(
+    let (c, stars, se, missing, ring_fwhm, screens, reported) = ring_and_correction(
         data,
         mask,
         w,
@@ -2715,6 +2758,7 @@ pub(super) fn correct_at_ring(
     outcome.aperture_stars = stars;
     outcome.aperture_se = se;
     outcome.aperture_screens = screens;
+    outcome.reported_aperture = reported;
     outcome.ring_sky_missing = missing;
     outcome.ring_fwhm = ring_fwhm;
 }

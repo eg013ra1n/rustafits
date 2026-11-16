@@ -968,6 +968,9 @@ pub(crate) fn ring_skies(
 /// missing (not finite), the `12F` disc leaves the plane or the caller's `footprint` (some pixel centre within `12F`
 /// with `footprint[i] == false`: LN's region outside its `allowed` mask holds zero fill and unseeded stars, F-5 round
 /// 4), or a pixel within `5F` is absent (it would bias the sum low by its missing light). `inside` is scratch.
+/// This is [`growth_curve_in`]'s unmasked form; the one non-test caller ([`aperture_correction`]) goes through
+/// `growth_curve_in`, so the existing tests keep calling this name.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn growth_curve(
     data: &[f32],
@@ -979,6 +982,28 @@ pub(crate) fn growth_curve(
     y: f64,
     fwhm: f64,
     b: f64,
+    inside: &mut Vec<f64>,
+) -> Option<f64> {
+    growth_curve_in(data, mask, footprint, w, h, x, y, fwhm, b, false, inside)
+}
+
+/// [`growth_curve`] with a choice of form. `masked` (OSC zero point, spec §5.1): the plane is a Bayer mosaic read on one colour's sites. A pixel within `5F`
+/// that `mask` marks absent is counted in the disc (`N_all`) and skipped, a present pixel that is not finite still
+/// refuses the star, and the sum is scaled by `N_all / N_present`; a disc whose present share is outside
+/// [`MASKED_GROWTH_SHARE`] (the green quincunx is 0.5) refuses the star. Footprint, `12F` disc and `B_i` rules are
+/// unchanged. `false` is the path above, bit for bit ([`growth_curve`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn growth_curve_in(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    footprint: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    x: f64,
+    y: f64,
+    fwhm: f64,
+    b: f64,
+    masked: bool,
     inside: &mut Vec<f64>,
 ) -> Option<f64> {
     let (r_ap, r_out) = (
@@ -996,6 +1021,7 @@ pub(crate) fn growth_curve(
     }
     let (r_ap2, r_out2) = (r_ap * r_ap, r_out * r_out);
     inside.clear();
+    let mut n_all = 0usize;
     let (y0, y1) = ((y - r_out).ceil() as usize, (y + r_out).floor() as usize);
     let (x0, x1) = ((x - r_out).ceil() as usize, (x + r_out).floor() as usize);
     for py in y0..=y1 {
@@ -1007,15 +1033,35 @@ pub(crate) fn growth_curve(
                 return None;
             }
             if d2 <= r_ap2 {
-                if !(data[i].is_finite() && mask.map_or(true, |m| m[i])) {
+                if masked {
+                    n_all += 1;
+                    if !mask.map_or(true, |m| m[i]) {
+                        continue;
+                    }
+                    if !data[i].is_finite() {
+                        return None;
+                    }
+                } else if !(data[i].is_finite() && mask.map_or(true, |m| m[i])) {
                     return None;
                 }
                 inside.push(data[i] as f64);
             }
         }
     }
-    Some(inside.iter().map(|v| v - b).sum())
+    let sum: f64 = inside.iter().map(|v| v - b).sum();
+    if !masked {
+        return Some(sum);
+    }
+    let share = inside.len() as f64 / n_all as f64;
+    if !MASKED_GROWTH_SHARE.contains(&share) {
+        return None;
+    }
+    Some(sum * (n_all as f64 / inside.len() as f64))
 }
+
+/// The present share of a masked growth disc that is accepted (the green sites of a Bayer mosaic are half of any
+/// disc; a share outside this range is a mask the growth does not know how to scale).
+pub(crate) const MASKED_GROWTH_SHARE: std::ops::RangeInclusive<f64> = 0.45..=0.55;
 
 /// The clip screen's range on a path without a saturation verdict (F-5, owner ruling R6 / C6): F-3's
 /// `range = min(plane max, norm) − bg` ([`SaturationPlane::new`]) from the fitted plane itself, in the plane's own
@@ -1099,6 +1145,9 @@ pub(crate) fn unverdicted_clip_range(
 /// refits) takes nothing back. Where `population` is `Some` (probes) the population's (a) leaves extended seeds out by eligibility, so
 /// nothing is taken back there; the stacking Measure runs without a population ([`super::Mode::All`] and
 /// [`super::Mode::Brightest`]).
+///
+/// `masked` (OSC zero point, spec §5.1): every growth is [`growth_curve_in`]'s masked form (a Bayer mosaic read on its
+/// green sites); every candidate screen above is unchanged, and the caller reports the result, never applies it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aperture_correction(
     data: &[f32],
@@ -1116,6 +1165,7 @@ pub(crate) fn aperture_correction(
     population: Option<super::population::PopulationView<'_>>,
     siblings: Option<&[Seed]>,
     rescue_extended: bool,
+    masked: bool,
 ) -> (Option<f64>, usize, Option<f64>, ApertureScreens) {
     if fits.is_empty() {
         tracing::debug!(
@@ -1205,7 +1255,7 @@ pub(crate) fn aperture_correction(
                 if !isolated(seed, f) {
                     continue;
                 }
-                if let Some(growth) = growth_curve(
+                if let Some(growth) = growth_curve_in(
                     data,
                     mask,
                     footprint,
@@ -1215,6 +1265,7 @@ pub(crate) fn aperture_correction(
                     f.y,
                     f_ring,
                     f.sky_ring,
+                    masked,
                     &mut inside,
                 ) {
                     ratios.push(growth / model);
@@ -1229,15 +1280,27 @@ pub(crate) fn aperture_correction(
     let n = ratios.len();
     screens.ratios = taken;
     if n < CORRECTION_MIN_RATIOS {
-        tracing::warn!(
-            count = n,
-            skipped = screened,
-            point_source = screens.point_source,
-            below_snr = screens.below_snr,
-            rescued = screens.rescued,
-            fwhm_px = ring_fwhm,
-            "aperture correction: fewer than 5 isolated unsaturated stars; the star flux is the model's, uncorrected"
-        );
+        if masked {
+            tracing::warn!(
+                count = n,
+                skipped = screened,
+                point_source = screens.point_source,
+                below_snr = screens.below_snr,
+                rescued = screens.rescued,
+                fwhm_px = ring_fwhm,
+                "aperture correction on green sites: fewer than 5 isolated unsaturated stars; none reported, none applied"
+            );
+        } else {
+            tracing::warn!(
+                count = n,
+                skipped = screened,
+                point_source = screens.point_source,
+                below_snr = screens.below_snr,
+                rescued = screens.rescued,
+                fwhm_px = ring_fwhm,
+                "aperture correction: fewer than 5 isolated unsaturated stars; the star flux is the model's, uncorrected"
+            );
+        }
         return (None, n, None, screens);
     }
     let c = super::robust::median_f64(&mut ratios);
@@ -1246,17 +1309,31 @@ pub(crate) fn aperture_correction(
     let mut dev: Vec<f64> = ratios.iter().map(|r| (r - c).abs()).collect();
     let mad = super::robust::median_f64(&mut dev);
     let se = 1.2533 * 1.4826 * mad / (n as f64).sqrt();
-    tracing::debug!(
-        count = n,
-        skipped = screened,
-        point_source = screens.point_source,
-        below_snr = screens.below_snr,
-        rescued = screens.rescued,
-        aperture_correction = c,
-        aperture_se = se,
-        fwhm_px = ring_fwhm,
-        "aperture correction measured"
-    );
+    if masked {
+        tracing::debug!(
+            count = n,
+            skipped = screened,
+            point_source = screens.point_source,
+            below_snr = screens.below_snr,
+            rescued = screens.rescued,
+            reported_aperture_correction = c,
+            reported_aperture_se = se,
+            fwhm_px = ring_fwhm,
+            "aperture correction on green sites reported, not applied"
+        );
+    } else {
+        tracing::debug!(
+            count = n,
+            skipped = screened,
+            point_source = screens.point_source,
+            below_snr = screens.below_snr,
+            rescued = screens.rescued,
+            aperture_correction = c,
+            aperture_se = se,
+            fwhm_px = ring_fwhm,
+            "aperture correction measured"
+        );
+    }
     (Some(c), n, Some(se), screens)
 }
 
@@ -2489,6 +2566,178 @@ mod tests {
             at_one.is_finite() && (at_one / near_one - 1.0).abs() < 1e-5,
             "{at_one} vs {near_one}"
         );
+    }
+
+    /// A round Moffat's analytic flux inside radius `r` (peak `amp`, FWHM `fwhm`, exponent `beta`).
+    fn moffat_flux_within(amp: f64, fwhm: f64, beta: f64, r: f64) -> f64 {
+        let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+        std::f64::consts::PI * alpha * alpha * amp / (beta - 1.0)
+            * (1.0 - (1.0 + r * r / (alpha * alpha)).powf(1.0 - beta))
+    }
+
+    /// OSC zero point, spec §5.1 / O2: on a pixel-integrated star the masked growth (the checkerboard's sites, scaled by
+    /// `N_all / N_present`) is the analytic flux inside `5F`: the median over a 4 x 4 grid of sub-pixel phases within
+    /// 1 % at FWHM 2 and 3 px and within 3 % at 1.4 px, and each phase within the lattice's own bound
+    /// `4·exp(−π²σ²)` plus 0.5 % (σ the Gaussian width of the same FWHM, native px) plus `2 / N_present`, the
+    /// departure of the disc's own count ratio `N_all / N_present` from the lattice's exact 2 (the spec's bound omits
+    /// it; at FWHM 2 it is 1.3 % on the worst phase).
+    #[test]
+    fn masked_growth_matches_the_analytic_flux() {
+        use crate::test_support::{integrated_field, IntegratedProfile};
+        let (w, h) = (130usize, 130usize);
+        let mask: Vec<bool> = (0..w * h).map(|i| (i % w + i / w) % 2 == 0).collect();
+        let beta = 2.5;
+        for (fwhm, median_bar) in [(1.4, 0.03), (2.0, 0.01), (3.0, 0.01)] {
+            let sigma = fwhm / (2.0 * (2.0 * std::f64::consts::LN_2).sqrt());
+            let per_phase_bar =
+                4.0 * (-std::f64::consts::PI.powi(2) * sigma * sigma).exp() + 0.005;
+            let truth = moffat_flux_within(1.0, fwhm, beta, GROWTH_RADIUS_PER_FWHM * fwhm);
+            let mut errs = Vec::new();
+            let mut scratch = Vec::new();
+            for j in 0..4 {
+                for i in 0..4 {
+                    // Half-step phases: cos(πx₀) sums to zero over the grid, as over the random phases of real stars.
+                    let (x, y) = (
+                        65.0 + (i as f64 + 0.5) / 4.0,
+                        65.0 + (j as f64 + 0.5) / 4.0,
+                    );
+                    let data = integrated_field(
+                        w,
+                        h,
+                        &[(x, y, 1.0)],
+                        IntegratedProfile::Moffat { fwhm, beta },
+                        5,
+                        0.0,
+                    );
+                    let g = growth_curve_in(
+                        &data,
+                        Some(&mask),
+                        None,
+                        w,
+                        h,
+                        x,
+                        y,
+                        fwhm,
+                        0.0,
+                        true,
+                        &mut scratch,
+                    )
+                    .unwrap_or_else(|| panic!("FWHM {fwhm} phase ({i}, {j}): refused"));
+                    let err = g / truth - 1.0;
+                    // The disc's own counts: `N_all / N_present` departs from the lattice's exact 2 by up to
+                    // `1 / N_present`, a term the lattice bound does not hold (measured: 1.3 % on one phase at FWHM 2).
+                    let n_present = (0..h)
+                        .flat_map(|py| (0..w).map(move |px| (px, py)))
+                        .filter(|&(px, py)| {
+                            mask[py * w + px]
+                                && (px as f64 - x).powi(2) + (py as f64 - y).powi(2)
+                                    <= (GROWTH_RADIUS_PER_FWHM * fwhm).powi(2)
+                        })
+                        .count();
+                    let per_phase_bar = per_phase_bar + 2.0 / n_present as f64;
+                    assert!(
+                        err.abs() < per_phase_bar,
+                        "FWHM {fwhm} phase ({i}, {j}): masked growth {g} vs analytic {truth}: {err:+.4} (bar {per_phase_bar:.4})"
+                    );
+                    errs.push(err);
+                }
+            }
+            let med = median(errs.iter().copied());
+            eprintln!("masked growth, FWHM {fwhm}: median error {med:+.5} over 16 phases");
+            assert!(
+                med.abs() < median_bar,
+                "FWHM {fwhm}: median error {med:+.4} over the phases (bar {median_bar})"
+            );
+        }
+    }
+
+    /// The unmasked form is the code that was: a pixel absent by the mask refuses the star (the mask is never read as
+    /// "skip"), the sum is the plain disc sum, and the masked form's own refusals leave it alone.
+    #[test]
+    fn growth_curve_unmasked_is_unchanged() {
+        let (w, h) = (120usize, 120usize);
+        let (x, y, fwhm, b) = (60.3, 59.6, 2.0, 5.0);
+        let data = moffat_field(
+            w,
+            h,
+            &[MoffatStar {
+                x,
+                y,
+                amp: 100.0,
+                alpha_x: 1.5,
+                alpha_y: 1.5,
+                theta: 0.0,
+            }],
+            4.0,
+            10.0,
+        );
+        let mut scratch = Vec::new();
+        let by_hand: f64 = {
+            let r = GROWTH_RADIUS_PER_FWHM * fwhm;
+            let mut sum = 0.0;
+            for py in 0..h {
+                for px in 0..w {
+                    if (px as f64 - x).powi(2) + (py as f64 - y).powi(2) <= r * r {
+                        sum += data[py * w + px] as f64 - b;
+                    }
+                }
+            }
+            sum
+        };
+        let plain = growth_curve_in(&data, None, None, w, h, x, y, fwhm, b, false, &mut scratch)
+            .unwrap();
+        assert_eq!(plain.to_bits(), by_hand.to_bits(), "the plain disc sum");
+        assert_eq!(
+            growth_curve(&data, None, None, w, h, x, y, fwhm, b, &mut scratch)
+                .unwrap()
+                .to_bits(),
+            plain.to_bits()
+        );
+        let mut all = vec![true; w * h];
+        all[60 * w + 60] = false;
+        assert_eq!(
+            growth_curve_in(&data, Some(&all), None, w, h, x, y, fwhm, b, false, &mut scratch),
+            None,
+            "unmasked: an absent pixel within 5F refuses the star"
+        );
+    }
+
+    /// The masked form's refusals: a mask that is not half the disc, no mask at all, a present pixel that is not
+    /// finite (while an absent one holding NaN is skipped), a missing B_i.
+    #[test]
+    fn masked_growth_refuses_what_it_cannot_scale() {
+        let (w, h) = (120usize, 120usize);
+        let (x, y, fwhm) = (60.0, 60.0, 2.0);
+        let mut data = vec![10.0f32; w * h];
+        let checker: Vec<bool> = (0..w * h).map(|i| (i % w + i / w) % 2 == 0).collect();
+        let mut scratch = Vec::new();
+        let mut go = |data: &[f32], mask: Option<&[bool]>, b: f64| {
+            growth_curve_in(data, mask, None, w, h, x, y, fwhm, b, true, &mut scratch)
+        };
+        // Flat 10 over a half-present disc: the sum scales to the whole disc, 5 above a sky of 5, per pixel.
+        let n_disc = (0..h)
+            .flat_map(|py| (0..w).map(move |px| (px, py)))
+            .filter(|&(px, py)| {
+                (px as f64 - x).powi(2) + (py as f64 - y).powi(2) <= (5.0 * fwhm).powi(2)
+            })
+            .count();
+        let g = go(&data, Some(&checker), 5.0).unwrap();
+        assert!(
+            (g / (5.0 * n_disc as f64) - 1.0).abs() < 1e-12,
+            "{g} vs {}",
+            5.0 * n_disc as f64
+        );
+        assert_eq!(go(&data, None, 5.0), None, "no mask: share 1.0");
+        assert_eq!(go(&data, Some(&vec![true; w * h]), 5.0), None, "all present");
+        let rows: Vec<bool> = (0..w * h).map(|i| (i / w) % 4 != 0).collect();
+        assert_eq!(go(&data, Some(&rows), 5.0), None, "three quarters present");
+        assert_eq!(go(&data, Some(&checker), f64::NAN), None, "no B_i");
+        let present = (60 * w + 60, 60 * w + 61);
+        let (on, off) = if checker[present.0] { present } else { (present.1, present.0) };
+        data[off] = f32::NAN;
+        assert!(go(&data, Some(&checker), 5.0).is_some(), "an absent NaN is skipped");
+        data[on] = f32::NAN;
+        assert_eq!(go(&data, Some(&checker), 5.0), None, "a present NaN refuses");
     }
 
     /// A pin (C0's qualifying rules; rim and edge by owner ruling R6; the rim read by `ring_sky` and handed in as B_i

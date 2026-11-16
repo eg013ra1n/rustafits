@@ -236,6 +236,12 @@ impl SnrNoise {
 /// Plan D = 8. `AnalysisConfig::config_hash` is Plan D's.
 pub const MEASURE_VERSION: u32 = 8;
 
+/// The version of the aperture correction a Bayer mosaic reports from its green sites
+/// ([`PlaneMeasurement::reported_aperture_correction`], OSC zero point): bumped when only that number changes, so
+/// [`MEASURE_VERSION`] and every stored star keep their meaning. 1 = the green-site growth at `5F` scaled by
+/// `N_all / N_green`, the median over up to 64 bright isolated stars.
+pub const CFA_APERTURE_VERSION: u32 = 1;
+
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
 /// gain, `PsfModel::Auto`, 24 576 stars, no seeds, `FitParams::default()`, no precomputed noise, `Bwmv` (ruling F14:
 /// every test literal uses `..Default::default()` so a later field never breaks an earlier test).
@@ -501,6 +507,7 @@ impl FitStarsOptions<'_> {
             // R-PC-10b / Plan D D3: LN's refits and every other `fit_stars_at` caller fit without the Blend refusal (as at
             // `MEASURE_VERSION` 5); the `measure_plane` paths set it themselves ([`finish_working`], [`measure_budget`]).
             blend_refusal: false,
+            report_aperture: false,
         }
     }
 }
@@ -573,6 +580,16 @@ pub struct PlaneMeasurement {
     pub aperture_stars: usize,
     /// The standard error of `aperture_correction` as the median of its ratios ([`FitOutcome::aperture_se`]).
     pub aperture_se: Option<f64>,
+    /// The aperture correction a Bayer mosaic measured on its green sites and REPORTED, never applied (OSC zero point,
+    /// ruling O3): the median over up to 64 bright isolated stars of the green-site growth flux at `5F` (scaled by
+    /// `N_all / N_green`) over the fit's model flux. No fit's `signal` carries it and `aperture_correction` stays
+    /// `None` on that path. `None` on every other path, and where fewer than 5 stars qualified. See
+    /// [`CFA_APERTURE_VERSION`].
+    pub reported_aperture_correction: Option<f64>,
+    /// The stars `reported_aperture_correction` is the median over (at most 64; 0 on every other path).
+    pub reported_aperture_stars: usize,
+    /// The standard error of `reported_aperture_correction`, from its ratios' MAD as [`Self::aperture_se`] is.
+    pub reported_aperture_se: Option<f64>,
     /// The `c` candidates the point-source screen refused (Plan B B4, PB-12'): no seed of another plane within
     /// `max(`[`photometry::POINT_SOURCE_MATCH_PX`]`, 0.5 F)` px of their fitted centre (R-PB4-2). 0 on a single plane and wherever no screen runs.
     /// Reported, not persisted.
@@ -653,6 +670,32 @@ pub fn measure_plane(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
+    measure_plane_in(plane, w, h, opts, false, pool)
+}
+
+/// [`measure_plane`] that also measures the aperture correction on the masked growth and reports it apart
+/// ([`PlaneMeasurement::reported_aperture_correction`], OSC zero point, spec §5.1): nothing else moves, no fit's
+/// `signal`, no `aperture_*` field. Crate-private — [`MeasureOptions`] gains no field — and called by
+/// [`green::measure_green_sites`] alone.
+pub(crate) fn measure_plane_reporting_aperture(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlaneMeasurement {
+    measure_plane_in(plane, w, h, opts, true, pool)
+}
+
+/// [`measure_plane`]'s body; `report_aperture` is [`fit::Correction::report_aperture`].
+fn measure_plane_in(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    report_aperture: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlaneMeasurement {
     if mask_mismatch(opts.mask.as_deref(), w, h) {
         // Nothing is measured: no seed source, no mask, the plane's noise and sky only (never a panic on `m[i]`).
         let bare = MeasureOptions {
@@ -661,7 +704,7 @@ pub fn measure_plane(
             mode: Mode::All,
             ..opts.clone()
         };
-        return measure_plane(plane, w, h, &bare, pool);
+        return measure_plane_in(plane, w, h, &bare, report_aperture, pool);
     }
     let sub = SubSteps::default();
     let working = {
@@ -671,9 +714,29 @@ pub fn measure_plane(
     match opts.mode {
         Mode::All | Mode::Population { .. } | Mode::Brightest { .. } => {
             let prep = prepare_working(plane, &working, w, h, opts, pool, sub);
-            finish_working(&working, w, h, opts, prep, None, None, pool)
+            finish_working(
+                &working,
+                w,
+                h,
+                opts,
+                prep,
+                None,
+                None,
+                report_aperture,
+                pool,
+            )
         }
-        Mode::Budget { budget } => measure_budget(plane, &working, w, h, opts, budget, pool, sub),
+        Mode::Budget { budget } => measure_budget(
+            plane,
+            &working,
+            w,
+            h,
+            opts,
+            budget,
+            report_aperture,
+            pool,
+            sub,
+        ),
     }
 }
 
@@ -998,7 +1061,17 @@ pub fn finish_plane(
         let _s = prep.sub.span(Step::WorkCopy);
         domain::to_working_units(plane, &opts.domain)
     };
-    finish_working(&working, w, h, opts, prep, siblings, point_siblings, pool)
+    finish_working(
+        &working,
+        w,
+        h,
+        opts,
+        prep,
+        siblings,
+        point_siblings,
+        false,
+        pool,
+    )
 }
 
 /// The plane's own β and where it came from: exactly the β [`finish_plane`] would fit `prep`'s seeds at under
@@ -1599,6 +1672,7 @@ fn finish_working(
     prep: PlanePrep,
     siblings: Option<&[Seed]>,
     point_siblings: Option<&[Seed]>,
+    report_aperture: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let PlanePrep {
@@ -1685,6 +1759,7 @@ fn finish_working(
                 // stacking Measure's subs, the master and the SNR-gain crops among them. `FitStarsOptions::correction()`
                 // (LN's refits, every `fit_stars_at` caller) still leaves it off.
                 blend_refusal: true,
+                report_aperture,
                 ..Default::default()
             },
             None,
@@ -1797,6 +1872,9 @@ fn finish_working(
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
         aperture_se: outcome.aperture_se,
+        reported_aperture_correction: outcome.reported_aperture.correction,
+        reported_aperture_stars: outcome.reported_aperture.stars,
+        reported_aperture_se: outcome.reported_aperture.se,
         point_source_screened: outcome.aperture_screens.point_source,
         aperture_below_snr: outcome.aperture_screens.below_snr,
         aperture_rescued: outcome.aperture_screens.rescued,
@@ -1833,6 +1911,7 @@ fn measure_budget(
     h: usize,
     opts: &MeasureOptions,
     budget: usize,
+    report_aperture: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
     steps: SubSteps,
 ) -> PlaneMeasurement {
@@ -1923,6 +2002,7 @@ fn measure_budget(
                 timers: Some(&steps),
                 // R-PC-10: the Blend refusal (the Analysis path's since 7; `finish_working` sets it too since Plan D D3).
                 blend_refusal: true,
+                report_aperture,
                 ..Default::default()
             },
             None,
@@ -2037,6 +2117,9 @@ fn measure_budget(
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
         aperture_se: outcome.aperture_se,
+        reported_aperture_correction: outcome.reported_aperture.correction,
+        reported_aperture_stars: outcome.reported_aperture.stars,
+        reported_aperture_se: outcome.reported_aperture.se,
         point_source_screened: outcome.aperture_screens.point_source,
         aperture_below_snr: outcome.aperture_screens.below_snr,
         aperture_rescued: outcome.aperture_screens.rescued,

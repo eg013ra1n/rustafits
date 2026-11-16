@@ -47,7 +47,8 @@ pub fn native_seed(s: &Seed) -> Seed {
 
 /// Measure a Bayer mosaic on its green sites (PC-4); `base` carries the domain, PSF model, threshold
 /// ([`SeedSpec::MatchedFilter`], else the default), detection cap, fit parameters and mode. `aperture_correction` of the
-/// result is `None` (`c` = 1). Every seed the green-sum matched filter found is handed to the fit in native pixels with
+/// result is `None` (`c` = 1: no fit's flux is corrected); the green-site `c` is reported, not applied, in
+/// `reported_aperture_correction` / `_stars` / `_se`. Every seed the green-sum matched filter found is handed to the fit in native pixels with
 /// its `extended` flag (R-PC-8); `PlaneMeasurement::detected` stays empty (given seeds), `seeds` / `extended_seeds`
 /// count them.
 ///
@@ -59,6 +60,20 @@ pub fn measure_green_sites(
     h: usize,
     pattern: BayerPattern,
     base: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlaneMeasurement {
+    measure_green(mosaic, w, h, pattern, base, true, pool)
+}
+
+/// [`measure_green_sites`]' body. `report_aperture` selects the green-site `c` (reported, never applied); `false` is the
+/// path as it was, which `reporting_moves_no_fit` measures the reporting path against.
+fn measure_green(
+    mosaic: &[f32],
+    w: usize,
+    h: usize,
+    pattern: BayerPattern,
+    base: &MeasureOptions,
+    report_aperture: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     assert_eq!(mosaic.len(), w * h, "mosaic does not match its geometry");
@@ -125,7 +140,11 @@ pub fn measure_green_sites(
         sky: Some(sky),
         given_extended,
     };
-    star_measure::measure_plane(mosaic, w, h, &opts, pool)
+    if report_aperture {
+        star_measure::measure_plane_reporting_aperture(mosaic, w, h, &opts, pool)
+    } else {
+        star_measure::measure_plane(mosaic, w, h, &opts, pool)
+    }
 }
 
 #[cfg(test)]
@@ -566,12 +585,206 @@ mod tests {
     }
 
     #[test]
-    fn a_cfa_plane_has_no_aperture_correction() {
+    fn a_cfa_plane_reports_its_aperture_correction() {
         let p = BayerPattern::Rggb;
         let stars = field_stars((100.3, 80.7), 256, 256, 11);
         let m = mosaic(p, 256, 256, &stars, 5);
         let pm = measure_green_sites(&m, 256, 256, p, &base(), None);
         assert!(!pm.stars.is_empty());
+        // Applied: nothing (O3). Reported: the green-site `c`.
         assert_eq!(pm.aperture_correction, None);
+        assert_eq!(pm.aperture_stars, 0);
+        assert_eq!(pm.aperture_se, None);
+        assert!(pm.aperture_ratios.is_empty());
+        let c = pm
+            .reported_aperture_correction
+            .unwrap_or_else(|| panic!("no reported c; {} stars", pm.reported_aperture_stars));
+        assert!(pm.reported_aperture_stars >= 5, "{}", pm.reported_aperture_stars);
+        assert!(c.is_finite() && c > 1.0 && c < 1.5, "c = {c}");
+        assert!(pm.reported_aperture_se.is_some_and(|se| se.is_finite() && se >= 0.0));
+        // No fit's signal carries it: the model flux in the FWTM, as at c = 1.
+        for f in &pm.stars {
+            let model = crate::star_measure::photometry::model_flux_in_fwtm(f);
+            assert_eq!(f.signal.to_bits(), model.to_bits(), "signal is the bare model flux");
+        }
+    }
+
+    /// A mosaic of pixel-integrated Moffat stars (β 2.5 wings): `(field, stars (x, y, amplitude))` on an RGGB mosaic with
+    /// R / B gains 0.5 / 0.4 and green sites of gain `g1` on even rows and `g2` on odd rows, sky 1000 per site (+ `ped2`
+    /// on the odd-row greens), Gaussian noise 4.
+    fn integrated_mosaic(
+        fwhm: f64,
+        (g1, g2): (f64, f64),
+        ped2: f64,
+        seed: u64,
+    ) -> (Vec<f32>, Vec<(f64, f64, f64)>) {
+        use crate::test_support::{integrated_field, IntegratedProfile};
+        let (w, h) = (400usize, 400usize);
+        let mut rng = crate::geometry::ransac::SplitMix64(seed);
+        let mut stars: Vec<(f64, f64, f64)> = Vec::new();
+        let mut attempts = 0;
+        while stars.len() < 30 && attempts < 20000 {
+            attempts += 1;
+            let x = 45.0 + rng.next_f64() * (w as f64 - 90.0);
+            let y = 45.0 + rng.next_f64() * (h as f64 - 90.0);
+            if stars.iter().any(|s| (s.0 - x).hypot(s.1 - y) < 50.0) {
+                continue;
+            }
+            stars.push((x, y, 1500.0 + rng.next_f64() * 3500.0));
+        }
+        let scene = integrated_field(
+            w,
+            h,
+            &stars,
+            IntegratedProfile::Moffat { fwhm, beta: 2.5 },
+            5,
+            0.0,
+        );
+        let mut m: Vec<f32> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let (gain, sky) = match site(BayerPattern::Rggb, x, y) {
+                    'R' => (0.5, 900.0),
+                    'B' => (0.4, 800.0),
+                    _ if y % 2 == 0 => (g1, 1000.0),
+                    _ => (g2, 1000.0 + ped2),
+                };
+                (scene[i] as f64 * gain + sky) as f32
+            })
+            .collect();
+        add_noise(&mut m, 4.0, seed + 1);
+        (m, stars)
+    }
+
+    /// OSC zero point, O2 / O3: on pixel-integrated Moffat (β 2.5) stars fitted with Moffat 4, `signal · reported c` is the
+    /// star's true flux: the median over stars within 2 %, at FWHM 2 and 3 px, and with the two green sites at gains
+    /// 1.00 / 0.98 and a +3 ADU pedestal on the second (the truth then is the mean green gain's, 0.99, of the scene).
+    #[test]
+    fn mosaic_corrected_flux_matches_the_truth() {
+        let p = BayerPattern::Rggb;
+        let beta = 2.5;
+        for (fwhm, gains, ped2) in [
+            (2.0, (1.0, 1.0), 0.0),
+            (3.0, (1.0, 1.0), 0.0),
+            (2.0, (1.0, 0.98), 3.0),
+            (3.0, (1.0, 0.98), 3.0),
+        ] {
+            let (m, stars) = integrated_mosaic(fwhm, gains, ped2, 31);
+            let pm = measure_green_sites(&m, 400, 400, p, &base(), None);
+            let c = pm.reported_aperture_correction.unwrap_or_else(|| {
+                panic!("FWHM {fwhm}: no c; stars {}", pm.reported_aperture_stars)
+            });
+            let alpha = fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt());
+            let mean_gain = 0.5 * (gains.0 + gains.1);
+            let mut ratios: Vec<f64> = Vec::new();
+            for f in &pm.stars {
+                let Some(t) = stars
+                    .iter()
+                    .find(|t| (t.0 - f.x).hypot(t.1 - f.y) < 1.5)
+                else {
+                    continue;
+                };
+                let total = std::f64::consts::PI * alpha * alpha * t.2 / (beta - 1.0) * mean_gain;
+                ratios.push(f.signal * c / total);
+            }
+            assert!(ratios.len() >= 10, "FWHM {fwhm}: {} stars matched", ratios.len());
+            let med = crate::star_measure::tests::median(ratios.iter().copied());
+            eprintln!(
+                "mosaic truth, FWHM {fwhm} gains {gains:?} ped {ped2}: c {c:.4} ({} stars, se {:?}), median signal*c/true {med:.4} over {} stars",
+                pm.reported_aperture_stars,
+                pm.reported_aperture_se,
+                ratios.len()
+            );
+            assert!(
+                (med - 1.0).abs() < 0.02,
+                "FWHM {fwhm} gains {gains:?} pedestal {ped2}: median signal*c / true flux = {med:.4}"
+            );
+        }
+    }
+
+    /// Every field the old path produced, as text (`Debug` prints a float's exact digits and NaN as NaN).
+    fn fits_text(pm: &PlaneMeasurement) -> Vec<String> {
+        pm.stars.iter().map(|f| format!("{f:?}")).collect()
+    }
+
+    fn assert_same_but_the_report(a: &PlaneMeasurement, b: &PlaneMeasurement, what: &str) {
+        assert_eq!(fits_text(a), fits_text(b), "{what}: every StarFit");
+        assert_eq!(format!("{:?}", a.frame), format!("{:?}", b.frame), "{what}: frame aggregates");
+        assert_eq!(format!("{:?}", a.noise), format!("{:?}", b.noise), "{what}: noise");
+        assert_eq!(format!("{:?}", a.sky), format!("{:?}", b.sky), "{what}: sky");
+        assert_eq!(a.beta.to_bits(), b.beta.to_bits(), "{what}: beta");
+        assert_eq!(a.seeds, b.seeds, "{what}: seeds");
+        assert_eq!(a.refused, b.refused, "{what}: refusals");
+        assert_eq!(a.aperture_correction, b.aperture_correction, "{what}: c");
+        assert_eq!(a.aperture_stars, b.aperture_stars, "{what}: c stars");
+        assert_eq!(a.aperture_se, b.aperture_se, "{what}: c se");
+        assert_eq!(a.aperture_ratios.len(), b.aperture_ratios.len(), "{what}: ratios");
+        assert_eq!(a.point_source_screened, b.point_source_screened, "{what}: screens");
+        assert_eq!(a.aperture_below_snr, b.aperture_below_snr, "{what}: snr screen");
+        assert_eq!(a.aperture_rescued, b.aperture_rescued, "{what}: rescued");
+        assert_eq!(a.ring_sky_missing, b.ring_sky_missing, "{what}: ring sky");
+        assert_eq!(a.clip_floor.map(f64::to_bits), b.clip_floor.map(f64::to_bits), "{what}: clip");
+        assert_eq!(format!("{:?}", a.budget), format!("{:?}", b.budget), "{what}: budget");
+    }
+
+    /// OSC zero point, O3: reporting `c` moves nothing. One mosaic through the reporting path and through the path as it
+    /// was (`FromPlane`): every `StarFit` field (`ap_sum` NaN on both), the frame aggregates and every other output
+    /// equal; the same for a mono plane and a debayered 3-plane file, where the reporting path is not selected.
+    #[test]
+    fn reporting_moves_no_fit() {
+        use crate::star_measure::analysis_mode::{measure_raw_frame, FrameOptions, FrameSummary};
+        use crate::star_measure::raw::{RawFrame, RawPlanes};
+        let p = BayerPattern::Rggb;
+        let (m, _) = integrated_mosaic(2.4, (1.0, 0.98), 3.0, 77);
+        let new = measure_green_sites(&m, 400, 400, p, &base(), None);
+        let old = measure_green(&m, 400, 400, p, &base(), false, None);
+        assert!(!new.stars.is_empty());
+        assert!(new.stars.iter().chain(&old.stars).all(|f| f.ap_sum.is_nan()));
+        assert_same_but_the_report(&new, &old, "mosaic");
+        assert!(new.reported_aperture_correction.is_some());
+        assert_eq!(
+            (old.reported_aperture_correction, old.reported_aperture_stars, old.reported_aperture_se),
+            (None, 0, None),
+            "the path as it was reports nothing"
+        );
+        let fo = FrameOptions::default();
+        assert_eq!(
+            format!("{:?}", FrameSummary::from_measurement(&new, &fo)),
+            format!("{:?}", FrameSummary::from_measurement(&old, &fo)),
+            "FrameSummary"
+        );
+
+        // A mono plane and a debayered 3-plane file: not selected, nothing reported, the outputs are `measure_plane`'s.
+        let stars = field_stars((100.3, 80.7), 256, 256, 11);
+        let plane = {
+            let mut d = moffat_field(256, 256, &stars, 4.0, 1000.0);
+            add_noise(&mut d, 6.0, 9);
+            d
+        };
+        for (what, planes, channels) in [
+            ("mono", RawPlanes::Mono(plane.clone()), 1),
+            (
+                "rgb",
+                RawPlanes::Rgb([plane.clone(), plane.clone(), plane.clone()]),
+                3,
+            ),
+        ] {
+            let frame = RawFrame {
+                planes,
+                w: 256,
+                h: 256,
+                domain: base().domain,
+                flip_vertical: false,
+                channels,
+            };
+            let pm = measure_raw_frame(&frame, &fo, None);
+            assert!(!pm.stars.is_empty(), "{what}");
+            assert_eq!(
+                (pm.reported_aperture_correction, pm.reported_aperture_stars, pm.reported_aperture_se),
+                (None, 0, None),
+                "{what}: nothing reported"
+            );
+            assert!(pm.aperture_correction.is_some(), "{what}: its own c is applied, as before");
+        }
     }
 }
