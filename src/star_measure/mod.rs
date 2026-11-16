@@ -513,10 +513,6 @@ impl FitStarsOptions<'_> {
             // `MEASURE_VERSION` 5); the `measure_plane` paths set it themselves ([`finish_working`], [`measure_budget`]).
             blend_refusal: false,
             report_aperture: false,
-            masked_growth: false,
-            max_c_stars: photometry::CORRECTION_STARS,
-            warn_short_c: true,
-            max_centre_offset: None,
         }
     }
 }
@@ -1778,7 +1774,6 @@ fn finish_working(
                 // (LN's refits, every `fit_stars_at` caller) still leaves it off.
                 blend_refusal: true,
                 report_aperture,
-                masked_growth: report_aperture,
                 ..Default::default()
             },
             None,
@@ -2033,7 +2028,6 @@ fn measure_budget(
                 // R-PC-10: the Blend refusal (the Analysis path's since 7; `finish_working` sets it too since Plan D D3).
                 blend_refusal: true,
                 report_aperture,
-                masked_growth: report_aperture,
                 ..Default::default()
             },
             None,
