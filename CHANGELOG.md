@@ -5,6 +5,63 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `measure_raw_frame_and_list`: on a Bayer mosaic the first callback's `PlaneMeasurement::detected` carries the matched
+  filter's seeds, as on a mono plane: in the frame's own pixels (file row order, the pixels of the stars' fits), each
+  peak the green-sum peak halved in the plane's working units (about 0.8 of the star's brightest green site above the
+  sky, on the scale of `noise.sigma`), each flux the green sites' own sum. They are lent to the callback only: the
+  returned measurement and every figure of it are unchanged (`detected` stays empty on a mosaic).
+- `star_measure::PlaneMeasurement::reported_aperture_correction`, `reported_aperture_stars` and
+  `reported_aperture_se`: the aperture correction a Bayer mosaic measures on its green sites, reported apart and never
+  applied. The growth flux at `5F` sums the green sites within the disc and scales the sum by the star's own fitted
+  model's all-sites over green-sites sum within `5F` (the model point-sampled at the pixel centres, as the fit
+  evaluated it), so the dependence of a green sum on where the star's centre falls on the checkerboard cancels
+  (±10 % per star at FWHM 1.25 px, ±3 % at 1.5, ±0.5 % at 1.8). A disc whose green share is outside 0.45 to 0.55, or a
+  model whose green share is outside 0.35 to 0.65 or has no light, refuses the star; every candidate screen is the mono
+  path's. `None` / 0 on every other path.
+- `star_measure::CFA_APERTURE_VERSION` (2): the version of that number, bumped when only it changes. 1 divided the
+  green sum by the constant lattice density 0.5; 2 is the phase-matched growth above. `MEASURE_VERSION` stays 8.
+- `star_measure::analysis_mode::measure_raw_frame_and_list` with `ListRequest`, `ListPlacement`, `ListFit`,
+  `ListAperture`, `ListTimings`, `ListMeasurement` and `ListRefusal` (all `#[non_exhaustive]`): the Analysis
+  measurement, then a caller's list of native-pixel positions fitted and summed on the same plane (mono, a mosaic's
+  green sites). Two callbacks of the caller drive it. The first builds a `ListRequest` (`fit_positions`, the centre
+  tolerance) from the measurement; the first fit pass fits those positions at the measurement's β and field width with
+  the saturation verdict and the plane's mask, the near-clip class is the measured plane's own clip floor, and a detected
+  star other than a list star's own detection (the nearest one within the larger of the tolerance and one field FWHM)
+  keeps its `3F` disc out of the ring sky. The second callback gets those fits, in request order, and returns a
+  `ListPlacement`: the seeds of a second fit pass (`refit_positions`) and the centres, radii and sky annulus of the
+  aperture sums. `None` from it ends the list with the first fits alone. No aperture correction is measured: both passes
+  take the given unit correction, so no growth curve runs. Each fit returns its fitted centre, model flux, SNR, flags and
+  whether it was kept (accepted, not saturated or near the clip, centred within the tolerance of its seed).
+  Each `ListAperture` is a plain sum (no fit) at a position, in the fits' working units: the sky-subtracted sum inside
+  `radius_px` and one per extra radius, a pixel on the edge counting by its 4 × 4 sub-sampled share of the disc; on a
+  mosaic the green sites only, each green phase less its own sky and the sum scaled by the disc's area over its green
+  area. The sky is the mean over the phases of the annulus' grouped median (a fractional level read out of quantised
+  data, the quantum taken from the data: 1 on a 16-bit camera, 4 or 16 on a 14- or 12-bit one scaled to 16 bits; the
+  plain median otherwise), with the annulus' scatter and the highest pixel within a peak radius. `on_frame` is false
+  and every number NaN when the annulus or a disc leaves the plane, a site pixel in a disc is not finite or the annulus
+  holds no present pixel. A placement whose annulus starts inside the largest disc (less than its radius plus 0.75 px) is
+  unusable and ends the list with the first fits alone. The quantum is read from the window's gaps, each a whole
+  multiple of it, so a float file's `f32`-coded lattice stays quantised. `ListMeasurement` also carries the second pass's fits (`refits`), the plane's near-clip level
+  in working units (`clip_level`), the refusals of both passes and the wall time of the three steps (`ListTimings`). No
+  list is measured on a trailed or defocused plane (neither callback is called and the result is `None`: the plane's
+  verdict is the reason), for an empty request or for a tolerance that is not positive. A debayered three-plane file
+  returns an empty `ListMeasurement` with `refusal == Some(ListRefusal::ColourFrame)`. With the `test-support` feature,
+  `ListFit::test_kept` / `test_refused`, `ListAperture::test_new` and `ListMeasurement::test_new` build rows for a
+  caller's own tests.
+
+The Analysis measurement is bit-identical with and without a list (a test pins every `StarFit` field, every
+`FrameSummary` field and every `PlaneMeasurement` field but the wall-clock `timings` / `sub_steps`, on a mono frame,
+an RGGB and a GBRG mosaic and a 3-plane file, with both passes and the apertures run); `MEASURE_VERSION` stays 8.
+
+No existing output moves: `measure_green_sites` still returns `aperture_correction` `None`, no star's `signal`
+changes, and `aperture_stars`, `aperture_se`, `aperture_ratios` and the population's `aperture_se` are as before.
+`MeasureOptions` and `FitStarsOptions` gain no field. `PlaneMeasurement` gains three public fields, so it can no
+longer be built by a struct literal outside the crate (no known caller does).
+
 ## [1.8.0] — 2026-11-05
 
 The Analysis-mode entry of Athenaeum's star measurement moves here (port plan
