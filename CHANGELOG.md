@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-11-19
+
+The forced-list entry for photometric zero points: `measure_raw_frame_and_list`
+fits and sums a caller's list of catalogue positions on the plane the Analysis
+measurement measured (mono, or a Bayer mosaic's green sites), and a mosaic
+reports its green-site aperture correction apart, never applied. Additive: no
+existing output moves and `MEASURE_VERSION` stays 8.
+
 ### Added
 
 - `measure_raw_frame_and_list`: on a Bayer mosaic the first callback's `PlaneMeasurement::detected` carries the matched
