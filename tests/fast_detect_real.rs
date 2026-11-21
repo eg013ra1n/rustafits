@@ -21,7 +21,8 @@
 //!     floor is a regression tripwire: the scan-order stripe truncation this
 //!     gate caught scored 1–3%.
 //!
-//! Also asserts detection-count parity and that fast is not slower than slow.
+//! Also asserts detection-count parity and, in a release build only, that fast
+//! is not slower than slow.
 //!
 //! **Must be run in release mode** — debug builds make the matched-filter
 //! convolution slow enough to dominate everything:
@@ -164,13 +165,23 @@ fn run_one(file: &'static str, min_coverage: f32) -> Option<Measurement> {
         matched_frac * 100.0,
         min_coverage * 100.0,
     );
-    assert!(
-        fast_ms <= slow_ms + 50.0,
-        "{}: fast ({:.0} ms) is materially slower than slow ({:.0} ms) — regression",
-        file,
-        fast_ms,
-        slow_ms,
-    );
+    // A speed comparison, not a detection check, so it runs in a release build
+    // only (the header's command). The host application's workspace test run
+    // builds this crate at opt-level 2 with debug assertions, and there the
+    // slow path's parallel stages can finish first on a many-core machine (a
+    // 16-core Windows box, 2026-11-21: osc.fits fast 225 ms, slow 160 ms). A
+    // build with debug assertions checks detection and coverage only.
+    if cfg!(debug_assertions) {
+        eprintln!("  speed gate skipped: debug build (run with --release)");
+    } else {
+        assert!(
+            fast_ms <= slow_ms + 50.0,
+            "{}: fast ({:.0} ms) is materially slower than slow ({:.0} ms) — regression",
+            file,
+            fast_ms,
+            slow_ms,
+        );
+    }
 
     Some(Measurement {
         file,
