@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `tests/fast_detect_real.rs`: the "fast is not slower than slow" assertion runs in a release build only, the
+  file header's command. The host application's workspace test run builds this crate at opt-level 2 with debug
+  assertions; there, on a 16-core machine, the slow path's parallel stages finished first on `osc.fits` (225 ms
+  against 160 ms) and the test failed with every detection gate passing. The count and coverage gates still run in
+  every build. No library code changes.
+
 ## [1.9.0] — 2026-11-19
 
 The forced-list entry for photometric zero points: `measure_raw_frame_and_list`
