@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.1] — 2026-11-23
+
+A test hook for downstream goldens. No library output moves and `MEASURE_VERSION` stays 8.
+
 ### Added
 
 - `star_measure::PlanePrep::zero_timings` under the `test-support` feature (`#[doc(hidden)]`, not semver-covered):
