@@ -99,3 +99,41 @@ impl crate::star_measure::analysis_mode::ListMeasurement {
         }
     }
 }
+
+/// Wall-clock fields a downstream golden must not see.
+impl crate::star_measure::PlanePrep {
+    /// Zeroes the record's two wall-clock fields, its [`crate::star_measure::PhaseTimings`] and its verdict time:
+    /// the only stored fields that differ between two runs on the same plane. A downstream test that pins the stored
+    /// bytes of a first pass calls it on every record (the stacking kernel's pass-1 artifact golden). Every other field
+    /// is kept.
+    // doc(hidden): a downstream test hook (test-support), not semver-covered.
+    #[doc(hidden)]
+    pub fn zero_timings(&mut self) {
+        self.timings = crate::star_measure::PhaseTimings::default();
+        self.verdict_time = std::time::Duration::ZERO;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::star_measure::{PhaseTimings, PlanePrep};
+    use std::time::Duration;
+
+    #[test]
+    fn zero_timings_zeroes_the_two_wall_clock_fields_and_keeps_every_other() {
+        for starless in [false, true] {
+            let prep = PlanePrep::for_pin(starless);
+            assert_ne!(prep.timings, PhaseTimings::default(), "the fixture's timings are not zero");
+            assert_ne!(prep.verdict_time(), Duration::ZERO, "the fixture's verdict time is not zero");
+            let mut zeroed = prep.clone();
+            zeroed.zero_timings();
+            assert_eq!(zeroed.timings, PhaseTimings::default());
+            assert_eq!(zeroed.verdict_time(), Duration::ZERO);
+            // Put the two fields back: the record reads as the fixture again, so nothing else moved.
+            let mut back = zeroed;
+            back.timings = prep.timings;
+            back.verdict_time = prep.verdict_time();
+            assert_eq!(format!("{back:?}"), format!("{prep:?}"), "starless {starless}");
+        }
+    }
+}

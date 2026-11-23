@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `star_measure::PlanePrep::zero_timings` under the `test-support` feature (`#[doc(hidden)]`, not semver-covered):
+  zeroes a record's `PhaseTimings` and its verdict time, the only stored fields that differ between two runs on the
+  same plane, so a downstream test can pin a stored first pass byte for byte. It replaces a rewrite of the record's
+  serialised tail that such a test had to do, which broke on any change of the field order.
+
 ### Fixed
 
 - `tests/fast_detect_real.rs`: the "fast is not slower than slow" assertion runs in a release build only, the
