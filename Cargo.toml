@@ -39,7 +39,8 @@ lm-counters = []
 # `Serialize` / `Deserialize` on the `star_measure` and `stats` types (Athenaeum stores some of them: stacking config,
 # pass-1 artifacts). Off by default.
 serde = ["dep:serde"]
-# `star_measure::StarFit::test_at`, a fixture for downstream tests (Athenaeum's). Not semver-covered.
+# Hooks for downstream tests (Athenaeum's, the stacking kernel's): the `star_measure::StarFit::test_at` fixture and
+# `star_measure::PlanePrep::zero_timings`. Not semver-covered.
 test-support = []
 
 [dependencies]
