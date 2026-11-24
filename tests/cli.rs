@@ -307,6 +307,56 @@ fn info_summarises_headers_without_pixels() {
     assert!(all.contains("EXPTIME  = 30.0  / [s]") && all.contains("COMMENT  = synthetic"), "{all}");
 }
 
+/// `info --facts` prints one JSON object per file, in the order given: the file as given, then the frame facts as the
+/// catalog reads them (camelCase), one line each; a file that cannot be read gives a `{"file", "error"}` line.
+#[test]
+fn info_facts_prints_one_json_object_per_file() {
+    let dir = scratch("info-facts");
+    let extra = |exp: &str| {
+        vec![
+            format!("EXPOSURE= {exp:>20}"),
+            "IMAGETYP= 'LIGHT'".to_string(),
+            "BAYERPAT= 'RGGB'".to_string(),
+            "XBAYROFF= 1".to_string(),
+            "XORGSUBF= 100".to_string(),
+            "YORGSUBF= 8".to_string(),
+        ]
+    };
+    write_star_field(&dir.join("a.fits"), 1.5, &extra("30.0"));
+    write_star_field(&dir.join("b.fits"), 1.5, &extra("120.0"));
+    let o = run(&dir, &["info", "a.fits", "b.fits", "--facts"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    for ((line, exp), file) in lines.iter().zip([30.0, 120.0]).zip(["a.fits", "b.fits"]) {
+        assert!(line.starts_with(&format!("{{\"file\":\"{file}\",")), "the file comes first: {line}");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        assert_eq!(v["file"], file);
+        assert_eq!(v["format"], "fits");
+        assert_eq!((v["width"].as_i64(), v["height"].as_i64()), (Some(320), Some(240)));
+        assert_eq!(v["imagetyp"], "Light");
+        assert_eq!(v["exptimeS"].as_f64(), Some(exp));
+        assert_eq!(v["bayerpat"], "RGGB");
+        assert_eq!(v["xbayroff"].as_i64(), Some(1));
+        assert!(v["ybayroff"].is_null());
+        assert_eq!(v["origin"], serde_json::json!([100, 8]));
+    }
+    // `--facts` excludes the other output forms.
+    assert!(!run(&dir, &["info", "a.fits", "--facts", "--csv"]).status.success());
+    // A file that cannot be read gives its own line, in place, and a failing exit.
+    std::fs::write(dir.join("c.xisf"), b"not an xisf file").unwrap();
+    let o = run(&dir, &["info", "a.fits", "c.xisf", "b.fits", "--facts"]);
+    assert!(!o.status.success());
+    let out = stdout(&o);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    let bad: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(bad["file"], "c.xisf");
+    assert!(bad["error"].as_str().is_some_and(|e| !e.is_empty()), "{}", lines[1]);
+    assert!(lines[2].contains("\"file\":\"b.fits\""), "{out}");
+}
+
 /// `info` shows the Bayer pattern with the offsets folded in by Athenaeum's catalog rule: a quoted
 /// `XBAYROFF= '1'` counts (RGGB -> GRBG), the first of a repeated card wins, and the plain card is as before.
 #[test]

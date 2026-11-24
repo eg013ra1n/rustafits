@@ -5,11 +5,50 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.10.0] — 2026-11-24
+
+FITS files read from `.fits.gz`, `.fz` and extension HDUs (PR #5), a public header reader that follows Athenaeum's
+catalog rules, and a Moffat profile with the caller's own beta. No pixel of a plain FITS or XISF file decodes
+differently, and `MEASURE_VERSION` stays 8; the XISF header values that read differently are listed under Changed.
+
+### Changed
+
+- **The header values rustafits decides by are read by Athenaeum's catalog reader**, as the new `header` module ports
+  it: the FITS reader's `XBAYROFF` / `YBAYROFF`, the XISF reader's Bayer offsets, `star_measure::raw`'s `BITPIX` /
+  `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN` and `rustafits info --facts`; the crate-private copy of the older Analysis
+  rules (`formats::stored_keys`) is gone. A Bayer offset is read as the catalog's `frames.xbayroff` / `ybayroff`
+  columns are, so the render, the Analysis and the catalog agree. The built-in and `-k` columns of `rustafits info`
+  and `--all` / `--json` are unchanged: they list the decode's own keywords. What reads differently after the
+  switch, for library users:
+  - FITS: nothing. A FITS file's `BITPIX` / `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN` and its offsets are read on the
+    key as written, the first card winning, as before (`HIERARCH egain` is still not `EGAIN`). On 38,691 real FITS and
+    XISF files (an Athenaeum catalog and the test folders) no number or fold moves.
+  - XISF, `DATAMAX` / `EGAIN` / offsets: the last `<FITSKeyword>` of a name wins (was the first non-empty one, so an
+    empty value after a real one now hides it); a value
+    is read as written, so a ` / comment` after a number makes it no number (`XBAYROFF = 1 / off` is 0,
+    `EGAIN = 1.5 / e-/ADU` and `DATAMAX = 0.9 / saturation` are absent); a Fortran exponent such as `1.5D0` is read
+    for `DATAMAX` / `EGAIN` and is no number for an offset; `1.5'` (a stray quote) is no number; an offset's fraction
+    is cut, not rounded (`0.6` is 0, was 1); an infinite offset (`inf`) is now odd, so it folds (was 0); a value that
+    holds a `<FITSKeyword>` element is no second keyword (the offset it names is absent, the pattern unshifted).
+  - XISF, the Bayer offsets only: the name is the one written (` XBAYROFF` and `xbayroff` are not `XBAYROFF`);
+    `DATAMAX` / `EGAIN` names are still trimmed and upper-cased.
+  - An XISF header with no `<?xml` declaration or no `</xisf>` has no `DATAMAX` / `EGAIN` and no offsets (a warning
+    names the file); `read_header_key_map` and `read_frame_facts` refuse such a file, as Athenaeum's catalog does.
+    The XISF header is read up to 64 MB there (the pixel reader allows 100 MB).
+  - A gzipped, tile-compressed or extension-HDU FITS file is read by its logical header, the header the pixel reader
+    decodes. The catalog reads the primary header of a `.fits` with an image extension, so for that class a fact here
+    and the catalog's column can differ.
 
 ### Added
 
-- **FITS: gzipped, tile-compressed and extension-HDU images** — `.fits.gz`
+- **`header`** (public): `header_text`, `header_key_map` / `read_header_key_map` and `HeaderKeyMap`,
+  `resolve_default`, `read_frame_facts` and `FrameFacts` (the facts of a frame as the catalog's scanner reads them,
+  `serde` with camelCase names; `FrameFacts`, `HeaderField`, `HeaderValue` and `HeaderFormat` are
+  `#[non_exhaustive]`, and a `FrameFacts` document missing a later field decodes). `rustafits info --facts` prints
+  one JSON object per line, the `file` as given first, then the `FrameFacts` fields (a file that cannot be read gives
+  `{"file": …, "error": …}`); the `cli`
+  feature now also enables `serde` and an optional `serde_json`.
+- **FITS: gzipped, tile-compressed and extension-HDU images (PR #5)** — `.fits.gz`
   (gzip magic bytes), `.fz` tile-compressed images (RICE_1, GZIP_1, GZIP_2,
   HCOMPRESS_1, PLIO_1, lossless or quantized floats) and an image in the first
   image extension behind an empty primary (`NAXIS = 0`) are read through
@@ -25,6 +64,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the image in the primary HDU is read in place exactly as before
   (same bytes, same speed). 26 MP 16-bit frame (64-core x86_64): plain 46 ms,
   `.fz` RICE_1 ~120 ms, `.fits.gz` ~310 ms.
+- **`PsfModel::Moffat(β)`**: a Moffat profile at the caller's own β, on the config wire as `{"moffat": β}`. It fits as
+  `PsfModel::Fixed` does, in one pass and with no β sample, and `Moffat(4.0)` measures bit for bit like `Moffat4`
+  though it is a different config value. A β outside 1.5 to 100 fails to decode with "moffat beta must be within
+  [1.5, 100], got X". `"auto"` and `"moffat4"` serialize as before, so no stored hash moves.
+- **`examples/decode_hashes.rs`**: a decode-hash harness. `cargo run --release --example decode_hashes -- FILES_OR_DIRS`
+  prints a SHA-256 of what `ImageConverter::read_raw` returns for each file and of the output of every converter
+  mode (`plain`, `downscale2`, `downscale3`, `preview`, `no-debayer`, `vng`, `rgb`, `rgba`); `--synthetic <dir>`
+  first writes 20 synthetic FITS files (every BITPIX, BZERO 0 and 32768, both row orders, widths of every
+  remainder modulo 8, an OSC file with Bayer offsets, f32 with NaN, f32 RGB). Run it before and after a change to
+  a reader: two runs that agree prove no decoded bit moved. It uses the public API only, so it builds against an
+  older checkout.
 
 ## [1.9.1] — 2026-11-23
 

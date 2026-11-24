@@ -5,6 +5,7 @@ mod analysis;
 mod annotate;
 mod converter;
 mod geometry;
+pub mod header;
 #[cfg(feature = "debug-pipeline")]
 pub mod formats;
 #[cfg(not(feature = "debug-pipeline"))]

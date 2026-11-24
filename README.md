@@ -11,6 +11,7 @@ High-performance FITS/XISF to JPEG/PNG converter for astronomical images with au
 - **SIMD Optimized**: SSE2/AVX2 (x86_64) and NEON (aarch64) with automatic detection
 - **RGBA Output**: Optional RGBA pixel data for canvas/web display
 - **In-Memory API**: Get raw pixel data without file I/O — ideal for GUI apps
+- **Header Reader**: `astroimage::header` reads a FITS or XISF file's header text and key map and the facts of a frame (`read_frame_facts` → `FrameFacts`: size, frame type, exposure, filter, Bayer pattern and offsets, …) by Athenaeum's catalog rules, so a program that catalogs files and rustafits agree on every value; `rustafits info --facts` prints them as JSON
 - **Star Measurement**: the measurement behind Athenaeum's Analysis tab (`star_measure::analysis_mode`) — matched-filter detection, a Moffat fit per star, one beta per frame, FWHM/HFR/eccentricity/SNR medians, background and noise, and trail and defocus verdicts. `rustafits analyze` and `--annotate` run it. The older `ImageAnalyzer::analyze*` is deprecated since 1.8.0
 - **Plate-Solving Blocks**: quad pattern matching, RANSAC outlier rejection, gnomonic projection, affine/SIP transform fitting and a WCS you can write to a FITS header — building blocks, no catalogue and no orchestration (see [docs/platesolving.md](docs/platesolving.md))
 - **Fast Star Detection**: Lean single-pass detector that skips PSF fitting, SNR photometry, and trail detection — intended for pipelines that only need `(x, y, flux)` centroids (blind plate solving, quick previews). Runs in ~300–500 ms on a full-frame image vs. seconds for the legacy analyzer
@@ -126,10 +127,16 @@ tests/test.xisf  6224x4168  u16   RGGB   120.0  -        101  -10.0  2025-09-26T
 rustafits info night1/ -r -k FOCALLEN -k AIRMASS   # extra keyword columns
 rustafits info light.fits --all                    # every keyword
 rustafits info night1/ --json | --csv
+rustafits info night1/ --facts                     # one JSON object per file: its frame facts
 ```
 
 Columns come from the FITS cards N.I.N.A., SharpCap, ASIAIR etc. write, with
-XISF property ids as fallback (`Instrument:ExposureTime`, …).
+XISF property ids as fallback (`Instrument:ExposureTime`, …); they list the
+file's own keywords. `--facts` prints each file's `file` (as given) and its
+`FrameFacts` (size, frame type, exposure, gain, filter, Bayer pattern and
+offsets, sub-frame origin, …) as Athenaeum's catalog reads them (the first card
+of a repeated FITS keyword, the last `<FITSKeyword>` of a repeated XISF one); a
+file that cannot be read gives a `{"file": …, "error": …}` line.
 
 ### Star metrics: `rustafits analyze`
 

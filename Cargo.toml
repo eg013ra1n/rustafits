@@ -1,6 +1,6 @@
 [package]
 name = "rustafits"
-version = "1.9.1"
+version = "1.10.0"
 edition = "2021"
 authors = ["Vilen Sharifov <vilen.sharifov@gmail.com>"]
 description = "High-performance FITS to JPEG converter for astronomical images with auto-stretch and Bayer debayering"
@@ -30,14 +30,15 @@ required-features = ["debug-pipeline"]
 
 [features]
 default = ["cli"]
-# The `rustafits` binary: argument parsing and the batch progress bar. Library
+# The `rustafits` binary: argument parsing, the batch progress bar, and the JSON of `rustafits info --facts`. Library
 # users (Athenaeum) can set `default-features = false` to skip these deps.
-cli = ["dep:clap", "dep:clap_complete", "dep:indicatif"]
+cli = ["dep:clap", "dep:clap_complete", "dep:indicatif", "serde", "dep:serde_json"]
 debug-pipeline = []
 # Debug-only Moffat LM solve counters (iterations, refused steps, Jacobian / cost passes, pixels), zero numeric effect.
 lm-counters = []
-# `Serialize` / `Deserialize` on the `star_measure` and `stats` types (Athenaeum stores some of them: stacking config,
-# pass-1 artifacts). Off by default.
+# `Serialize` / `Deserialize` on the `header` types (`FrameFacts`, ...) and on the `star_measure` and `stats` types
+# (Athenaeum stores some of them: stacking config, pass-1 artifacts). Off by default in the library; the default `cli`
+# feature enables it.
 serde = ["dep:serde"]
 # Hooks for downstream tests (Athenaeum's, the stacking kernel's): the `star_measure::StarFit::test_at` fixture and
 # `star_measure::PlanePrep::zero_timings`. Not semver-covered.
@@ -66,6 +67,7 @@ rayon = "1.10"
 nalgebra = "0.35"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 clap = { version = "4.6", features = ["derive"], optional = true }
 clap_complete = { version = "4.6", optional = true }
 indicatif = { version = "0.18", optional = true }
@@ -94,3 +96,4 @@ strip = true
 [[example]]
 name = "bg_bench"
 required-features = ["debug-pipeline"]
+

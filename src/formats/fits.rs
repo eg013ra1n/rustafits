@@ -7,7 +7,6 @@ use anyhow::{bail, Context, Result};
 use fitsio_pure::hdu::{FitsData, Hdu, HduInfo};
 use rayon::prelude::*;
 
-use super::stored_keys::FitsHeader as CatalogHeader;
 use crate::types::{BayerPattern, DataType, FileFormat, HeaderKeyword, ImageHeader, ImageMetadata, PixelData};
 
 const FITS_BLOCK_SIZE: usize = 2880;
@@ -67,10 +66,11 @@ fn parse_string_keyword(card: &str, keyword: &str) -> Option<String> {
 /// collected (as the parser saw it) for [`read_fits_header_info`].
 ///
 /// `XBAYROFF` / `YBAYROFF` are the exception to the reader's own card parse:
-/// they come from Athenaeum's catalog reader (`stored_keys::FitsHeader`, over
-/// the same header blocks), so a quoted, lower-case or repeated card (the
-/// first one wins) means to the render, the Analysis numbers and the catalog
-/// what it means to the catalog. `path` only names the file in the warning.
+/// they come from the catalog's rule (`header`, over the same header blocks:
+/// `get_i32` on the key as written, the first card winning), so a quoted,
+/// lower-case or repeated card means to the render, the Analysis numbers and
+/// the catalog what it means to the catalog. `path` only names the file in
+/// the warning.
 fn read_fits_header<R: Read>(
     reader: &mut R,
     path: &Path,
@@ -142,10 +142,10 @@ fn read_fits_header<R: Read>(
     // read stay only if the catalog reader cannot parse this header at all. The
     // warning reaches a caller that installs a tracing subscriber (Athenaeum's
     // log); the `rustafits` binary installs none yet, so it shows nothing there.
-    match CatalogHeader::from_bytes(&header_bytes) {
-        Ok(catalog) => {
-            hdr.xbayroff = catalog.get_i32("XBAYROFF").unwrap_or(0);
-            hdr.ybayroff = catalog.get_i32("YBAYROFF").unwrap_or(0);
+    match crate::header::fits_bayer_offsets_of_blocks(&header_bytes) {
+        Ok((x, y)) => {
+            hdr.xbayroff = x.unwrap_or(0);
+            hdr.ybayroff = y.unwrap_or(0);
         }
         Err(e) => tracing::warn!(
             path = %path.display(),
@@ -926,8 +926,8 @@ mod tests {
         let mut seen = Vec::new();
         for cards in cases {
             let header = write_cfa_fits_raw(&path, cards);
-            let catalog = CatalogHeader::from_bytes(&header).unwrap();
-            let (x, y) = (catalog.get_i32("XBAYROFF").unwrap_or(0), catalog.get_i32("YBAYROFF").unwrap_or(0));
+            let (x, y) = crate::header::fits_bayer_offsets_of_blocks(&header).unwrap();
+            let (x, y) = (x.unwrap_or(0), y.unwrap_or(0));
             let want = super::super::shift_bayer_pattern(P::Rggb, x % 2 != 0, y % 2 != 0);
             assert_eq!(
                 both_readers_pattern(&path, &format!("{cards:?}")),
@@ -964,8 +964,8 @@ mod tests {
             !String::from_utf8_lossy(&header[..FITS_BLOCK_SIZE]).contains("XBAYROFF"),
             "the premise: the offset card is not in the first block"
         );
-        let catalog = CatalogHeader::from_bytes(&header).unwrap();
-        let (x, y) = (catalog.get_i32("XBAYROFF").unwrap_or(0), catalog.get_i32("YBAYROFF").unwrap_or(0));
+        let (x, y) = crate::header::fits_bayer_offsets_of_blocks(&header).unwrap();
+        let (x, y) = (x.unwrap_or(0), y.unwrap_or(0));
         assert_eq!((x, y), (1, 0), "the premise: the catalog reads the card in block 2");
         let want = super::super::shift_bayer_pattern(P::Rggb, x % 2 != 0, y % 2 != 0);
         assert_eq!(want, P::Grbg);
@@ -1000,7 +1000,7 @@ mod tests {
         bytes.resize(2 * FITS_BLOCK_SIZE, 0);
         std::fs::write(&path, bytes).unwrap();
         assert!(
-            CatalogHeader::from_bytes(&std::fs::read(&path).unwrap()[..FITS_BLOCK_SIZE]).is_err(),
+            crate::header::fits_bayer_offsets_of_blocks(&std::fs::read(&path).unwrap()[..FITS_BLOCK_SIZE]).is_err(),
             "the premise: the catalog reader does not find an END in this header"
         );
 
