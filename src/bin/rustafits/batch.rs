@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use astroimage::{ThreadPool, ThreadPoolBuilder};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-pub const INPUT_EXTENSIONS: &[&str] = &["fits", "fit", "fts", "xisf"];
+pub const INPUT_EXTENSIONS: &[&str] = &["fits", "fit", "fts", "fz", "xisf"];
 
 /// One input file, with its path relative to the directory it was found in
 /// (or just its file name when given directly) for mirroring under `-o DIR`.
