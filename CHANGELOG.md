@@ -5,7 +5,11 @@ All notable changes to rustafits will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.10.0] — 2026-11-24
+
+FITS files read from `.fits.gz`, `.fz` and extension HDUs (PR #5), a public header reader that follows Athenaeum's
+catalog rules, and a Moffat profile with the caller's own beta. No pixel of a plain FITS or XISF file decodes
+differently, and `MEASURE_VERSION` stays 8; the XISF header values that read differently are listed under Changed.
 
 ### Changed
 
@@ -44,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one JSON object per line, the `file` as given first, then the `FrameFacts` fields (a file that cannot be read gives
   `{"file": …, "error": …}`); the `cli`
   feature now also enables `serde` and an optional `serde_json`.
-- **FITS: gzipped, tile-compressed and extension-HDU images** — `.fits.gz`
+- **FITS: gzipped, tile-compressed and extension-HDU images (PR #5)** — `.fits.gz`
   (gzip magic bytes), `.fz` tile-compressed images (RICE_1, GZIP_1, GZIP_2,
   HCOMPRESS_1, PLIO_1, lossless or quantized floats) and an image in the first
   image extension behind an empty primary (`NAXIS = 0`) are read through
@@ -60,6 +64,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the image in the primary HDU is read in place exactly as before
   (same bytes, same speed). 26 MP 16-bit frame (64-core x86_64): plain 46 ms,
   `.fz` RICE_1 ~120 ms, `.fits.gz` ~310 ms.
+- **`PsfModel::Moffat(β)`**: a Moffat profile at the caller's own β, on the config wire as `{"moffat": β}`. It fits as
+  `PsfModel::Fixed` does, in one pass and with no β sample, and `Moffat(4.0)` measures bit for bit like `Moffat4`
+  though it is a different config value. A β outside 1.5 to 100 fails to decode with "moffat beta must be within
+  [1.5, 100], got X". `"auto"` and `"moffat4"` serialize as before, so no stored hash moves.
+- **`examples/decode_hashes.rs`**: a decode-hash harness. `cargo run --release --example decode_hashes -- FILES_OR_DIRS`
+  prints a SHA-256 of what `ImageConverter::read_raw` returns for each file and of the output of every converter
+  mode (`plain`, `downscale2`, `downscale3`, `preview`, `no-debayer`, `vng`, `rgb`, `rgba`); `--synthetic <dir>`
+  first writes 20 synthetic FITS files (every BITPIX, BZERO 0 and 32768, both row orders, widths of every
+  remainder modulo 8, an OSC file with Bayer offsets, f32 with NaN, f32 RGB). Run it before and after a change to
+  a reader: two runs that agree prove no decoded bit moved. It uses the public API only, so it builds against an
+  older checkout.
 
 ## [1.9.1] — 2026-11-23
 
