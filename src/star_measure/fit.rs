@@ -100,6 +100,27 @@ pub enum PsfModel {
     /// enum because `f64` has no total order.
     #[cfg_attr(feature = "serde", serde(skip))]
     Fixed(f64),
+    /// A Moffat profile at the caller's own β, on the config wire as `{"moffat": β}` (spelled `moffat` by
+    /// `rename_all`). It fits exactly as [`PsfModel::Fixed`] does, in one pass like [`PsfModel::Moffat4`], with no β
+    /// sample; `Moffat(4.0)` measures bit for bit like `Moffat4` but is a different config value. Decoding refuses a
+    /// β outside [`super::beta::BETA_BOUNDS`] ([`beta_in_bounds`]); `"auto"` and `"moffat4"` serialize as before.
+    #[cfg_attr(feature = "serde", serde(deserialize_with = "beta_in_bounds"))]
+    Moffat(f64),
+}
+
+/// Decode a β for [`PsfModel::Moffat`]: a number inside [`super::beta::BETA_BOUNDS`], else a decoding error
+/// "moffat beta must be within [1.5, 100], got X". (JSON cannot carry NaN; a NaN would fail the same test.)
+#[cfg(feature = "serde")]
+fn beta_in_bounds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let beta = f64::deserialize(d)?;
+    let (lo, hi) = super::beta::BETA_BOUNDS;
+    if (lo..=hi).contains(&beta) {
+        Ok(beta)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "moffat beta must be within [{lo}, {hi}], got {beta}"
+        )))
+    }
 }
 
 /// A detection to fit: centroid, background-subtracted peak and flux.
@@ -2265,7 +2286,7 @@ pub(super) fn resolve_beta(
 ) -> super::beta::SampleBeta {
     match model {
         PsfModel::Moffat4 => super::beta::SampleBeta::fixed(4.0),
-        PsfModel::Fixed(b) => super::beta::SampleBeta::fixed(b),
+        PsfModel::Fixed(b) | PsfModel::Moffat(b) => super::beta::SampleBeta::fixed(b),
         PsfModel::Auto => match passes {
             Some(v) => super::beta::verdict_beta(data, w, seeds, p, mask, v, extended, pool),
             None => super::beta::sample_beta(data, w, h, seeds, p, mask, field.fwhm_px, pool),
@@ -3496,6 +3517,111 @@ mod tests {
         // Its own would-be spelling reads as an unknown variant, exactly as
         // if `Fixed` were not declared at all.
         assert!(serde_json::from_str::<PsfModel>("{\"fixed\":6.0}").is_err());
+    }
+
+    /// P2-R18: `{"moffat": β}` round-trips, and a β outside `BETA_BOUNDS` fails to decode with the message.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn moffat_beta_round_trips_and_refuses_out_of_bounds() {
+        let m = PsfModel::Moffat(8.0);
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, "{\"moffat\":8.0}");
+        assert_eq!(serde_json::from_str::<PsfModel>(&json).unwrap(), m);
+        assert_eq!(
+            serde_json::from_str::<PsfModel>("{\"moffat\":1.5}").unwrap(),
+            PsfModel::Moffat(1.5)
+        );
+        assert_eq!(
+            serde_json::from_str::<PsfModel>("{\"moffat\":100.0}").unwrap(),
+            PsfModel::Moffat(100.0)
+        );
+        for (text, got) in [("1.0", "1"), ("101.0", "101"), ("-4.0", "-4")] {
+            let err = serde_json::from_str::<PsfModel>(&format!("{{\"moffat\":{text}}}"))
+                .expect_err("out of bounds must not decode");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("moffat beta must be within [1.5, 100], got {got}")),
+                "{msg}"
+            );
+        }
+    }
+
+    /// P2-R18: the names that were on the wire before `Moffat` keep their spelling, so no stored hash moves.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn auto_and_moffat4_serialize_unchanged() {
+        assert_eq!(serde_json::to_string(&PsfModel::Auto).unwrap(), "\"auto\"");
+        assert_eq!(
+            serde_json::to_string(&PsfModel::Moffat4).unwrap(),
+            "\"moffat4\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PsfModel>("\"auto\"").unwrap(),
+            PsfModel::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<PsfModel>("\"moffat4\"").unwrap(),
+            PsfModel::Moffat4
+        );
+    }
+
+    /// P2-R18: `Fixed` stays internal next to the new variant.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn fixed_still_refuses_to_serialize() {
+        assert!(serde_json::to_string(&PsfModel::Fixed(4.0)).is_err());
+        assert!(serde_json::from_str::<PsfModel>("{\"fixed\":4.0}").is_err());
+    }
+
+    /// P2-R18: `Moffat(4.0)` fits as `Moffat4` does, every field of every star with the same bits.
+    #[test]
+    fn moffat_4_on_the_wire_measures_bit_for_bit_like_moffat4() {
+        let stars = [
+            round(50.3, 60.7, 0.5),
+            round(140.2, 130.9, 0.3),
+            round(30.1, 150.4, 0.1),
+        ];
+        let data = moffat_field(200, 200, &stars, 4.0, 0.05);
+        let seeds = seeds_from(&stars, 4.0);
+        let fit = |model| fit_stars(&data, 200, 200, &seeds, model, &FitParams::default(), None);
+        let (a, b) = (fit(PsfModel::Moffat4), fit(PsfModel::Moffat(4.0)));
+        assert_eq!(a.fits.len(), 3);
+        assert_eq!(a.fits.len(), b.fits.len());
+        assert_eq!(a.beta.to_bits(), b.beta.to_bits());
+        assert_eq!(a.beta_source, b.beta_source);
+        for (x, y) in a.fits.iter().zip(&b.fits) {
+            let f = |s: &StarFit| {
+                [
+                    s.x,
+                    s.y,
+                    s.background,
+                    s.amplitude,
+                    s.fwhm_x,
+                    s.fwhm_y,
+                    s.fwtm_x,
+                    s.fwtm_y,
+                    s.theta,
+                    s.beta,
+                    s.residual,
+                    s.signal,
+                    s.area,
+                    s.peak5,
+                    s.sky_ring,
+                    s.sky_ring_sigma,
+                    s.snr,
+                    s.ap_sum,
+                    s.hfr,
+                ]
+                .map(f64::to_bits)
+            };
+            assert_eq!(f(x), f(y));
+            assert_eq!(x.sky_ring_n, y.sky_ring_n);
+            assert_eq!(x.flags, y.flags);
+        }
+        assert_eq!(
+            a.aperture_correction.map(f64::to_bits),
+            b.aperture_correction.map(f64::to_bits)
+        );
     }
 
     #[test]
