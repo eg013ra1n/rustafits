@@ -254,3 +254,180 @@ fn an_xisf_without_keywords_gives_athenaeum_s_placeholder_text() {
     assert!(!header_key_map(format, &text).has_keywords());
     assert!(!read_header_key_map(&xisf).unwrap().has_keywords());
 }
+
+// ---- the pinned inputs of the header rules, moved here from `formats::stored_keys` when it was removed ----
+//
+// Each pin read through the crate's older copy of Athenaeum's Analysis rules (`stored_keys`, Athenaeum at e6344ddd)
+// before starloom phase 2; it reads through `header` now, the catalog's own reader (P2-R1, P2-R23). A comment names
+// the pins whose value changed (the owner saw them at checkpoint 3, 2026-11-24, and ruled 1 and 2 on them); every
+// other expectation is the old one.
+
+use super::facts::fits_bayer_offsets;
+use super::text::xisf_keyword_pairs;
+
+/// An XISF header holding `children` (the `<FITSKeyword>`s) in an `<Image>`.
+fn xisf_xml(children: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0"><Image geometry="2:2:1">{children}</Image></xisf>"#
+    )
+}
+
+/// `XBAYROFF` of an XISF header holding `children`, as the catalog's column holds it.
+fn xisf_x(children: &str) -> Option<i64> {
+    xisf_bayer_offsets(&xisf_xml(children)).unwrap().0
+}
+
+/// What the catalog's reader returns for `XBAYROFF` on the shapes the Analysis rules read otherwise.
+#[test]
+fn xisf_rule_pins_the_catalogs_results() {
+    // An empty value in front is no value: the later keyword of the name wins.
+    assert_eq!(xisf_x(&format!("{}{}", kw("XBAYROFF", ""), kw("XBAYROFF", "1"))), Some(1));
+    assert_eq!(xisf_x(&format!("{}{}", kw("XBAYROFF", "''"), kw("XBAYROFF", "1"))), Some(1));
+    assert_eq!(xisf_x(&format!(r#"<FITSKeyword name="XBAYROFF"/>{}"#, kw("XBAYROFF", "1"))), Some(1), "no value attribute");
+    // The value is the raw attribute: a comment after the number makes it no number. Changed: was 1, 1 (the Analysis
+    // rule cut the value at " / "): sk-x04, rm-02, xu-04; sk-x05, xu-05.
+    assert_eq!(xisf_x(&kw("XBAYROFF", "1 / off")), None);
+    assert_eq!(xisf_x(&kw("XBAYROFF", "'1' / off")), None);
+    // An unclosed quote is no number.
+    assert_eq!(xisf_x(&kw("XBAYROFF", "'1")), None);
+    // The name is the one written. Changed: was 1, 1 (the Analysis rule trimmed and upper-cased the name): sk-x07,
+    // sk-x08, xu-09, xv-13.
+    assert_eq!(xisf_x(&kw(" XBAYROFF", "1")), None);
+    assert_eq!(xisf_x(&kw("xbayroff", "1")), None);
+    // The raw attribute is read, a character reference stays text.
+    assert_eq!(xisf_x(&kw("XBAYROFF", "&#49;")), None);
+    // The last element of a name wins. Changed: was 0 (the first non-empty value won): sk-x10, xv-15; xv-14 (1 then 0).
+    assert_eq!(xisf_x(&format!("{}{}", kw("XBAYROFF", "0"), kw("XBAYROFF", "1"))), Some(1));
+    assert_eq!(xisf_x(&format!("{}{}", kw("XBAYROFF", "1"), kw("XBAYROFF", "0"))), Some(0));
+    // Empty elements only: a start / end pair is not read.
+    assert_eq!(xisf_x(r#"<FITSKeyword name="XBAYROFF" value="1"></FITSKeyword>"#), None);
+    // A `<Property>` is not a keyword.
+    assert_eq!(xisf_x(r#"<Property id="XBAYROFF" type="Int32" value="1"/>"#), None);
+    // A lone quote is no pair of quotes; `'1'0'` has its outer pair stripped and `1'0` is no number.
+    assert_eq!(xisf_x(&kw("XBAYROFF", "'")), None);
+    assert_eq!(xisf_x(&kw("XBAYROFF", "'1'0'")), None);
+    // The header is cut at the first `<?xml`: a keyword in front of it is not read.
+    let before_the_cut = format!(r#"{}<?xml version="1.0"?><xisf><Image geometry="2:2:1"/></xisf>"#, kw("XBAYROFF", "1"));
+    assert_eq!(xisf_bayer_offsets(&before_the_cut).unwrap(), (None, None));
+    // A keyword value that holds an element is a value, not a second header. Changed: was 1 (the Analysis rule read
+    // the dump as XML first): sk-x23.
+    assert_eq!(xisf_x(&kw("Z", "<FITSKeyword name='XBAYROFF' value='1'/>")), None);
+}
+
+#[test]
+fn xisf_number_and_offset_read_as_the_catalog_reads_them() {
+    let xml = xisf_xml(&format!(
+        "{}{}{}{}{}{}",
+        kw("A", "1.5"),
+        kw("B", "'1.5'"),
+        kw("XBAYROFF", "0.6"),
+        kw("YBAYROFF", "-1"),
+        kw("C", "1D0"),
+        kw("D", "nan"),
+    ));
+    let map = header_key_map(HeaderFormat::Xisf, &super::text::xisf_header_text(xml.as_bytes(), Path::new("a.xisf")).unwrap());
+    assert_eq!(map.number("A"), Some(1.5));
+    assert_eq!(map.number("B"), Some(1.5));
+    assert_eq!(map.number("Z"), None);
+    assert_eq!(map.number("C"), Some(1.0), "a Fortran exponent");
+    assert!(map.number("D").is_some_and(f64::is_nan), "NaN as written");
+    // A fraction is cut, not rounded. Changed: 0.6 was 1: sk-x16, xv-06, xv-12.
+    assert_eq!(xisf_bayer_offsets(&xml).unwrap(), (Some(0), Some(-1)));
+    for (value, want) in [("1D0", None), ("nan", Some(0)), ("1.5", Some(1)), ("-0.6", Some(0)), ("x", None), ("", None)] {
+        assert_eq!(xisf_x(&kw("XBAYROFF", value)), want, "XBAYROFF {value:?}");
+    }
+}
+
+#[test]
+fn an_xisf_without_keywords_reads_no_offsets() {
+    assert_eq!(xisf_bayer_offsets(&xisf_xml("")).unwrap(), (None, None));
+    assert!(xisf_bayer_offsets("").is_err());
+    assert!(xisf_bayer_offsets("not xml at all").is_err());
+}
+
+/// The `<?xml` … `</xisf>` cut: a keyword after the closing tag is not read.
+#[test]
+fn a_keyword_after_the_closing_tag_is_not_read() {
+    let xml = format!(r#"junk<?xml version="1.0"?><xisf>{}</xisf>{}"#, kw("EGAIN", "1.5"), kw("DATAMAX", "9"));
+    let pairs = xisf_keyword_pairs(xml.as_bytes(), None).unwrap();
+    assert_eq!(pairs, vec![("EGAIN".to_string(), "1.5".to_string())]);
+}
+
+/// The keyword pass's parse-abort line names the file when the caller has it, and has no `path` field when it has
+/// not. A `</xisf>` inside a comment ends the cut section in the comment.
+#[test]
+fn the_parse_abort_log_line_carries_the_path_when_given() {
+    let xml = format!(r#"<?xml version="1.0"?><xisf><!-- </xisf> -->{}</xisf>"#, kw("EGAIN", "2"));
+    let path = Path::new("/data/a_frame.xisf");
+    let mut pairs = Vec::new();
+    let with = crate::test_support::captured_logs(|| pairs = xisf_keyword_pairs(xml.as_bytes(), Some(path)).unwrap());
+    assert!(with.contains("error parsing XISF XML header; using partial result"), "{with}");
+    assert!(with.contains("path=/data/a_frame.xisf"), "{with}");
+    assert!(pairs.is_empty(), "the keyword is past the cut: the partial result is empty");
+    let without = crate::test_support::captured_logs(|| pairs = xisf_keyword_pairs(xml.as_bytes(), None).unwrap());
+    assert!(without.contains("error parsing stored XISF XML header; using partial result"), "{without}");
+    assert!(!without.contains("path="), "{without}");
+}
+
+#[test]
+fn xisf_keywords_after_a_dangling_ampersand_are_still_read() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xisf>
+  <Property id="note">Dark & Flat calibration</Property>
+  <FITSKeyword name="OBJECT" value="'M42'" comment="" />
+  <FITSKeyword name="EXPTIME" value="120.0" />
+</xisf>"#;
+    let pairs = xisf_keyword_pairs(xml.as_bytes(), None).unwrap();
+    assert_eq!(pairs, vec![("OBJECT".to_string(), "M42".to_string()), ("EXPTIME".to_string(), "120.0".to_string())]);
+}
+
+/// A capture tool's plain `KEY = value` header dump reads as the stored text of an XISF header.
+#[test]
+fn a_plain_keyword_dump_reads_as_an_xisf_header_text() {
+    let dump = "XISF FITS Keywords:\n==================\n\nSIMPLE = T\nBITPIX = 16\nNAXIS = 2\nCOMMENT = \nFOCALLEN = 140.616\nXPIXSZ = 2.4\nOBJCTRA = 2 41 04.824\nOBJCTDEC = +62 56 44.95\nCROTA2 = 4.383973760472021\nCREATOR = a capture tool\n";
+    let map = header_key_map(HeaderFormat::Xisf, dump);
+    assert_eq!(map.get("FOCALLEN"), Some("140.616"));
+    assert_eq!(map.get("OBJCTRA"), Some("2 41 04.824"));
+    assert_eq!(map.get("OBJCTDEC"), Some("+62 56 44.95"));
+}
+
+/// 80-column FITS cards, `END`, padded to a 2880-byte block.
+fn fits_header_of(cards: &[&str]) -> fits_header_reader::FitsHeader {
+    let mut block = Vec::new();
+    for c in cards {
+        block.extend_from_slice(format!("{c:<80}").as_bytes());
+    }
+    block.extend_from_slice(format!("{:<80}", "END").as_bytes());
+    block.resize(block.len().div_ceil(2880) * 2880, b' ');
+    fits_header_reader::FitsHeader::from_bytes(&block).unwrap()
+}
+
+/// What the catalog's `FitsHeader` returns for `EGAIN` on card shapes a plain card parser reads otherwise.
+#[test]
+fn fits_rule_pins_the_catalogs_results() {
+    let egain = |cards: &[&str]| fits_header_of(cards).get_f64("EGAIN");
+    assert_eq!(egain(&["EGAIN    1.5"]), None);
+    assert_eq!(egain(&["EGAIN   =1.5"]), None);
+    assert_eq!(egain(&["EGAIN", "EGAIN   = 1.5"]), Some(1.5));
+    assert_eq!(egain(&["HIERARCH EGAIN = 1.5"]), Some(1.5));
+    assert_eq!(egain(&[" EGAIN  = 1.5"]), Some(1.5));
+    assert_eq!(egain(&["EGAIN   = '1.5&'"]), Some(1.5));
+    assert_eq!(egain(&["EGAIN   = '1.&'", "CONTINUE  '5'"]), Some(1.5));
+    assert_eq!(egain(&["EGAIN   = 1.5D0 / e-/ADU"]), Some(1.5));
+    assert_eq!(egain(&["EGAIN   = 1.5", "EGAIN   = 2.5"]), Some(1.5));
+    assert_eq!(egain(&["EGAIN   = '1.5'"]), Some(1.5));
+    assert_eq!(fits_header_of(&["BITPIX  = 16.0"]).get_i32("BITPIX"), Some(16));
+}
+
+/// The FITS offsets are the catalog column's: `get_i32` on the key as written, the first card winning.
+#[test]
+fn fits_bayer_offsets_are_the_catalogs_columns() {
+    let x = |cards: &[&str]| fits_bayer_offsets(&fits_header_of(cards)).0;
+    assert_eq!(x(&["XBAYROFF= 1"]), Some(1));
+    assert_eq!(x(&["XBAYROFF= '1'"]), Some(1));
+    assert_eq!(x(&["XBAYROFF= 0", "XBAYROFF= 1"]), Some(0), "the first card wins");
+    assert_eq!(x(&["XBAYROFF= 0.6"]), Some(0), "a fraction is cut");
+    assert_eq!(x(&["XBAYROFF= 1D0"]), Some(1), "a Fortran exponent");
+    assert_eq!(x(&["XBAYROFF= 1 / comment"]), Some(1));
+    assert_eq!(x(&[]), None);
+}

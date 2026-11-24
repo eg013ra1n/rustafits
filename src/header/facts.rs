@@ -32,7 +32,7 @@ use anyhow::Result;
 use super::chains::{resolve_default, HeaderField};
 use super::fits_header_reader::FitsHeader;
 use super::keys::HeaderKeyMap;
-use super::text::{detect_format, fits_header, read_xisf_header, xisf_keyword_element, xisf_xml_slice};
+use super::text::{detect_format, fits_header, read_xisf_header, xisf_keyword_element, xisf_keyword_pairs, xisf_xml_slice};
 use super::HeaderFormat;
 
 /// What a frame's header says, read by the catalog's rules (see the module docs of [`super`]).
@@ -179,10 +179,43 @@ fn text(keys: &HeaderKeyMap, field: HeaderField) -> Option<String> {
     resolve_default(field, keys).and_then(|v| v.as_text().map(str::to_string))
 }
 
+/// The scanner's `parse_offset`: an `i64`, else an `f64` truncated to `i64` (no `D` exponent; a fraction is cut, not
+/// rounded).
+fn parse_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+}
+
+/// `XBAYROFF` and `YBAYROFF` of a FITS header, as the catalog's `frames.xbayroff` / `ybayroff` columns hold them:
+/// `FitsHeader::get_i32` on the key as written, the first card of a keyword winning. The one function the facts, the
+/// FITS reader's Bayer fold and the render read the offsets by.
+pub(crate) fn fits_bayer_offsets(header: &FitsHeader) -> (Option<i32>, Option<i32>) {
+    (header.get_i32("XBAYROFF"), header.get_i32("YBAYROFF"))
+}
+
+/// The same offsets of a FITS header held as blocks (everything up to and including the `END` card's block).
+pub(crate) fn fits_bayer_offsets_of_blocks(blocks: &[u8]) -> Result<(Option<i32>, Option<i32>)> {
+    Ok(fits_bayer_offsets(&FitsHeader::from_bytes(blocks)?))
+}
+
+/// `XBAYROFF` and `YBAYROFF` of an XISF header, as the catalog's columns hold them: the scanner's `parse_offset` on
+/// the value of the `<FITSKeyword>` whose name is the key as written, the last element of a name winning. The one
+/// function the facts and the XISF reader's Bayer fold read the offsets by. `xml` is the XML header string.
+pub(crate) fn xisf_bayer_offsets(xml: &str) -> Result<(Option<i64>, Option<i64>)> {
+    Ok(xisf_offsets_of_pairs(&xisf_keyword_pairs(xml.as_bytes(), None)?))
+}
+
+/// [`xisf_bayer_offsets`] over the `<FITSKeyword>` pairs in document order.
+fn xisf_offsets_of_pairs(pairs: &[(String, String)]) -> (Option<i64>, Option<i64>) {
+    let last = |key: &str| pairs.iter().rev().find(|(name, _)| name == key).and_then(|(_, v)| parse_offset(v));
+    (last("XBAYROFF"), last("YBAYROFF"))
+}
+
 /// The facts of a FITS header (`build_frame_from_header`'s lines).
 pub(crate) fn facts_from_fits_header(header: &FitsHeader) -> FrameFacts {
     let keys = HeaderKeyMap::from_fits_header(header).with_format(HeaderFormat::Fits);
     let int = |key: &str| header.get_i32(key).map(i64::from);
+    let bayer_offsets = fits_bayer_offsets(header);
     let planes = match header.get_i32("NAXIS") {
         Some(n) if n >= 3 => int("NAXIS3"),
         Some(2) => Some(1),
@@ -213,8 +246,8 @@ pub(crate) fn facts_from_fits_header(header: &FitsHeader) -> FrameFacts {
         date_obs: header.get_str("DATE-OBS"),
         time_obs: header.get_str("TIME-OBS"),
         bayerpat: header.get_str("BAYERPAT"),
-        xbayroff: int("XBAYROFF"),
-        ybayroff: int("YBAYROFF"),
+        xbayroff: bayer_offsets.0.map(i64::from),
+        ybayroff: bayer_offsets.1.map(i64::from),
         roworder: header.get_str("ROWORDER"),
         origin: origin(&keys),
         calstat: non_blank(&keys, "CALSTAT"),
@@ -339,7 +372,7 @@ pub(crate) fn facts_from_xisf_xml(content: &[u8], path: &Path) -> Result<FrameFa
 
     // The twelve rule-driven fields: one resolver, the same one the FITS path calls. The
     // XISF pixel-size `<Property>` stays a last resort after the whole keyword order.
-    let keys = HeaderKeyMap::from_last_wins(keyword_pairs).with_format(HeaderFormat::Xisf);
+    let keys = HeaderKeyMap::from_last_wins(keyword_pairs.iter().cloned()).with_format(HeaderFormat::Xisf);
 
     let xbinning = fits_keywords.get("XBINNING")
         .and_then(|s| s.parse::<i32>().ok())
@@ -365,12 +398,7 @@ pub(crate) fn facts_from_xisf_xml(content: &[u8], path: &Path) -> Result<FrameFa
         }
     });
     // CFA phase offsets + row order. Absent keywords stay None; 0 is a real phase, not a default.
-    let parse_offset = |s: &String| -> Option<i64> {
-        let s = s.trim();
-        s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
-    };
-    let xbayroff = fits_keywords.get("XBAYROFF").and_then(parse_offset);
-    let ybayroff = fits_keywords.get("YBAYROFF").and_then(parse_offset);
+    let (xbayroff, ybayroff) = xisf_offsets_of_pairs(&keyword_pairs);
     let roworder = fits_keywords.get("ROWORDER")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());

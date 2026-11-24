@@ -126,10 +126,15 @@ tests/test.xisf  6224x4168  u16   RGGB   120.0  -        101  -10.0  2025-09-26T
 rustafits info night1/ -r -k FOCALLEN -k AIRMASS   # extra keyword columns
 rustafits info light.fits --all                    # every keyword
 rustafits info night1/ --json | --csv
+rustafits info night1/ --facts                     # one JSON object per file: its frame facts
 ```
 
 Columns come from the FITS cards N.I.N.A., SharpCap, ASIAIR etc. write, with
-XISF property ids as fallback (`Instrument:ExposureTime`, …).
+XISF property ids as fallback (`Instrument:ExposureTime`, …). Values are read by
+Athenaeum's catalog rules (the first card of a repeated FITS keyword, the last
+`<FITSKeyword>` of a repeated XISF one). `--facts` prints each file's
+`FrameFacts` (size, frame type, exposure, gain, filter, Bayer pattern and
+offsets, sub-frame origin, …) as the catalog stores them.
 
 ### Star metrics: `rustafits analyze`
 

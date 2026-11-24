@@ -35,13 +35,6 @@ pub use converter::ImageConverter;
 pub use output::encode_jpeg;
 pub use output::{encode_png, OutputFormat, PngCompression};
 pub use rayon::{ThreadPool, ThreadPoolBuilder};
-/// Not an API (`test-support` only, not semver-covered): the crate's older copy of Athenaeum's header rules
-/// (`formats::stored_keys`, Athenaeum at e6344ddd), reachable so that `examples/header_rules_diff.rs` can read every
-/// file through them and through [`header`] and list where the two read different values (starloom phase 2, Task 2,
-/// ruling P2-R23). Goes with `stored_keys`.
-#[cfg(feature = "test-support")]
-#[doc(hidden)]
-pub use formats::stored_keys::diff_shim as old_header_rules;
 /// The Moffat LM solve counters (feature `lm-counters`; zero numeric effect), reachable without `debug-pipeline`.
 #[cfg(feature = "lm-counters")]
 pub use analysis::fitting::lm_counters;

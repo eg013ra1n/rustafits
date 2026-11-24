@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Every header read goes through `header`**: the FITS reader's `XBAYROFF` / `YBAYROFF`, the XISF reader's Bayer
+  offsets, `star_measure::raw`'s `BITPIX` / `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN`, and every `rustafits info`
+  column read Athenaeum's catalog rules, as `header` ports them; the crate-private copy of the older Analysis rules
+  (`formats::stored_keys`) is gone. An offset is read as the catalog's `frames.xbayroff` / `ybayroff` columns are, so
+  the render, the Analysis and the catalog agree. On unusual XISF values the number changes: the last `<FITSKeyword>`
+  of a name wins (was the first non-empty one), the value is read verbatim (a ` / comment` after a number makes it
+  no number: `XBAYROFF = 1 / off` is 0, `EGAIN = 1.5 / e-/ADU` and `DATAMAX = 0.9 / saturation` are absent), an
+  offset's fraction is cut (`0.6` is 0, was 1), and a name is the one written (` XBAYROFF` and `xbayroff` are not
+  `XBAYROFF`). On 38,691 real FITS / XISF files of an Athenaeum catalog and test folders no number or fold moves.
+
 ### Added
 
+- **`header`** (public): `header_text`, `header_key_map` / `read_header_key_map` and `HeaderKeyMap`,
+  `resolve_default`, `read_frame_facts` and `FrameFacts` (the facts of a frame as the catalog's scanner reads them,
+  `serde` with camelCase names). `rustafits info --facts` prints one `FrameFacts` JSON object per line; the `cli`
+  feature now also enables `serde` and an optional `serde_json`.
 - **FITS: gzipped, tile-compressed and extension-HDU images** — `.fits.gz`
   (gzip magic bytes), `.fz` tile-compressed images (RICE_1, GZIP_1, GZIP_2,
   HCOMPRESS_1, PLIO_1, lossless or quantized floats) and an image in the first

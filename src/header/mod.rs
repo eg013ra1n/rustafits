@@ -19,8 +19,11 @@
 //!
 //! The module knows no Athenaeum card (`ATH_*`) and no card of the stacking kernel's.
 //!
-//! In this release the module sits beside the crate's older copy of Athenaeum's rules (`formats::stored_keys`,
-//! Athenaeum at e6344ddd), which the readers and `star_measure::raw` still use.
+//! Every header read in the crate goes through this module: the FITS and XISF readers' Bayer offsets
+//! (`formats::fits`, `formats::xisf`), the header facts of `star_measure::raw`, and every `rustafits info` column.
+//! The Bayer offsets are read exactly as the catalog's `frames.xbayroff` / `ybayroff` columns are (FITS
+//! `get_i32` on the key as written, the first card winning; XISF the scanner's `parse_offset` on the element named
+//! as written, the last one winning), so the render, the Analysis and the catalog agree.
 
 #![deny(missing_docs)]
 
@@ -37,6 +40,7 @@ mod tests;
 mod text;
 
 pub use chains::{resolve_default, HeaderField, HeaderValue};
+pub(crate) use facts::{fits_bayer_offsets_of_blocks, xisf_bayer_offsets};
 pub use facts::{read_frame_facts, FrameFacts};
 pub use keys::{header_key_map, normalize_keyword, HeaderKeyMap};
 

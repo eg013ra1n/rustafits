@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use astroimage::header::{read_frame_facts, read_header_key_map, HeaderKeyMap};
 use astroimage::{BayerPattern, FileFormat, ImageConverter, ImageHeader};
 use clap::Args;
 
@@ -24,16 +25,21 @@ pub struct InfoArgs {
     keywords: Vec<String>,
 
     /// Every keyword of every file instead of the summary table
-    #[arg(long, conflicts_with_all = ["json", "csv"])]
+    #[arg(long, conflicts_with_all = ["json", "csv", "facts"])]
     all: bool,
 
     /// JSON: one object per file with the layout and every keyword
-    #[arg(long, conflicts_with = "csv")]
+    #[arg(long, conflicts_with_all = ["csv", "facts"])]
     json: bool,
 
     /// CSV of the summary columns (plus -k columns)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "facts")]
     csv: bool,
+
+    /// One JSON object per line, per file: its frame facts as Athenaeum's catalog reads them (size, type, exposure,
+    /// gain, filter, Bayer pattern and offsets, sub-frame origin, ...). A file that cannot be read is reported on stderr
+    #[arg(long)]
+    facts: bool,
 }
 
 /// A summary column: header name and the keywords tried in order (FITS cards
@@ -50,10 +56,31 @@ const COLUMNS: &[(&str, &[&str])] = &[
 pub fn run(args: InfoArgs) -> Result<bool> {
     let inputs = batch::collect_inputs(&args.paths, args.recursive)?;
     let mut ok = true;
+    if args.facts {
+        for input in &inputs {
+            match read_frame_facts(&input.path) {
+                Ok(facts) => println!("{}", serde_json::to_string(&facts)?),
+                Err(e) => {
+                    ok = false;
+                    eprintln!("error: {}: {e:#}", input.path.display());
+                }
+            }
+        }
+        return Ok(ok);
+    }
     let mut headers = Vec::new();
+    let mut maps = Vec::new();
     for input in &inputs {
         match ImageConverter::read_header(&input.path) {
-            Ok(h) => headers.push((input.path.display().to_string(), h)),
+            Ok(h) => {
+                // The columns read the file's key map, by the catalog's rules; the layout and `--all` / `--json` still
+                // list the reader's own keywords.
+                let map = read_header_key_map(&input.path)
+                    .map_err(|e| eprintln!("warning: {}: header keys: {e:#}", input.path.display()))
+                    .ok();
+                headers.push((input.path.display().to_string(), h));
+                maps.push(map);
+            }
             Err(e) => {
                 ok = false;
                 eprintln!("error: {}: {e:#}", input.path.display());
@@ -71,10 +98,11 @@ pub fn run(args: InfoArgs) -> Result<bool> {
         cols.extend(args.keywords.iter().map(String::as_str));
         let rows: Vec<Vec<String>> = headers
             .iter()
-            .map(|(file, h)| {
+            .zip(&maps)
+            .map(|((file, h), map)| {
                 let mut row = vec![file.clone(), size(h), h.sample_type.to_string(), bayer(h.bayer_pattern).to_string()];
-                row.extend(COLUMNS.iter().map(|(_, keys)| first_of(h, keys)));
-                row.extend(args.keywords.iter().map(|k| first_of(h, &[k.as_str()])));
+                row.extend(COLUMNS.iter().map(|(_, keys)| first_of(h, map.as_ref(), keys)));
+                row.extend(args.keywords.iter().map(|k| first_of(h, map.as_ref(), &[k.as_str()])));
                 row
             })
             .collect();
@@ -88,8 +116,17 @@ pub fn run(args: InfoArgs) -> Result<bool> {
     Ok(ok)
 }
 
-fn first_of(h: &ImageHeader, keys: &[&str]) -> String {
-    keys.iter().find_map(|k| h.get(k)).filter(|v| !v.is_empty()).unwrap_or("-").to_string()
+/// The first of `keys` with a value, as the catalog's key map reads it (FITS: the first card of a keyword; XISF: the
+/// last `<FITSKeyword>`; names normalised). An XISF `<Property>` id (`Instrument:Camera:Gain`) is no keyword, so it
+/// is read from the reader's own list.
+fn first_of(h: &ImageHeader, map: Option<&HeaderKeyMap>, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|k| {
+            let from_map = map.and_then(|m| m.get(k)).map(str::trim).filter(|v| !v.is_empty());
+            from_map.or_else(|| if k.contains(':') { h.get(k).map(str::trim).filter(|v| !v.is_empty()) } else { None })
+        })
+        .unwrap_or("-")
+        .to_string()
 }
 
 fn size(h: &ImageHeader) -> String {

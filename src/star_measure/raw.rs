@@ -9,9 +9,10 @@
 //! only picks the full scale of the plane it is handed.
 //!
 //! **In rustafits** (port plan phase 4, `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md`): copied from
-//! Athenaeum's `analysis/input.rs` at e6344ddd. The header facts are read with Athenaeum's own header-value rules,
-//! ported as `formats::stored_keys` (ruling R-P4-C1: the Analysis numbers must not move on any input, malformed header
-//! values included); `ImageConverter::read_header` only says which format the file is. The Bayer offsets are not
+//! Athenaeum's `analysis/input.rs` at e6344ddd. The header facts are read with Athenaeum's catalog rules, as `header`
+//! ports them (R-P4-C1 read them from a copy of the Analysis rules at e6344ddd; since starloom phase 2, P2-R1 / P2-R23,
+//! from the catalog's current reader, so the number is the one the catalog holds); `ImageConverter::read_header` only
+//! says which format the file is. The Bayer offsets are not
 //! folded here: both rustafits readers fold `XBAYROFF` / `YBAYROFF` into the pattern they report. The rulings the docs
 //! cite (`PC-…`, `R-PC-…`) are Athenaeum's.
 
@@ -19,9 +20,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::formats::fits::routed_image_header;
-use crate::formats::stored_keys::{self, FitsHeader};
-use crate::formats::xisf::read_xisf_stored_keys;
+use crate::header::read_header_key_map;
 use crate::star_measure::Domain;
 use crate::{BayerPattern, FileFormat, ImageConverter, PixelData};
 
@@ -77,33 +76,29 @@ struct HeaderFacts {
     egain: Option<f64>,
 }
 
-/// The header facts of `path`, read by Athenaeum's own rules (`formats::stored_keys`, R-P4-C1). A FITS file reads
-/// `BITPIX` / `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN`; an XISF file reads `DATAMAX` / `EGAIN` only, its `BITPIX` /
-/// `BZERO` / `BSCALE` keywords (some writers copy a FITS layout into the XISF header) say nothing about the XISF
-/// samples.
+/// The header facts of `path`, read by Athenaeum's catalog rules (`header`, R-P4-C1 and starloom phase 2, P2-R1): the
+/// key map of the file's own header, as the scanner builds it (FITS: the first card of a keyword wins; XISF: the last
+/// `<FITSKeyword>` of a name wins, its value verbatim), and the catalog's number rule. A FITS file reads `BITPIX` /
+/// `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN`; an XISF file reads `DATAMAX` / `EGAIN` only, its `BITPIX` / `BZERO` /
+/// `BSCALE` keywords (some writers copy a FITS layout into the XISF header) say nothing about the XISF samples. A
+/// gzipped, tile-compressed or extension-HDU image reads the header of the image the pixel reader decodes.
 fn header_facts(path: &Path, xisf: bool) -> Result<HeaderFacts> {
+    let map = read_header_key_map(path).with_context(|| format!("header: {}", path.display()))?;
     if xisf {
-        let map = read_xisf_stored_keys(path)
-            .with_context(|| format!("XISF header: {}", path.display()))?;
         Ok(HeaderFacts {
             bitpix: None,
             bzero: 0.0,
             bscale: 1.0,
-            datamax: stored_keys::num(&map, "DATAMAX"),
-            egain: stored_keys::num(&map, "EGAIN"),
+            datamax: map.number("DATAMAX"),
+            egain: map.number("EGAIN"),
         })
     } else {
-        // A gzipped, tile-compressed or extension-HDU image: the header of the image the pixel reader decodes.
-        let h = match routed_image_header(path)? {
-            Some(blocks) => FitsHeader::from_bytes(&blocks)?,
-            None => FitsHeader::from_path(path)?,
-        };
         Ok(HeaderFacts {
-            bitpix: h.get_i32("BITPIX"),
-            bzero: h.get_f64("BZERO").unwrap_or(0.0),
-            bscale: h.get_f64("BSCALE").unwrap_or(1.0),
-            datamax: h.get_f64("DATAMAX"),
-            egain: h.get_f64("EGAIN"),
+            bitpix: map.integer("BITPIX").map(|v| v as i32),
+            bzero: map.number("BZERO").unwrap_or(0.0),
+            bscale: map.number("BSCALE").unwrap_or(1.0),
+            datamax: map.number("DATAMAX"),
+            egain: map.number("EGAIN"),
         })
     }
 }
@@ -746,9 +741,11 @@ mod tests {
         assert_eq!(facts(&["EGAIN   = 1.5", "EGAIN   = 2.5"]).2, Some(1.5));
     }
 
-    /// R-P4-C1: the XISF facts are read by Athenaeum's text rule (`formats::stored_keys`), not by
-    /// `ImageHeader::get`. Each case is a `<FITSKeyword>` / element shape the two read differently; the result is
-    /// Athenaeum's (the commented one is what `ImageHeader::get` + `num` would give).
+    /// The XISF facts are read by the catalog's key map (`header`): the last `<FITSKeyword>` of a name wins, its value
+    /// verbatim, read by the catalog's number rule; not by `ImageHeader::get`. Each case is a `<FITSKeyword>` /
+    /// element shape the two read differently; the result is the catalog's. Two cases read otherwise before starloom
+    /// phase 2 (P2-R23): a value with a ` / ` comment after it was cut to its number, and is now no number (pinned
+    /// inputs rx-03, rx-04, rx-11).
     #[test]
     fn xisf_facts_read_as_athenaeum_reads_them_on_unusual_values() {
         let dir = tempfile::tempdir().unwrap();
@@ -765,9 +762,10 @@ mod tests {
         // An empty value is skipped and a later keyword of the name wins (no gain).
         assert_eq!(gain(format!("{}{}", keyword("EGAIN", ""), keyword("EGAIN", "1.5"))), Some(1.5));
         assert_eq!(gain(format!("{}{}", keyword("EGAIN", "''"), keyword("EGAIN", "1.5"))), Some(1.5));
-        // The value is cut at " / " (no gain).
-        assert_eq!(gain(keyword("EGAIN", "1.5 / e-/ADU")), Some(1.5));
-        assert_eq!(gain(keyword("EGAIN", "'1.5' / e-/ADU")), Some(1.5));
+        // The value is the raw attribute: a comment after the number makes it no number (was Some(1.5) twice: rx-03,
+        // rx-04).
+        assert_eq!(gain(keyword("EGAIN", "1.5 / e-/ADU")), None);
+        assert_eq!(gain(keyword("EGAIN", "'1.5' / e-/ADU")), None);
         // An unclosed quote drops the line (gain 1.5).
         assert_eq!(gain(keyword("EGAIN", "'1.5")), None);
         // The name is trimmed and upper-cased; a character reference stays text (gain 1.5).
@@ -779,12 +777,13 @@ mod tests {
         // DATAMAX goes the same way (the clip is 0.9 x 65535 when read, else the full scale).
         let read_clip = 0.9 * 65535.0;
         assert!((clip(format!("{}{}", keyword("DATAMAX", ""), keyword("DATAMAX", "0.9"))) - read_clip).abs() < 1e-6);
-        assert!((clip(keyword("DATAMAX", "0.9 / saturation")) - read_clip).abs() < 1e-6);
+        // A comment after the number: no number, the full scale (was the 0.9 clip: rx-11).
+        assert_eq!(clip(keyword("DATAMAX", "0.9 / saturation")), 65535.0);
         assert_eq!(clip(keyword("DATAMAX", "'0.9")), 65535.0);
     }
 
-    /// R-P4-C1 through `read_raw_frame`: the reader's fold reads the offsets by the same text rule (the reader's own
-    /// test lists more shapes).
+    /// Through `read_raw_frame`: the reader's fold reads the offsets by the catalog's rule (the reader's own test
+    /// lists more shapes).
     #[test]
     fn an_xisf_mosaic_reads_unusual_offset_values_as_athenaeum_reads_them() {
         use BayerPattern::{Grbg, Rggb};
@@ -793,7 +792,8 @@ mod tests {
         let pat = keyword("BAYERPAT", "'RGGB'");
         let cases = [
             ("empty, then 1", format!("{}{}", keyword("XBAYROFF", ""), keyword("XBAYROFF", "1")), Grbg),
-            ("1 / off", keyword("XBAYROFF", "1 / off"), Grbg),
+            // No number (was Grbg: the old rule cut the value at " / "; pinned input sk-x04).
+            ("1 / off", keyword("XBAYROFF", "1 / off"), Rggb),
             ("unclosed quote", keyword("XBAYROFF", "'1"), Rggb),
         ];
         for (label, offsets, expected) in cases {
@@ -803,6 +803,34 @@ mod tests {
                 other => panic!("{label}: expected Cfa, got {other:?}"),
             }
         }
+    }
+
+    /// `DATAMAX` and `EGAIN` are read by the catalog's rules (`header`, starloom phase 2): in a FITS file the first
+    /// card of a keyword wins and a quoted number is unquoted; in an XISF file the last `<FITSKeyword>` of a name wins
+    /// and its value is read verbatim (the outer quotes of the attribute are the element's).
+    #[test]
+    fn star_measure_reads_datamax_and_egain_by_the_catalog_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let fits = dir.path().join("a.fits");
+        write_fits_cards(
+            &fits,
+            &["DATAMAX = '30000'", "EGAIN   = 1.5", "EGAIN   = 2.5", "DATAMAX = 40000"].map(String::from),
+        );
+        assert_eq!(raw(&read_raw_frame(&fits).unwrap()).0, 30000.0, "FITS: the first DATAMAX card, unquoted");
+        assert_eq!(raw(&read_raw_frame(&fits).unwrap()).2, Some(1.5), "FITS: the first EGAIN card wins");
+
+        let xisf = dir.path().join("a.xisf");
+        let children = format!(
+            "{}{}{}{}",
+            keyword("DATAMAX", "'0.5'"),
+            keyword("EGAIN", "1.5"),
+            keyword("EGAIN", "2.5"),
+            keyword("DATAMAX", "'0.9'"),
+        );
+        write_xisf(&xisf, "2:2:1", "Float32", &children, &lef32(&[0.0, 0.25, 0.5, 1.0]));
+        let (clip, _, gain) = raw(&read_raw_frame(&xisf).unwrap());
+        assert!((clip - 0.9 * 65535.0).abs() < 1e-6, "XISF: the last DATAMAX element wins, got {clip}");
+        assert_eq!(gain, Some(2.5), "XISF: the last EGAIN element wins");
     }
 
     /// A gzipped or tile-compressed frame reads as its plain form does: the header facts come from the image's own
