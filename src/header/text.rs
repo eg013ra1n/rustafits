@@ -3,7 +3,9 @@
 //! `xisf_xml_slice`, `xisf_keyword_element`, `xisf_keyword_pairs`, `xisf_header_text`, `extract_fits_header`,
 //! `extract_xisf_header`), bodies unchanged apart from paths. One addition: a gzipped, tile-compressed or
 //! extension-HDU FITS file is read by its logical header, the header blocks `formats::fits::routed_image_header`
-//! returns (PR #5's rule; Athenaeum's catalog does not index such files).
+//! returns (PR #5's rule). The catalog reads the primary header of a `.fits` with an image extension, so for that
+//! class the text here (the extension's) and the catalog's differ; a gzipped or tile-compressed file the catalog
+//! does not index.
 
 use std::io::{BufReader, Read};
 use std::path::Path;

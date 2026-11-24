@@ -9,21 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Every header read goes through `header`**: the FITS reader's `XBAYROFF` / `YBAYROFF`, the XISF reader's Bayer
-  offsets, `star_measure::raw`'s `BITPIX` / `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN`, and every `rustafits info`
-  column read Athenaeum's catalog rules, as `header` ports them; the crate-private copy of the older Analysis rules
-  (`formats::stored_keys`) is gone. An offset is read as the catalog's `frames.xbayroff` / `ybayroff` columns are, so
-  the render, the Analysis and the catalog agree. On unusual XISF values the number changes: the last `<FITSKeyword>`
-  of a name wins (was the first non-empty one), the value is read verbatim (a ` / comment` after a number makes it
-  no number: `XBAYROFF = 1 / off` is 0, `EGAIN = 1.5 / e-/ADU` and `DATAMAX = 0.9 / saturation` are absent), an
-  offset's fraction is cut (`0.6` is 0, was 1), and a name is the one written (` XBAYROFF` and `xbayroff` are not
-  `XBAYROFF`). On 38,691 real FITS / XISF files of an Athenaeum catalog and test folders no number or fold moves.
+- **The header values rustafits decides by are read by Athenaeum's catalog reader**, as the new `header` module ports
+  it: the FITS reader's `XBAYROFF` / `YBAYROFF`, the XISF reader's Bayer offsets, `star_measure::raw`'s `BITPIX` /
+  `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN` and `rustafits info --facts`; the crate-private copy of the older Analysis
+  rules (`formats::stored_keys`) is gone. A Bayer offset is read as the catalog's `frames.xbayroff` / `ybayroff`
+  columns are, so the render, the Analysis and the catalog agree. The built-in and `-k` columns of `rustafits info`
+  and `--all` / `--json` are unchanged: they list the decode's own keywords. What reads differently after the
+  switch, for library users:
+  - FITS: nothing. A FITS file's `BITPIX` / `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN` and its offsets are read on the
+    key as written, the first card winning, as before (`HIERARCH egain` is still not `EGAIN`). On 38,691 real FITS and
+    XISF files (an Athenaeum catalog and the test folders) no number or fold moves.
+  - XISF, `DATAMAX` / `EGAIN` / offsets: the last `<FITSKeyword>` of a name wins (was the first non-empty one, so an
+    empty value after a real one now hides it); a value
+    is read as written, so a ` / comment` after a number makes it no number (`XBAYROFF = 1 / off` is 0,
+    `EGAIN = 1.5 / e-/ADU` and `DATAMAX = 0.9 / saturation` are absent); a Fortran exponent such as `1.5D0` is read
+    for `DATAMAX` / `EGAIN` and is no number for an offset; `1.5'` (a stray quote) is no number; an offset's fraction
+    is cut, not rounded (`0.6` is 0, was 1); an infinite offset (`inf`) is now odd, so it folds (was 0); a value that
+    holds a `<FITSKeyword>` element is no second keyword (the offset it names is absent, the pattern unshifted).
+  - XISF, the Bayer offsets only: the name is the one written (` XBAYROFF` and `xbayroff` are not `XBAYROFF`);
+    `DATAMAX` / `EGAIN` names are still trimmed and upper-cased.
+  - An XISF header with no `<?xml` declaration or no `</xisf>` has no `DATAMAX` / `EGAIN` and no offsets (a warning
+    names the file); `read_header_key_map` and `read_frame_facts` refuse such a file, as Athenaeum's catalog does.
+    The XISF header is read up to 64 MB there (the pixel reader allows 100 MB).
+  - A gzipped, tile-compressed or extension-HDU FITS file is read by its logical header, the header the pixel reader
+    decodes. The catalog reads the primary header of a `.fits` with an image extension, so for that class a fact here
+    and the catalog's column can differ.
 
 ### Added
 
 - **`header`** (public): `header_text`, `header_key_map` / `read_header_key_map` and `HeaderKeyMap`,
   `resolve_default`, `read_frame_facts` and `FrameFacts` (the facts of a frame as the catalog's scanner reads them,
-  `serde` with camelCase names). `rustafits info --facts` prints one `FrameFacts` JSON object per line; the `cli`
+  `serde` with camelCase names; `FrameFacts`, `HeaderField`, `HeaderValue` and `HeaderFormat` are
+  `#[non_exhaustive]`, and a `FrameFacts` document missing a later field decodes). `rustafits info --facts` prints
+  one JSON object per line, the `file` as given first, then the `FrameFacts` fields (a file that cannot be read gives
+  `{"file": …, "error": …}`); the `cli`
   feature now also enables `serde` and an optional `serde_json`.
 - **FITS: gzipped, tile-compressed and extension-HDU images** — `.fits.gz`
   (gzip magic bytes), `.fz` tile-compressed images (RICE_1, GZIP_1, GZIP_2,

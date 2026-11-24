@@ -72,16 +72,17 @@ impl HeaderKeyMap {
         self.get(key).and_then(|v| parse_fits_f64(v.trim()))
     }
 
-    /// A keyword's value as an integer, by the rule of the catalog's scanner line for the map's format, the rule it
-    /// reads `XBAYROFF` / `YBAYROFF` with:
+    /// A keyword's value as an integer, by the rule of the catalog's scanner line for the map's format, over the
+    /// NORMALISED lookup of [`HeaderKeyMap::get`]. It is not what the catalog's `xbayroff` / `ybayroff` columns hold:
+    /// those read the name as written, in FITS (`FitsHeader::get_i32`, so `HIERARCH xbayroff` is not `XBAYROFF`) and
+    /// in XISF (the element's `name`, last wins), and are [`FrameFacts::xbayroff`](super::FrameFacts::xbayroff) /
+    /// [`FrameFacts::ybayroff`](super::FrameFacts::ybayroff) (from [`read_frame_facts`](super::read_frame_facts)).
+    /// The rule per format:
     ///
     /// - FITS: `FitsHeader::get_i32` (an `i64` cut to 32 bits, else a `parse_fits_f64` number truncated to `i32`),
     ///   widened to `i64`. `'1'` is 1 (the card rule unquotes it), `0.6` is 0, `1D0` is 1.
     /// - XISF: the scanner's `parse_offset` (an `i64`, else an `f64` truncated to `i64`; no `D` exponent). `0.6` is
     ///   0, `1D0` is `None`.
-    ///
-    /// The key is looked up as [`HeaderKeyMap::get`] looks it up (normalised); the catalog's XISF scanner line looks
-    /// the name up as written (see [`super::read_frame_facts`]).
     pub fn integer(&self, key: &str) -> Option<i64> {
         let s = self.get(key)?.trim();
         match self.format {

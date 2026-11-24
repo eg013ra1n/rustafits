@@ -2,7 +2,9 @@
 //! `fits_parser::build_frame_from_header` for FITS, `parse_xisf_xml` for XISF, at ff7e0ca3), under the default rules.
 //!
 //! Each field is read the way the scanner reads the column it fills, so a fact equals what the catalog stores for the
-//! file under Athenaeum's default header rules:
+//! file under Athenaeum's default header rules. (Exception: a `.fits` with an image extension behind an empty primary
+//! is read by the extension's logical header, as the pixel reader decodes it, where the catalog stores the primary's;
+//! see the module docs of [`super`].)
 //!
 //! - the twelve rule-driven fields through [`resolve_default`] over the file's key map (FITS: the cards, the first of a
 //!   keyword winning; XISF: the `<FITSKeyword>` elements, the last winning), and for XISF the pixel-size
@@ -16,8 +18,9 @@
 //! - `imagetyp`: Athenaeum's `ImageType::from_str` (upper-cased, the names its `ImageType` serializes to), `IMAGETYP`
 //!   first, then `FRAME`;
 //! - `origin`: Athenaeum's `calibration::geometry::origin_from_keys` (`XORGSUBF` and `YORGSUBF`, both or neither, an
-//!   integral real counting); `calstat`: the trimmed, non-blank `CALSTAT` its calibrated-light check reads; `egain`:
-//!   [`HeaderKeyMap::number`].
+//!   integral real counting); `calstat`: the trimmed, non-blank `CALSTAT` its calibrated-light check reads; `egain`
+//!   (not a catalog column; read as Athenaeum's stacker reads it): FITS `FitsHeader::get_f64` on the key as written,
+//!   the first card winning, XISF [`HeaderKeyMap::number`].
 //!
 //! Not the scanner's (it stores no such column): `planes` and `bitpix`. FITS reads them from `NAXIS` / `NAXIS3` and
 //! `BITPIX`; XISF from the third `<Image geometry>` component and the `sampleFormat` of the same element (`UInt8` is 8,
@@ -36,8 +39,16 @@ use super::text::{detect_format, fits_header, read_xisf_header, xisf_keyword_ele
 use super::HeaderFormat;
 
 /// What a frame's header says, read by the catalog's rules (see the module docs of [`super`]).
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "camelCase"))]
+///
+/// The struct is `#[non_exhaustive]` and, with `serde`, decodes a document that lacks a later field (the field is
+/// `None`): start from [`FrameFacts::default`] to build one.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase", default)
+)]
+#[non_exhaustive]
 pub struct FrameFacts {
     /// The header's format.
     pub format: HeaderFormat,
@@ -58,7 +69,8 @@ pub struct FrameFacts {
     pub gain: Option<f64>,
     /// Camera offset setting (the `Offset` chain).
     pub offset: Option<f64>,
-    /// `EGAIN`, e- per ADU, as [`HeaderKeyMap::number`] reads it.
+    /// `EGAIN`, e- per ADU (FITS: `FitsHeader::get_f64` on the key as written, the first card winning; XISF:
+    /// [`HeaderKeyMap::number`]).
     pub egain: Option<f64>,
     /// Sensor temperature, °C (the `CcdTemp` chain).
     pub ccd_temp: Option<f64>,
@@ -200,9 +212,24 @@ pub(crate) fn fits_bayer_offsets_of_blocks(blocks: &[u8]) -> Result<(Option<i32>
 
 /// `XBAYROFF` and `YBAYROFF` of an XISF header, as the catalog's columns hold them: the scanner's `parse_offset` on
 /// the value of the `<FITSKeyword>` whose name is the key as written, the last element of a name winning. The one
-/// function the facts and the XISF reader's Bayer fold read the offsets by. `xml` is the XML header string.
-pub(crate) fn xisf_bayer_offsets(xml: &str) -> Result<(Option<i64>, Option<i64>)> {
-    Ok(xisf_offsets_of_pairs(&xisf_keyword_pairs(xml.as_bytes(), None)?))
+/// function the facts and the XISF reader's Bayer fold read the offsets by. `xml` is the XML header string; `path`
+/// names the file in logs. A header with no `<?xml` or no `</xisf>` reads as no offsets, with a warning (the fold
+/// must not fail a render over keywords it cannot read).
+pub(crate) fn xisf_bayer_offsets(xml: &str, path: Option<&Path>) -> (Option<i64>, Option<i64>) {
+    match xisf_keyword_pairs(xml.as_bytes(), path) {
+        Ok(pairs) => xisf_offsets_of_pairs(&pairs),
+        Err(e) => {
+            match path {
+                Some(path) => tracing::warn!(
+                    path = %path.display(),
+                    error = %format!("{e:#}"),
+                    "XISF keywords unreadable; no Bayer offsets"
+                ),
+                None => tracing::warn!(error = %format!("{e:#}"), "XISF keywords unreadable; no Bayer offsets"),
+            }
+            (None, None)
+        }
+    }
 }
 
 /// [`xisf_bayer_offsets`] over the `<FITSKeyword>` pairs in document order.
@@ -231,7 +258,7 @@ pub(crate) fn facts_from_fits_header(header: &FitsHeader) -> FrameFacts {
         exptime_s: number(&keys, HeaderField::Exptime),
         gain: number(&keys, HeaderField::Gain),
         offset: number(&keys, HeaderField::Offset),
-        egain: keys.number("EGAIN"),
+        egain: header.get_f64("EGAIN"),
         ccd_temp: number(&keys, HeaderField::CcdTemp),
         set_temp: number(&keys, HeaderField::SetTemp),
         filter: text(&keys, HeaderField::Filter),

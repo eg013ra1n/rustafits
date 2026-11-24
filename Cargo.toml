@@ -36,8 +36,9 @@ cli = ["dep:clap", "dep:clap_complete", "dep:indicatif", "serde", "dep:serde_jso
 debug-pipeline = []
 # Debug-only Moffat LM solve counters (iterations, refused steps, Jacobian / cost passes, pixels), zero numeric effect.
 lm-counters = []
-# `Serialize` / `Deserialize` on the `star_measure` and `stats` types (Athenaeum stores some of them: stacking config,
-# pass-1 artifacts). Off by default.
+# `Serialize` / `Deserialize` on the `header` types (`FrameFacts`, ...) and on the `star_measure` and `stats` types
+# (Athenaeum stores some of them: stacking config, pass-1 artifacts). Off by default in the library; the default `cli`
+# feature enables it.
 serde = ["dep:serde"]
 # Hooks for downstream tests (Athenaeum's, the stacking kernel's): the `star_measure::StarFit::test_at` fixture and
 # `star_measure::PlanePrep::zero_timings`. Not semver-covered.

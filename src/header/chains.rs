@@ -19,6 +19,7 @@ enum FieldKind {
 /// The twelve catalog fields whose header keywords Athenaeum's user orders. Declaration order is the order of
 /// Athenaeum's Settings section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum HeaderField {
     /// Sensor temperature, °C (`CCD-TEMP`, then `DET-TEMP`).
     CcdTemp,
@@ -112,6 +113,7 @@ impl HeaderField {
 
 /// A resolved header value.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum HeaderValue {
     /// A text field's value, trimmed and not blank.
     Text(String),

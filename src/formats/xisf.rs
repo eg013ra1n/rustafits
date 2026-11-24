@@ -234,7 +234,7 @@ fn parse_image_attrs(e: &quick_xml::events::BytesStart) -> Result<XisfImageInfo>
     Ok(info)
 }
 
-fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
+fn parse_xisf_xml(xml: &str, path: Option<&Path>) -> Result<XisfImageInfo> {
     let mut info: Option<XisfImageInfo> = None;
 
     let mut reader = Reader::from_str(xml);
@@ -324,7 +324,7 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
     // addresses pixel (0, 0) of the stored frame — as `formats::fits` does. A
     // file without a pattern has nothing to shift and skips the keyword pass.
     if info.bayer_pattern != BayerPattern::None {
-        let (odd_x, odd_y) = odd_bayer_offsets(xml);
+        let (odd_x, odd_y) = odd_bayer_offsets(xml, path);
         info.bayer_pattern = super::shift_bayer_pattern(info.bayer_pattern, odd_x, odd_y);
     }
 
@@ -336,15 +336,13 @@ fn parse_xisf_xml(xml: &str) -> Result<XisfImageInfo> {
 /// The offsets are read as the catalog's `frames.xbayroff` / `ybayroff` columns are (`header`, the scanner's
 /// `parse_offset`): the `<FITSKeyword>` element whose name is the key as written, the last element of a name winning,
 /// its value verbatim read as an integer (an `i64`, else a number with its fraction cut; `0.6` is 0). Absent or
-/// unreadable is 0. A header that cannot be read as XML for its keywords reads as no offsets, with a warning.
+/// unreadable is 0. A header that cannot be read as XML for its keywords reads as no offsets, with a warning that
+/// names the file (`path`, when the header came from one).
 ///
 /// The FITS reader reads its offsets by the same module (`FitsHeader::get_i32` on the key as written, the first card
 /// winning), so the render, the Analysis and the catalog agree on what a file's offsets are.
-fn odd_bayer_offsets(xml: &str) -> (bool, bool) {
-    let (x, y) = crate::header::xisf_bayer_offsets(xml).unwrap_or_else(|e| {
-        tracing::warn!(error = %format!("{e:#}"), "XISF keywords unreadable; no Bayer offsets");
-        (None, None)
-    });
+fn odd_bayer_offsets(xml: &str, path: Option<&Path>) -> (bool, bool) {
+    let (x, y) = crate::header::xisf_bayer_offsets(xml, path);
     let odd = |v: Option<i64>| v.unwrap_or(0).rem_euclid(2) == 1;
     (odd(x), odd(y))
 }
@@ -610,7 +608,7 @@ pub fn read_xisf_header_info(path: &Path) -> Result<ImageHeader> {
     let file = File::open(path).context("Failed to open XISF file")?;
     let mut reader = BufReader::new(file);
     let xml = read_xml_header(&mut reader)?;
-    let info = parse_xisf_xml(&xml)?;
+    let info = parse_xisf_xml(&xml, Some(path))?;
     let sample_type = match info.sample_format {
         XisfSampleFormat::Uint8 => "u8",
         XisfSampleFormat::Uint16 => "u16",
@@ -734,7 +732,7 @@ pub fn read_xisf_image(path: &Path) -> Result<(ImageMetadata, PixelData)> {
     let xml = read_xml_header(&mut reader)?;
 
     // Parse XML
-    let info = parse_xisf_xml(&xml)?;
+    let info = parse_xisf_xml(&xml, Some(path))?;
 
     // Read pixel data
     let compressed_data = match info.location {
@@ -863,7 +861,7 @@ mod tests {
             r#"</xisf>"#,
         );
 
-        let info = parse_xisf_xml(xml)
+        let info = parse_xisf_xml(xml, None)
             .expect("a lone `&` in text content must not fail the header parse");
 
         // Not just "no error": the element *after* the dangling `&` must still
@@ -1100,7 +1098,7 @@ mod tests {
             r#"<Image geometry="4:2:1" sampleFormat="Float32" location="path:foo.dat"/>"#,
             r#"</xisf>"#,
         );
-        let info = parse_xisf_xml(xml)
+        let info = parse_xisf_xml(xml, None)
             .expect("a later un-parsable <Image> must not fail the whole header parse");
         assert_eq!((info.width, info.height, info.channels), (4, 2, 1));
         assert_eq!(info.attachment_pos, 4096, "must have picked the parsable image");
@@ -1115,7 +1113,7 @@ mod tests {
             r#"<Image geometry="4:2:1" sampleFormat="Float32" location="path:foo.dat"/>"#,
             r#"</xisf>"#,
         );
-        let err = parse_xisf_xml(xml)
+        let err = parse_xisf_xml(xml, None)
             .expect_err("a header whose only <Image> can't be parsed must error");
         assert!(
             err.to_string().contains("Unsupported XISF location"),
@@ -1159,7 +1157,7 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0">"#,
             r#"</xisf>"#,
         );
-        let err = parse_xisf_xml(xml).expect_err("a header with zero <Image> elements must error");
+        let err = parse_xisf_xml(xml, None).expect_err("a header with zero <Image> elements must error");
         assert!(
             err.to_string().contains("No <Image> element found"),
             "unexpected error: {err}"

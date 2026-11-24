@@ -19,11 +19,22 @@
 //!
 //! The module knows no Athenaeum card (`ATH_*`) and no card of the stacking kernel's.
 //!
-//! Every header read in the crate goes through this module: the FITS and XISF readers' Bayer offsets
-//! (`formats::fits`, `formats::xisf`), the header facts of `star_measure::raw`, and every `rustafits info` column.
-//! The Bayer offsets are read exactly as the catalog's `frames.xbayroff` / `ybayroff` columns are (FITS
-//! `get_i32` on the key as written, the first card winning; XISF the scanner's `parse_offset` on the element named
-//! as written, the last one winning), so the render, the Analysis and the catalog agree.
+//! Every header value the crate reads for a decision goes through this module: the FITS and XISF readers' Bayer
+//! offsets (`formats::fits`, `formats::xisf`), the header facts of `star_measure::raw`, and the `rustafits info`
+//! `--facts` lines and key-map columns. What does not: the decode's own structural card parse (`ImageHeader`:
+//! `BITPIX`, `BZERO`, `BSCALE`, `BAYERPAT`, `ROWORDER`, the layout), and the `ImageHeader` keyword list that `info
+//! --all` / `--json` print and that the built-in and `-k` columns of `info` read.
+//!
+//! A typed value is read by the catalog's reader: a FITS value through `FitsHeader` on the key as written (the first
+//! card winning), an XISF value through the catalog's key map, an offset as the catalog's column reads the name. The
+//! Bayer offsets are read exactly as the catalog's `frames.xbayroff` / `ybayroff` columns are (FITS `get_i32` on the
+//! key as written, the first card winning; XISF the scanner's `parse_offset` on the element named as written, the
+//! last one winning), so the render, the Analysis and the catalog agree.
+//!
+//! A routed FITS file (gzip, tile-compressed, or an empty primary with the image in an extension) is read by its
+//! logical header, the header the pixel reader decodes. The catalog does not do that for a `.fits` with an image
+//! extension: it stores and reads the primary header, so for that class a fact here and the catalog's column can
+//! differ.
 
 #![deny(missing_docs)]
 
@@ -41,20 +52,24 @@ mod text;
 
 pub use chains::{resolve_default, HeaderField, HeaderValue};
 pub(crate) use facts::{fits_bayer_offsets_of_blocks, xisf_bayer_offsets};
+pub(crate) use text::fits_header;
 pub use facts::{read_frame_facts, FrameFacts};
 pub use keys::{header_key_map, normalize_keyword, HeaderKeyMap};
 
 /// The container format a header was read from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "camelCase"))]
+#[non_exhaustive]
 pub enum HeaderFormat {
     /// FITS: 80-column cards (plain, gzipped, tile-compressed or in an extension HDU).
+    #[default]
     Fits,
     /// XISF: `<FITSKeyword>` elements of the XML header.
     Xisf,
 }
 
-/// The header text of the file at `path` and its format: the text Athenaeum's catalog stores for the file.
+/// The header text of the file at `path` and its format: the text Athenaeum's catalog stores for the file (for a
+/// routed FITS file, the text of its logical header; see the module docs).
 ///
 /// - FITS: every card through `END`, one per line (Athenaeum's `extract_fits_header`). For a routed file (gzip, an
 ///   empty primary with the image in an extension, a tile-compressed image), the cards of the image's logical header.

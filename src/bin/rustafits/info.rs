@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use astroimage::header::{read_frame_facts, read_header_key_map, HeaderKeyMap};
+use astroimage::header::{read_frame_facts, FrameFacts};
 use astroimage::{BayerPattern, FileFormat, ImageConverter, ImageHeader};
 use clap::Args;
 
@@ -36,8 +36,9 @@ pub struct InfoArgs {
     #[arg(long, conflicts_with = "facts")]
     csv: bool,
 
-    /// One JSON object per line, per file: its frame facts as Athenaeum's catalog reads them (size, type, exposure,
-    /// gain, filter, Bayer pattern and offsets, sub-frame origin, ...). A file that cannot be read is reported on stderr
+    /// One JSON object per line, per file: its `file` (as given) and its frame facts as Athenaeum's catalog reads them
+    /// (size, type, exposure, gain, filter, Bayer pattern and offsets, sub-frame origin, ...). A file that cannot be
+    /// read gives `{"file": ..., "error": ...}` (and the error on stderr)
     #[arg(long)]
     facts: bool,
 }
@@ -58,29 +59,24 @@ pub fn run(args: InfoArgs) -> Result<bool> {
     let mut ok = true;
     if args.facts {
         for input in &inputs {
+            let file = input.path.display().to_string();
             match read_frame_facts(&input.path) {
-                Ok(facts) => println!("{}", serde_json::to_string(&facts)?),
+                Ok(facts) => println!("{}", serde_json::to_string(&FactsLine { file: &file, facts: &facts })?),
                 Err(e) => {
                     ok = false;
-                    eprintln!("error: {}: {e:#}", input.path.display());
+                    eprintln!("error: {file}: {e:#}");
+                    println!("{}", serde_json::to_string(&ErrorLine { file: &file, error: format!("{e:#}") })?);
                 }
             }
         }
         return Ok(ok);
     }
     let mut headers = Vec::new();
-    let mut maps = Vec::new();
     for input in &inputs {
         match ImageConverter::read_header(&input.path) {
-            Ok(h) => {
-                // The columns read the file's key map, by the catalog's rules; the layout and `--all` / `--json` still
-                // list the reader's own keywords.
-                let map = read_header_key_map(&input.path)
-                    .map_err(|e| eprintln!("warning: {}: header keys: {e:#}", input.path.display()))
-                    .ok();
-                headers.push((input.path.display().to_string(), h));
-                maps.push(map);
-            }
+            // The columns, `--all` and `--json` list the decode's own keywords (`ImageHeader`), as they always did;
+            // `--facts` is the catalog's reading.
+            Ok(h) => headers.push((input.path.display().to_string(), h)),
             Err(e) => {
                 ok = false;
                 eprintln!("error: {}: {e:#}", input.path.display());
@@ -98,11 +94,10 @@ pub fn run(args: InfoArgs) -> Result<bool> {
         cols.extend(args.keywords.iter().map(String::as_str));
         let rows: Vec<Vec<String>> = headers
             .iter()
-            .zip(&maps)
-            .map(|((file, h), map)| {
+            .map(|(file, h)| {
                 let mut row = vec![file.clone(), size(h), h.sample_type.to_string(), bayer(h.bayer_pattern).to_string()];
-                row.extend(COLUMNS.iter().map(|(_, keys)| first_of(h, map.as_ref(), keys)));
-                row.extend(args.keywords.iter().map(|k| first_of(h, map.as_ref(), &[k.as_str()])));
+                row.extend(COLUMNS.iter().map(|(_, keys)| first_of(h, keys)));
+                row.extend(args.keywords.iter().map(|k| first_of(h, &[k.as_str()])));
                 row
             })
             .collect();
@@ -116,17 +111,23 @@ pub fn run(args: InfoArgs) -> Result<bool> {
     Ok(ok)
 }
 
-/// The first of `keys` with a value, as the catalog's key map reads it (FITS: the first card of a keyword; XISF: the
-/// last `<FITSKeyword>`; names normalised). An XISF `<Property>` id (`Instrument:Camera:Gain`) is no keyword, so it
-/// is read from the reader's own list.
-fn first_of(h: &ImageHeader, map: Option<&HeaderKeyMap>, keys: &[&str]) -> String {
-    keys.iter()
-        .find_map(|k| {
-            let from_map = map.and_then(|m| m.get(k)).map(str::trim).filter(|v| !v.is_empty());
-            from_map.or_else(|| if k.contains(':') { h.get(k).map(str::trim).filter(|v| !v.is_empty()) } else { None })
-        })
-        .unwrap_or("-")
-        .to_string()
+fn first_of(h: &ImageHeader, keys: &[&str]) -> String {
+    keys.iter().find_map(|k| h.get(k)).filter(|v| !v.is_empty()).unwrap_or("-").to_string()
+}
+
+/// One `--facts` line: the file as given, then the `FrameFacts` fields.
+#[derive(serde::Serialize)]
+struct FactsLine<'a> {
+    file: &'a str,
+    #[serde(flatten)]
+    facts: &'a FrameFacts,
+}
+
+/// The `--facts` line of a file that cannot be read.
+#[derive(serde::Serialize)]
+struct ErrorLine<'a> {
+    file: &'a str,
+    error: String,
 }
 
 fn size(h: &ImageHeader) -> String {

@@ -9,10 +9,10 @@
 //! only picks the full scale of the plane it is handed.
 //!
 //! **In rustafits** (port plan phase 4, `docs/superpowers/plans/2026-11-04-star-measure-port-phase-4.md`): copied from
-//! Athenaeum's `analysis/input.rs` at e6344ddd. The header facts are read with Athenaeum's catalog rules, as `header`
-//! ports them (R-P4-C1 read them from a copy of the Analysis rules at e6344ddd; since starloom phase 2, P2-R1 / P2-R23,
-//! from the catalog's current reader, so the number is the one the catalog holds); `ImageConverter::read_header` only
-//! says which format the file is. The Bayer offsets are not
+//! Athenaeum's `analysis/input.rs` at e6344ddd. The header facts are read by the catalog's reader, as `header` ports
+//! it (R-P4-C1 read them from a copy of the Analysis rules at e6344ddd; since starloom phase 2, P2-R1 / P2-R23, a FITS
+//! value through `FitsHeader` on the key as written, an XISF value through the catalog's key map);
+//! `ImageConverter::read_header` only says which format the file is. The Bayer offsets are not
 //! folded here: both rustafits readers fold `XBAYROFF` / `YBAYROFF` into the pattern they report. The rulings the docs
 //! cite (`PC-…`, `R-PC-…`) are Athenaeum's.
 
@@ -20,7 +20,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::header::read_header_key_map;
+use crate::header::{fits_header, read_header_key_map};
 use crate::star_measure::Domain;
 use crate::{BayerPattern, FileFormat, ImageConverter, PixelData};
 
@@ -76,29 +76,44 @@ struct HeaderFacts {
     egain: Option<f64>,
 }
 
-/// The header facts of `path`, read by Athenaeum's catalog rules (`header`, R-P4-C1 and starloom phase 2, P2-R1): the
-/// key map of the file's own header, as the scanner builds it (FITS: the first card of a keyword wins; XISF: the last
-/// `<FITSKeyword>` of a name wins, its value verbatim), and the catalog's number rule. A FITS file reads `BITPIX` /
-/// `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN`; an XISF file reads `DATAMAX` / `EGAIN` only, its `BITPIX` / `BZERO` /
-/// `BSCALE` keywords (some writers copy a FITS layout into the XISF header) say nothing about the XISF samples. A
-/// gzipped, tile-compressed or extension-HDU image reads the header of the image the pixel reader decodes.
+/// The header facts of `path`, each read by the catalog's reader (`header`, R-P4-C1 and starloom phase 2, P2-R1): a
+/// FITS file reads `BITPIX` / `BZERO` / `BSCALE` / `DATAMAX` / `EGAIN` through `FitsHeader::get_i32` / `get_f64` on
+/// the key as written, the first card of a keyword winning (as the old rules did, and as Athenaeum's stacker reads
+/// `EGAIN`); an XISF file reads `DATAMAX` / `EGAIN` only (its `BITPIX` / `BZERO` / `BSCALE` keywords, which some
+/// writers copy from a FITS layout, say nothing about the XISF samples), through the catalog's key map: the last
+/// `<FITSKeyword>` of a name wins, its value verbatim, read by the catalog's number rule. A gzipped, tile-compressed
+/// or extension-HDU FITS image reads the header of the image the pixel reader decodes.
+///
+/// An XISF header that cannot be read for its keywords (no `<?xml` or no `</xisf>`) has no `DATAMAX` and no `EGAIN`,
+/// with a warning naming the file: the measurement goes ahead.
 fn header_facts(path: &Path, xisf: bool) -> Result<HeaderFacts> {
-    let map = read_header_key_map(path).with_context(|| format!("header: {}", path.display()))?;
     if xisf {
+        let map = match read_header_key_map(path) {
+            Ok(map) => Some(map),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %format!("{e:#}"),
+                    "XISF header keywords unreadable; no DATAMAX and no EGAIN"
+                );
+                None
+            }
+        };
         Ok(HeaderFacts {
             bitpix: None,
             bzero: 0.0,
             bscale: 1.0,
-            datamax: map.number("DATAMAX"),
-            egain: map.number("EGAIN"),
+            datamax: map.as_ref().and_then(|m| m.number("DATAMAX")),
+            egain: map.as_ref().and_then(|m| m.number("EGAIN")),
         })
     } else {
+        let h = fits_header(path).with_context(|| format!("header: {}", path.display()))?;
         Ok(HeaderFacts {
-            bitpix: map.integer("BITPIX").map(|v| v as i32),
-            bzero: map.number("BZERO").unwrap_or(0.0),
-            bscale: map.number("BSCALE").unwrap_or(1.0),
-            datamax: map.number("DATAMAX"),
-            egain: map.number("EGAIN"),
+            bitpix: h.get_i32("BITPIX"),
+            bzero: h.get_f64("BZERO").unwrap_or(0.0),
+            bscale: h.get_f64("BSCALE").unwrap_or(1.0),
+            datamax: h.get_f64("DATAMAX"),
+            egain: h.get_f64("EGAIN"),
         })
     }
 }
@@ -739,6 +754,29 @@ mod tests {
         assert_eq!(facts(&["EGAIN   = '1.&'", "CONTINUE  '5'"]).2, Some(1.5));
         // The first card of a keyword wins.
         assert_eq!(facts(&["EGAIN   = 1.5", "EGAIN   = 2.5"]).2, Some(1.5));
+        // The key is the one written: a lower-case HIERARCH card is no `EGAIN`, and it does not hide a later plain card.
+        assert_eq!(facts(&["HIERARCH egain = 1.5"]).2, None);
+        assert_eq!(facts(&["HIERARCH egain = 3.0", "EGAIN   = 1.5"]).2, Some(1.5));
+        assert_eq!(facts(&["HIERARCH datamax = 30000"]).0, 32767.0);
+    }
+
+    /// An XISF header that cannot be read for its keywords (no `<?xml` declaration here) has no `DATAMAX` and no
+    /// `EGAIN`: the measurement goes ahead on the full scale, as before the header module.
+    #[test]
+    fn an_xisf_header_without_the_xml_declaration_reads_no_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.xisf");
+        let children = format!("{}{}", keyword("DATAMAX", "0.9"), keyword("EGAIN", "1.5"));
+        write_xisf(&p, "2:2:1", "Float32", &children, &lef32(&[0.0, 0.25, 0.5, 1.0]));
+        let (clip, _, gain) = raw(&read_raw_frame(&p).unwrap());
+        assert!((clip - 0.9 * 65535.0).abs() < 1e-6 && gain == Some(1.5), "the header as written reads");
+        let decl = br#"<?xml version="1.0" encoding="UTF-8"?>"#;
+        let mut bytes = std::fs::read(&p).unwrap();
+        let at = bytes.windows(decl.len()).position(|w| w == decl).unwrap();
+        bytes[at..at + decl.len()].fill(b' ');
+        std::fs::write(&p, bytes).unwrap();
+        let (clip, _, gain) = raw(&read_raw_frame(&p).unwrap());
+        assert_eq!((clip, gain), (65535.0, None), "no declaration: no DATAMAX, no EGAIN");
     }
 
     /// The XISF facts are read by the catalog's key map (`header`): the last `<FITSKeyword>` of a name wins, its value
@@ -792,7 +830,7 @@ mod tests {
         let pat = keyword("BAYERPAT", "'RGGB'");
         let cases = [
             ("empty, then 1", format!("{}{}", keyword("XBAYROFF", ""), keyword("XBAYROFF", "1")), Grbg),
-            // No number (was Grbg: the old rule cut the value at " / "; pinned input sk-x04).
+            // No number (was Grbg: the old rule cut the value at " / "; pinned input rm-02).
             ("1 / off", keyword("XBAYROFF", "1 / off"), Rggb),
             ("unclosed quote", keyword("XBAYROFF", "'1"), Rggb),
         ];

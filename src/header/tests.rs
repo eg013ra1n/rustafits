@@ -274,7 +274,7 @@ fn xisf_xml(children: &str) -> String {
 
 /// `XBAYROFF` of an XISF header holding `children`, as the catalog's column holds it.
 fn xisf_x(children: &str) -> Option<i64> {
-    xisf_bayer_offsets(&xisf_xml(children)).unwrap().0
+    xisf_bayer_offsets(&xisf_xml(children), None).0
 }
 
 /// What the catalog's reader returns for `XBAYROFF` on the shapes the Analysis rules read otherwise.
@@ -308,7 +308,7 @@ fn xisf_rule_pins_the_catalogs_results() {
     assert_eq!(xisf_x(&kw("XBAYROFF", "'1'0'")), None);
     // The header is cut at the first `<?xml`: a keyword in front of it is not read.
     let before_the_cut = format!(r#"{}<?xml version="1.0"?><xisf><Image geometry="2:2:1"/></xisf>"#, kw("XBAYROFF", "1"));
-    assert_eq!(xisf_bayer_offsets(&before_the_cut).unwrap(), (None, None));
+    assert_eq!(xisf_bayer_offsets(&before_the_cut, None), (None, None));
     // A keyword value that holds an element is a value, not a second header. Changed: was 1 (the Analysis rule read
     // the dump as XML first): sk-x23.
     assert_eq!(xisf_x(&kw("Z", "<FITSKeyword name='XBAYROFF' value='1'/>")), None);
@@ -332,7 +332,7 @@ fn xisf_number_and_offset_read_as_the_catalog_reads_them() {
     assert_eq!(map.number("C"), Some(1.0), "a Fortran exponent");
     assert!(map.number("D").is_some_and(f64::is_nan), "NaN as written");
     // A fraction is cut, not rounded. Changed: 0.6 was 1: sk-x16, xv-06, xv-12.
-    assert_eq!(xisf_bayer_offsets(&xml).unwrap(), (Some(0), Some(-1)));
+    assert_eq!(xisf_bayer_offsets(&xml, None), (Some(0), Some(-1)));
     for (value, want) in [("1D0", None), ("nan", Some(0)), ("1.5", Some(1)), ("-0.6", Some(0)), ("x", None), ("", None)] {
         assert_eq!(xisf_x(&kw("XBAYROFF", value)), want, "XBAYROFF {value:?}");
     }
@@ -340,9 +340,9 @@ fn xisf_number_and_offset_read_as_the_catalog_reads_them() {
 
 #[test]
 fn an_xisf_without_keywords_reads_no_offsets() {
-    assert_eq!(xisf_bayer_offsets(&xisf_xml("")).unwrap(), (None, None));
-    assert!(xisf_bayer_offsets("").is_err());
-    assert!(xisf_bayer_offsets("not xml at all").is_err());
+    assert_eq!(xisf_bayer_offsets(&xisf_xml(""), None), (None, None));
+    assert_eq!(xisf_bayer_offsets("", None), (None, None));
+    assert_eq!(xisf_bayer_offsets("not xml at all", None), (None, None));
 }
 
 /// The `<?xml` … `</xisf>` cut: a keyword after the closing tag is not read.
@@ -430,4 +430,25 @@ fn fits_bayer_offsets_are_the_catalogs_columns() {
     assert_eq!(x(&["XBAYROFF= 1D0"]), Some(1), "a Fortran exponent");
     assert_eq!(x(&["XBAYROFF= 1 / comment"]), Some(1));
     assert_eq!(x(&[]), None);
+}
+
+/// `FrameFacts.egain` of a FITS header is `FitsHeader::get_f64` on the key as written (the first card wins; a
+/// lower-case HIERARCH card is not `EGAIN`), as Athenaeum's stacker reads it; an XISF one is the key map's number.
+#[test]
+fn the_egain_fact_of_a_fits_header_is_read_on_the_key_as_written() {
+    let egain = |cards: &[&str]| facts::facts_from_fits_header(&fits_header_of(cards)).egain;
+    assert_eq!(egain(&["EGAIN   = 1.5", "EGAIN   = 2.5"]), Some(1.5));
+    assert_eq!(egain(&["HIERARCH EGAIN = 1.5"]), Some(1.5));
+    assert_eq!(egain(&["HIERARCH egain = 1.5"]), None);
+    assert_eq!(egain(&["HIERARCH egain = 3.0", "EGAIN   = 1.5"]), Some(1.5));
+}
+
+/// A stored `FrameFacts` document that lacks a later field decodes, the field being `None`.
+#[cfg(feature = "serde")]
+#[test]
+fn a_frame_facts_document_missing_a_field_decodes() {
+    let f: FrameFacts = serde_json::from_str(r#"{"format":"xisf","width":4,"height":2}"#).unwrap();
+    assert_eq!((f.format, f.width, f.height, f.egain, f.origin), (HeaderFormat::Xisf, Some(4), Some(2), None, None));
+    let all: FrameFacts = serde_json::from_str(&serde_json::to_string(&FrameFacts::default()).unwrap()).unwrap();
+    assert_eq!(all, FrameFacts::default());
 }

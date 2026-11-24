@@ -130,11 +130,12 @@ rustafits info night1/ --facts                     # one JSON object per file: i
 ```
 
 Columns come from the FITS cards N.I.N.A., SharpCap, ASIAIR etc. write, with
-XISF property ids as fallback (`Instrument:ExposureTime`, …). Values are read by
-Athenaeum's catalog rules (the first card of a repeated FITS keyword, the last
-`<FITSKeyword>` of a repeated XISF one). `--facts` prints each file's
+XISF property ids as fallback (`Instrument:ExposureTime`, …); they list the
+file's own keywords. `--facts` prints each file's `file` (as given) and its
 `FrameFacts` (size, frame type, exposure, gain, filter, Bayer pattern and
-offsets, sub-frame origin, …) as the catalog stores them.
+offsets, sub-frame origin, …) as Athenaeum's catalog reads them (the first card
+of a repeated FITS keyword, the last `<FITSKeyword>` of a repeated XISF one); a
+file that cannot be read gives a `{"file": …, "error": …}` line.
 
 ### Star metrics: `rustafits analyze`
 
