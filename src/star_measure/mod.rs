@@ -52,6 +52,7 @@ pub mod domain;
 pub mod fit;
 pub mod frame;
 pub mod green;
+mod list;
 pub mod photometry;
 pub mod population;
 pub mod raw;
@@ -235,6 +236,16 @@ impl SnrNoise {
 /// measures, never one per task; Plan C = 7 (6 is burnt, never released),
 /// Plan D = 8. `AnalysisConfig::config_hash` is Plan D's.
 pub const MEASURE_VERSION: u32 = 8;
+
+/// The version of the aperture correction a Bayer mosaic reports from its green sites
+/// ([`PlaneMeasurement::reported_aperture_correction`], OSC zero point): bumped when only that number changes, so
+/// [`MEASURE_VERSION`] and every stored star keep their meaning. 1 = the green-site growth at `5F` divided by
+/// the green lattice density 0.5, the median over up to 64 bright isolated stars. 2 = each star's growth is
+/// phase-matched to its own fitted model: the green-site sum is scaled by the model's all-sites over green-sites sum
+/// within `5F` (the model point-sampled at the pixel centres, as the fit evaluated it) in place of the constant 0.5,
+/// so the dependence of a green sum on where the star's centre falls on the checkerboard cancels (it was ±10 % per
+/// star at FWHM 1.25 px); a star whose model's green share is outside 0.35 to 0.65 is refused.
+pub const CFA_APERTURE_VERSION: u32 = 2;
 
 /// What the module is handed besides the plane (grows in Tasks 4–12). `Default` = `Domain::Calibrated` without a
 /// gain, `PsfModel::Auto`, 24 576 stars, no seeds, `FitParams::default()`, no precomputed noise, `Bwmv` (ruling F14:
@@ -494,6 +505,7 @@ impl FitStarsOptions<'_> {
             gain: self.gain_e_per_working_adu,
             noise: self.aperture_noise,
             neighbours: None,
+            split: None,
             population: None,
             siblings: None,
             point_siblings: None,
@@ -501,6 +513,7 @@ impl FitStarsOptions<'_> {
             // R-PC-10b / Plan D D3: LN's refits and every other `fit_stars_at` caller fit without the Blend refusal (as at
             // `MEASURE_VERSION` 5); the `measure_plane` paths set it themselves ([`finish_working`], [`measure_budget`]).
             blend_refusal: false,
+            report_aperture: false,
         }
     }
 }
@@ -573,6 +586,17 @@ pub struct PlaneMeasurement {
     pub aperture_stars: usize,
     /// The standard error of `aperture_correction` as the median of its ratios ([`FitOutcome::aperture_se`]).
     pub aperture_se: Option<f64>,
+    /// The aperture correction a Bayer mosaic measured on its green sites and REPORTED, never applied (OSC zero point,
+    /// ruling O3): the median over up to 64 bright isolated stars of the green-site growth flux at `5F` (scaled by the
+    /// star's own model's all-sites over green-sites share, [`CFA_APERTURE_VERSION`] 2) over the fit's model flux. No fit's `signal` carries it and `aperture_correction` stays
+    /// `None` on that path. `None` on every other path, and where fewer than 5 stars qualified. See
+    /// [`CFA_APERTURE_VERSION`].
+    pub reported_aperture_correction: Option<f64>,
+    /// The stars `reported_aperture_correction` is the median over (at most 64); the qualifier count (1 to 4) when
+    /// fewer than 5 qualified and the correction is `None`; 0 on every other path.
+    pub reported_aperture_stars: usize,
+    /// The standard error of `reported_aperture_correction`, from its ratios' MAD as [`Self::aperture_se`] is.
+    pub reported_aperture_se: Option<f64>,
     /// The `c` candidates the point-source screen refused (Plan B B4, PB-12'): no seed of another plane within
     /// `max(`[`photometry::POINT_SOURCE_MATCH_PX`]`, 0.5 F)` px of their fitted centre (R-PB4-2). 0 on a single plane and wherever no screen runs.
     /// Reported, not persisted.
@@ -653,6 +677,32 @@ pub fn measure_plane(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
+    measure_plane_in(plane, w, h, opts, false, pool)
+}
+
+/// [`measure_plane`] that also measures the aperture correction on the masked growth and reports it apart
+/// ([`PlaneMeasurement::reported_aperture_correction`], OSC zero point, spec §5.1): nothing else moves, no fit's
+/// `signal`, no `aperture_*` field. Crate-private — [`MeasureOptions`] gains no field — and called by
+/// [`green::measure_green_sites`] alone.
+pub(crate) fn measure_plane_reporting_aperture(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlaneMeasurement {
+    measure_plane_in(plane, w, h, opts, true, pool)
+}
+
+/// [`measure_plane`]'s body; `report_aperture` is [`fit::Correction::report_aperture`].
+fn measure_plane_in(
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    report_aperture: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> PlaneMeasurement {
     if mask_mismatch(opts.mask.as_deref(), w, h) {
         // Nothing is measured: no seed source, no mask, the plane's noise and sky only (never a panic on `m[i]`).
         let bare = MeasureOptions {
@@ -661,7 +711,7 @@ pub fn measure_plane(
             mode: Mode::All,
             ..opts.clone()
         };
-        return measure_plane(plane, w, h, &bare, pool);
+        return measure_plane_in(plane, w, h, &bare, report_aperture, pool);
     }
     let sub = SubSteps::default();
     let working = {
@@ -671,9 +721,29 @@ pub fn measure_plane(
     match opts.mode {
         Mode::All | Mode::Population { .. } | Mode::Brightest { .. } => {
             let prep = prepare_working(plane, &working, w, h, opts, pool, sub);
-            finish_working(&working, w, h, opts, prep, None, None, pool)
+            finish_working(
+                &working,
+                w,
+                h,
+                opts,
+                prep,
+                None,
+                None,
+                report_aperture,
+                pool,
+            )
         }
-        Mode::Budget { budget } => measure_budget(plane, &working, w, h, opts, budget, pool, sub),
+        Mode::Budget { budget } => measure_budget(
+            plane,
+            &working,
+            w,
+            h,
+            opts,
+            budget,
+            report_aperture,
+            pool,
+            sub,
+        ),
     }
 }
 
@@ -998,7 +1068,17 @@ pub fn finish_plane(
         let _s = prep.sub.span(Step::WorkCopy);
         domain::to_working_units(plane, &opts.domain)
     };
-    finish_working(&working, w, h, opts, prep, siblings, point_siblings, pool)
+    finish_working(
+        &working,
+        w,
+        h,
+        opts,
+        prep,
+        siblings,
+        point_siblings,
+        false,
+        pool,
+    )
 }
 
 /// The plane's own β and where it came from: exactly the β [`finish_plane`] would fit `prep`'s seeds at under
@@ -1268,11 +1348,13 @@ fn prepare_working(
         working,
         w,
         h,
-        opts,
+        &opts.fit,
+        opts.mask.as_deref(),
         pool,
         &pass_seeds,
         head.field_width,
         head.saturation,
+        None,
     );
     drop(pass_seeds);
     PlanePrep {
@@ -1541,13 +1623,14 @@ fn prepare_passes(
     working: &[f32],
     w: usize,
     h: usize,
-    opts: &MeasureOptions,
+    fit_params: &FitParams,
+    mask: Option<&[bool]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     seeds: &[Seed],
     field_width: FieldWidth,
     saturation: SaturationPlane,
+    given_floor: Option<(Option<f64>, usize)>,
 ) -> Passes {
-    let mask = opts.mask.as_deref();
     let t = Instant::now();
     let pass_call = || {
         fit::verdict_pass(
@@ -1555,7 +1638,7 @@ fn prepare_passes(
             w,
             h,
             seeds,
-            &opts.fit,
+            fit_params,
             mask,
             Some(field_width.fwhm_px),
             &saturation,
@@ -1567,13 +1650,18 @@ fn prepare_passes(
     // The plane's near-clip floor (Task 10c, R10c-10) comes from the plane's own verdicts, so clause 3 is re-read here,
     // before the cross-plane rule; level and fit are untouched.
     let mut saturation = saturation;
-    let floor = photometry::derive_clip_floor(
-        &saturation,
-        passes.iter().filter_map(|p| match &p.verdict {
-            Some(Ok(v)) => Some(v),
-            _ => None,
-        }),
-    );
+    // `given_floor` is a plane's own floor handed in (the list entry reads the measured plane's, not one re-derived
+    // from the list's seeds): `(floor in working units, evidence)`, `(None, _)` = the plane has no near-clip class.
+    let floor = match given_floor {
+        Some((floor, evidence)) => floor.map(|f| (f, evidence)),
+        None => photometry::derive_clip_floor(
+            &saturation,
+            passes.iter().filter_map(|p| match &p.verdict {
+                Some(Ok(v)) => Some(v),
+                _ => None,
+            }),
+        ),
+    };
     saturation.clip_floor = floor.map(|(f, _)| f);
     saturation.clip_evidence = floor.map_or(0, |(_, n)| n);
     for pass in passes.iter_mut() {
@@ -1599,6 +1687,7 @@ fn finish_working(
     prep: PlanePrep,
     siblings: Option<&[Seed]>,
     point_siblings: Option<&[Seed]>,
+    report_aperture: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> PlaneMeasurement {
     let PlanePrep {
@@ -1685,6 +1774,7 @@ fn finish_working(
                 // stacking Measure's subs, the master and the SNR-gain crops among them. `FitStarsOptions::correction()`
                 // (LN's refits, every `fit_stars_at` caller) still leaves it off.
                 blend_refusal: true,
+                report_aperture,
                 ..Default::default()
             },
             None,
@@ -1797,6 +1887,9 @@ fn finish_working(
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
         aperture_se: outcome.aperture_se,
+        reported_aperture_correction: outcome.reported_aperture.correction,
+        reported_aperture_stars: outcome.reported_aperture.stars,
+        reported_aperture_se: outcome.reported_aperture.se,
         point_source_screened: outcome.aperture_screens.point_source,
         aperture_below_snr: outcome.aperture_screens.below_snr,
         aperture_rescued: outcome.aperture_screens.rescued,
@@ -1833,6 +1926,7 @@ fn measure_budget(
     h: usize,
     opts: &MeasureOptions,
     budget: usize,
+    report_aperture: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
     steps: SubSteps,
 ) -> PlaneMeasurement {
@@ -1885,7 +1979,18 @@ fn measure_budget(
             .map(|&i| all_extended.get(i).copied().unwrap_or(false))
             .collect()
     };
-    let prepared = prepare_passes(working, w, h, opts, pool, &sub, field_width, saturation);
+    let prepared = prepare_passes(
+        working,
+        w,
+        h,
+        &opts.fit,
+        opts.mask.as_deref(),
+        pool,
+        &sub,
+        field_width,
+        saturation,
+        None,
+    );
     let Passes {
         fit_field,
         passes,
@@ -1923,6 +2028,7 @@ fn measure_budget(
                 timers: Some(&steps),
                 // R-PC-10: the Blend refusal (the Analysis path's since 7; `finish_working` sets it too since Plan D D3).
                 blend_refusal: true,
+                report_aperture,
                 ..Default::default()
             },
             None,
@@ -2037,6 +2143,9 @@ fn measure_budget(
         aperture_correction: outcome.aperture_correction,
         aperture_stars: outcome.aperture_stars,
         aperture_se: outcome.aperture_se,
+        reported_aperture_correction: outcome.reported_aperture.correction,
+        reported_aperture_stars: outcome.reported_aperture.stars,
+        reported_aperture_se: outcome.reported_aperture.se,
         point_source_screened: outcome.aperture_screens.point_source,
         aperture_below_snr: outcome.aperture_screens.below_snr,
         aperture_rescued: outcome.aperture_screens.rescued,
@@ -2096,12 +2205,28 @@ fn saturation_plane(
         Domain::RawAdu { full_scale, .. } => (1.0, *full_scale),
     };
     // The maximum of the finite, unmasked values and how many pixels equal it (an exact clip has two or more): both
-    // order-free, so read in one parallel reduce.
+    // order-free, so read in one parallel reduce over blocks of rows' worth of pixels, each block one tight loop.
+    const BLOCK: usize = 1 << 16;
+    let scan = |(b, block): (usize, &[f32])| -> (f64, usize) {
+        let base = b * BLOCK;
+        let (mut max, mut count) = (f64::NEG_INFINITY, 0usize);
+        for (k, &v) in block.iter().enumerate() {
+            if v.is_finite() && mask.map_or(true, |m| m[base + k]) {
+                let v = v as f64;
+                if v > max {
+                    max = v;
+                    count = 1;
+                } else if v == max {
+                    count += 1;
+                }
+            }
+        }
+        (max, count)
+    };
     let (plane_max, max_count) = working
-        .par_iter()
+        .par_chunks(BLOCK)
         .enumerate()
-        .filter(|&(i, v)| v.is_finite() && mask.map_or(true, |m| m[i]))
-        .map(|(_, &v)| (v as f64, 1usize))
+        .map(scan)
         .reduce(
             || (f64::NEG_INFINITY, 0),
             |a, b| match a.0.partial_cmp(&b.0) {
@@ -2227,6 +2352,64 @@ mod tests {
     use super::*;
     use crate::test_support::fixture_field;
     use crate::test_support::{moffat_field, MoffatStar};
+
+    /// The saturation plane's maximum and its count of pixels at the maximum are the plain loop's over the finite,
+    /// unmasked pixels, whichever blocks the parallel scan cuts the plane into (the maximum sits in the last block, in
+    /// the first, in several, in none; a masked or non-finite pixel is above it).
+    #[test]
+    fn the_saturation_scan_is_the_plain_loop_over_any_blocks() {
+        let noise = NoiseModel { sigma: 5.0, source: NoiseSource::None, m_star: 0.0, n_star: 0.0 };
+        let sky = SkyLevel {
+            median: 1000.0,
+            mad: 1.0,
+            median_mean_dev: 1.0,
+            location: 1000.0,
+            scale: 1.0,
+            noise_scale_low: 1.0,
+            noise_scale_high: 1.0,
+        };
+        let domain = Domain::RawAdu { clip: 65535.0, full_scale: 65535.0, gain_e_per_adu: None };
+        let n = (1usize << 16) * 3 + 12345;
+        let make = |top_at: &[usize], above: &[(usize, f32)]| {
+            let mut plane: Vec<f32> = (0..n).map(|i| 900.0 + (i % 977) as f32).collect();
+            for &i in top_at {
+                plane[i] = 60000.0;
+            }
+            for &(i, v) in above {
+                plane[i] = v;
+            }
+            plane
+        };
+        let mut mask = vec![true; n];
+        mask[7] = false;
+        let cases: Vec<Vec<f32>> = vec![
+            make(&[n - 1], &[]),
+            make(&[0], &[]),
+            make(&[0, 65535, 65536, 131071, 131072, n - 1], &[]),
+            make(&[5, 100_000], &[(7, 65000.0), (9, f32::NAN), (11, f32::INFINITY)]),
+            make(&[], &[]),
+        ];
+        for (c, plane) in cases.iter().enumerate() {
+            for with_mask in [false, true] {
+                let m = with_mask.then_some(mask.as_slice());
+                let (mut max, mut count) = (f64::NEG_INFINITY, 0usize);
+                for (i, &v) in plane.iter().enumerate() {
+                    if v.is_finite() && m.map_or(true, |m| m[i]) {
+                        let v = v as f64;
+                        if v > max {
+                            max = v;
+                            count = 1;
+                        } else if v == max {
+                            count += 1;
+                        }
+                    }
+                }
+                let got = saturation_plane(plane, m, &noise, &sky, &domain, false);
+                assert_eq!(got.plane_max.to_bits(), max.to_bits(), "case {c} mask {with_mask}");
+                assert_eq!(got.max_count, count, "case {c} mask {with_mask}");
+            }
+        }
+    }
 
     /// Plan A Task 11c, ruling F28 (a pin, outside RED): the first-pass artifact's body is postcard, which is not
     /// self-describing, so this fails on ANY layout change of a serialised type (a `PlanePrep` field, `RefusalReason`'s

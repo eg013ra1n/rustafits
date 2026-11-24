@@ -29,7 +29,7 @@
 //!
 //! The star flux (F-5, Task 10, ruling R-OSP-7): a fit's `signal` is [`model_flux_in_fwtm`] (the fitted model's
 //! analytic flux inside its own FWTM ellipse) times the plane's [`aperture_correction`] `c`, the median ratio of the
-//! [`growth_curve`] flux at `5F` to the model flux over the 64 brightest isolated unsaturated fits — so the flux no
+//! [`growth_curve_in`] flux at `5F` to the model flux over the 64 brightest isolated unsaturated fits — so the flux no
 //! longer depends on how much of a profile its FWTM ellipse holds. The growth curve's sky is the star's stored B_i,
 //! and a candidate whose fitted amplitude tops the plane's range is screened out (F-3's amplitude clause, on every
 //! path; owner ruling R6, 2026-10-11). Round 4: off the measure path the screen's full scale is the caller's
@@ -52,6 +52,7 @@ use rayon::prelude::*;
 
 use super::beta::{BETA_BOUNDS, BETA_START};
 use super::diagnostics::RefusalReason;
+use super::analysis_mode::ListAperture;
 use super::fit::{FitParams, FitScratch, Seed, StarFit};
 use crate::stats;
 #[cfg(test)]
@@ -686,7 +687,7 @@ impl NearIndex {
 }
 
 /// One growth / model ratio of the aperture correction's sample: the candidate's [`model_flux_in_fwtm`] (the sort key)
-/// and its [`growth_curve`] flux over it. Reported (the probe's `--dump-ratios`), never read.
+/// and its [`growth_curve_in`] flux over it. Reported (the probe's `--dump-ratios`), never read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ApertureRatio {
     pub model: f64,
@@ -727,29 +728,56 @@ pub fn model_flux_in_fwtm(f: &StarFit) -> f64 {
 /// covered when its centre lies within `r` of a seed's own position (`d² ≤ r²`; seed coordinates, not fitted centres).
 /// One bit per pixel, built once per call; [`ring_sky`] leaves the covered pixels out.
 pub(crate) struct SeedMask {
-    bits: Vec<u64>,
+    bits: Vec<std::sync::atomic::AtomicU64>,
 }
 
+/// Seeds one painting task takes; a mask of fewer seeds than two tasks is painted on the calling thread.
+const SEED_MASK_TASK: usize = 512;
+
 impl SeedMask {
+    /// The union is order-free (every seed ORs its own pixels in), so the seeds are painted in parallel chunks, each
+    /// word an atomic OR: the bits are those of the one-thread loop, whichever thread paints which seed.
     pub(crate) fn new(w: usize, h: usize, seeds: &[Seed], r: f64) -> SeedMask {
-        let mut bits = vec![0u64; (w * h).div_ceil(64)];
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let bits: Vec<AtomicU64> = std::iter::repeat_with(|| AtomicU64::new(0))
+            .take((w * h).div_ceil(64))
+            .collect();
         if r.is_finite() && r >= 0.0 && w > 0 && h > 0 {
             let (r2, ri) = (r * r, r.ceil() as i64);
             let (xmax, ymax) = (w as i64 - 1, h as i64 - 1);
-            for s in seeds.iter().filter(|s| s.x.is_finite() && s.y.is_finite()) {
-                let x0 = (s.x.floor() as i64).saturating_sub(ri).max(0);
-                let x1 = (s.x.ceil() as i64).saturating_add(ri).min(xmax);
-                let y0 = (s.y.floor() as i64).saturating_sub(ri).max(0);
-                let y1 = (s.y.ceil() as i64).saturating_add(ri).min(ymax);
-                for py in y0..=y1 {
-                    let dy2 = (py as f64 - s.y).powi(2);
-                    for px in x0..=x1 {
-                        if (px as f64 - s.x).powi(2) + dy2 <= r2 {
-                            let i = py as usize * w + px as usize;
-                            bits[i / 64] |= 1u64 << (i % 64);
+            let paint = |chunk: &[Seed]| {
+                for s in chunk.iter().filter(|s| s.x.is_finite() && s.y.is_finite()) {
+                    let x0 = (s.x.floor() as i64).saturating_sub(ri).max(0);
+                    let x1 = (s.x.ceil() as i64).saturating_add(ri).min(xmax);
+                    let y0 = (s.y.floor() as i64).saturating_sub(ri).max(0);
+                    let y1 = (s.y.ceil() as i64).saturating_add(ri).min(ymax);
+                    for py in y0..=y1 {
+                        let dy2 = (py as f64 - s.y).powi(2);
+                        // A row's pixels are consecutive bits: one OR per word touched, not one per pixel.
+                        let (mut word, mut acc) = (usize::MAX, 0u64);
+                        for px in x0..=x1 {
+                            if (px as f64 - s.x).powi(2) + dy2 <= r2 {
+                                let i = py as usize * w + px as usize;
+                                if i / 64 != word {
+                                    if acc != 0 {
+                                        bits[word].fetch_or(acc, Ordering::Relaxed);
+                                    }
+                                    word = i / 64;
+                                    acc = 0;
+                                }
+                                acc |= 1u64 << (i % 64);
+                            }
+                        }
+                        if acc != 0 {
+                            bits[word].fetch_or(acc, Ordering::Relaxed);
                         }
                     }
                 }
+            };
+            if seeds.len() >= 2 * SEED_MASK_TASK {
+                seeds.par_chunks(SEED_MASK_TASK).for_each(paint);
+            } else {
+                paint(seeds);
             }
         }
         SeedMask { bits }
@@ -757,7 +785,60 @@ impl SeedMask {
 
     /// Pixel `i` (row-major) lies within `r` of a seed.
     fn covers(&self, i: usize) -> bool {
-        (self.bits[i / 64] >> (i % 64)) & 1 == 1
+        (self.bits[i / 64].load(std::sync::atomic::Ordering::Relaxed) >> (i % 64)) & 1 == 1
+    }
+}
+
+/// [`SeedMask`] over one rectangle of the plane, `(y0, y1, x0, x1)` inclusive, from the seeds that can reach it: the same
+/// test per pixel (`d² <= r²` in the same arithmetic, finite seeds only), so inside the rectangle a pixel is covered
+/// exactly when the plane-wide mask covers it, provided `seeds` holds every seed within `r` of the rectangle.
+pub(crate) struct WindowMask {
+    w: usize,
+    x0: i64,
+    y0: i64,
+    cols: usize,
+    rows: usize,
+    bits: Vec<u64>,
+}
+
+impl WindowMask {
+    pub(crate) fn new<'s>(
+        w: usize,
+        (y0, y1, x0, x1): (i64, i64, i64, i64),
+        seeds: impl Iterator<Item = &'s Seed>,
+        r: f64,
+    ) -> WindowMask {
+        let (cols, rows) = ((x1 - x0 + 1).max(0) as usize, (y1 - y0 + 1).max(0) as usize);
+        let mut bits = vec![0u64; (cols * rows).div_ceil(64)];
+        if r.is_finite() && r >= 0.0 {
+            let (r2, ri) = (r * r, r.ceil() as i64);
+            for s in seeds.filter(|s| s.x.is_finite() && s.y.is_finite()) {
+                let sx0 = ((s.x.floor() as i64).saturating_sub(ri)).max(x0);
+                let sx1 = ((s.x.ceil() as i64).saturating_add(ri)).min(x1);
+                let sy0 = ((s.y.floor() as i64).saturating_sub(ri)).max(y0);
+                let sy1 = ((s.y.ceil() as i64).saturating_add(ri)).min(y1);
+                for py in sy0..=sy1 {
+                    let dy2 = (py as f64 - s.y).powi(2);
+                    for px in sx0..=sx1 {
+                        if (px as f64 - s.x).powi(2) + dy2 <= r2 {
+                            let k = (py - y0) as usize * cols + (px - x0) as usize;
+                            bits[k / 64] |= 1u64 << (k % 64);
+                        }
+                    }
+                }
+            }
+        }
+        WindowMask { w, x0, y0, cols, rows, bits }
+    }
+
+    /// Pixel `i` (row-major on the plane) lies within `r` of a seed; a pixel outside the rectangle reads false.
+    pub(crate) fn covers(&self, i: usize) -> bool {
+        let (px, py) = ((i % self.w) as i64 - self.x0, (i / self.w) as i64 - self.y0);
+        if px < 0 || py < 0 || px as usize >= self.cols || py as usize >= self.rows {
+            return false;
+        }
+        let k = py as usize * self.cols + px as usize;
+        (self.bits[k / 64] >> (k % 64)) & 1 == 1
     }
 }
 
@@ -792,14 +873,16 @@ pub(crate) fn ring_sky(
     y: f64,
     fwhm: f64,
 ) -> Option<RingSky> {
-    let (r_in, r_out) = (
-        GROWTH_RIM_INNER_PER_FWHM * fwhm,
-        GROWTH_RIM_OUTER_PER_FWHM * fwhm,
-    );
+    ring_sky_by(data, mask, footprint, &|i| seeds.covers(i), w, h, x, y, fwhm)
+}
+
+/// The window of the plane a star's ring can touch, `(y0, y1, x0, x1)` inclusive: the pixel rows and columns within the
+/// ring's outer radius, on the plane. `None` for a non-finite centre or width, an empty plane or a window off the plane.
+fn ring_window(w: usize, h: usize, x: f64, y: f64, fwhm: f64) -> Option<(i64, i64, i64, i64)> {
+    let r_out = GROWTH_RIM_OUTER_PER_FWHM * fwhm;
     if !(x.is_finite() && y.is_finite() && r_out.is_finite() && r_out > 0.0) || w == 0 || h == 0 {
         return None;
     }
-    let (r_in2, r_out2) = (r_in * r_in, r_out * r_out);
     let (y0, y1) = (
         (y - r_out).ceil().max(0.0),
         (y + r_out).floor().min((h - 1) as f64),
@@ -811,7 +894,29 @@ pub(crate) fn ring_sky(
     if y1 < y0 || x1 < x0 {
         return None;
     }
-    let (y0, y1, x0, x1) = (y0 as i64, y1 as i64, x0 as i64, x1 as i64);
+    Some((y0 as i64, y1 as i64, x0 as i64, x1 as i64))
+}
+
+/// [`ring_sky`] with the seed discs as a predicate on the pixel's row-major index (`covered(i)`: pixel `i` lies within
+/// the disc radius of a seed) instead of a plane-wide [`SeedMask`]; it is asked about the ring window's pixels only.
+#[allow(clippy::too_many_arguments)]
+fn ring_sky_by(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    footprint: Option<&[bool]>,
+    covered: &dyn Fn(usize) -> bool,
+    w: usize,
+    h: usize,
+    x: f64,
+    y: f64,
+    fwhm: f64,
+) -> Option<RingSky> {
+    let (r_in, r_out) = (
+        GROWTH_RIM_INNER_PER_FWHM * fwhm,
+        GROWTH_RIM_OUTER_PER_FWHM * fwhm,
+    );
+    let (y0, y1, x0, x1) = ring_window(w, h, x, y, fwhm)?;
+    let (r_in2, r_out2) = (r_in * r_in, r_out * r_out);
     // The plain sum is the mean's (row-major, as the growth curve's rim summed it); the variance reads sums shifted by
     // the first ring value, so no large sky level cancels in them.
     let (mut sum, mut n) = (0.0f64, 0usize);
@@ -851,7 +956,7 @@ pub(crate) fn ring_sky(
             let d2 = (px as f64 - x).powi(2) + dy2;
             let i = row + px as usize;
             px += 1;
-            if d2 < r_in2 || d2 > r_out2 || seeds.covers(i) {
+            if d2 < r_in2 || d2 > r_out2 || covered(i) {
                 continue;
             }
             let v = data[i];
@@ -890,7 +995,7 @@ pub(crate) fn ring_sky(
 /// the frame-statistic population (a) - the plane's own `F` then reads those fits alone; `None` = every fit. A fit without a ring (fewer than 8 present pixels, or no `F`: no
 /// fit in the statistic) keeps NaN, NaN, 0 and is counted in the returned `missing`. `pool` as the fit's.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ring_skies(
+pub(super) fn ring_skies(
     data: &[f32],
     mask: Option<&[bool]>,
     footprint: Option<&[bool]>,
@@ -900,6 +1005,7 @@ pub(crate) fn ring_skies(
     kept: &mut [(usize, StarFit)],
     given: Option<f64>,
     statistic: Option<&[bool]>,
+    split: Option<(&super::fit::NeighbourSplit<'_>, &[Seed])>,
     pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
     sub: Option<&super::SubSteps>,
 ) -> (Option<f64> /* F */, usize /* missing */) {
@@ -940,16 +1046,43 @@ pub(crate) fn ring_skies(
         );
         return (None, kept.len());
     };
-    let seed_mask = SeedMask::new(w, h, seeds, GROWTH_RIM_SEED_MASK_PER_FWHM * f_ring);
-    let body = || {
-        kept.par_iter_mut().for_each(|(_, f)| {
+    let r_disc = GROWTH_RIM_SEED_MASK_PER_FWHM * f_ring;
+    let body = || match split {
+        // A list pass: the neighbours are the detected seeds less the own detections and the pass's list stars (`list`,
+        // the fit call's own seeds), held in the two parts the blend test reads. The few kept stars each read a ring
+        // window, so the discs that can touch one are painted into a mask of that window alone, not into a plane-wide
+        // mask of every seed: a pixel is covered in the window exactly when it is in the plane-wide mask.
+        Some((split, list)) => kept.par_iter_mut().for_each(|(_, f)| {
             let _leaf = super::substeps::leaf(sub, super::Step::RingSky);
-            if let Some(r) = ring_sky(data, mask, footprint, &seed_mask, w, h, f.x, f.y, f_ring) {
+            let Some(window) = ring_window(w, h, f.x, f.y, f_ring) else {
+                return;
+            };
+            let reach = GROWTH_RIM_OUTER_PER_FWHM * f_ring + r_disc + 2.0;
+            let near = split
+                .tree
+                .within(f.x, f.y, reach)
+                .into_iter()
+                .filter(|&(j, _)| !split.own[j])
+                .map(|(j, _)| &split.detected[j])
+                .chain(list.iter().filter(|s| (s.x - f.x).hypot(s.y - f.y) <= reach));
+            let local = WindowMask::new(w, window, near, r_disc);
+            if let Some(r) = ring_sky_by(data, mask, footprint, &|i| local.covers(i), w, h, f.x, f.y, f_ring) {
                 f.sky_ring = r.mean;
                 f.sky_ring_sigma = r.sigma;
                 f.sky_ring_n = r.n;
             }
-        })
+        }),
+        None => {
+            let seed_mask = SeedMask::new(w, h, seeds, r_disc);
+            kept.par_iter_mut().for_each(|(_, f)| {
+                let _leaf = super::substeps::leaf(sub, super::Step::RingSky);
+                if let Some(r) = ring_sky(data, mask, footprint, &seed_mask, w, h, f.x, f.y, f_ring) {
+                    f.sky_ring = r.mean;
+                    f.sky_ring_sigma = r.sigma;
+                    f.sky_ring_n = r.n;
+                }
+            })
+        }
     };
     super::install_in_span(pool, body);
     let missing = kept.iter().filter(|(_, f)| f.sky_ring_n == 0).count();
@@ -968,6 +1101,9 @@ pub(crate) fn ring_skies(
 /// missing (not finite), the `12F` disc leaves the plane or the caller's `footprint` (some pixel centre within `12F`
 /// with `footprint[i] == false`: LN's region outside its `allowed` mask holds zero fill and unseeded stars, F-5 round
 /// 4), or a pixel within `5F` is absent (it would bias the sum low by its missing light). `inside` is scratch.
+/// This is [`growth_curve_in`]'s unmasked form; the one non-test caller ([`aperture_correction`]) goes through
+/// `growth_curve_in`, so the existing tests keep calling this name.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn growth_curve(
     data: &[f32],
@@ -979,6 +1115,36 @@ pub(crate) fn growth_curve(
     y: f64,
     fwhm: f64,
     b: f64,
+    inside: &mut Vec<f64>,
+) -> Option<f64> {
+    growth_curve_in(data, mask, footprint, w, h, x, y, fwhm, b, None, inside)
+}
+
+/// The growth flux with a choice of form. `masked` (OSC zero point, spec §5.1 as amended by task 1b, 2026-11-16): the
+/// plane is a Bayer mosaic read on one colour's sites, and `Some(model)` is the star's own fitted model (point-sampled
+/// at the pixel centres, exactly as the fit evaluated it; `x`, `y` are its centre). A pixel within `5F` that `mask`
+/// marks absent is counted in the disc (`N_all`) and skipped, a present pixel that is not finite still refuses the
+/// star, and a disc whose present share `N_present / N_all` is outside [`MASKED_GROWTH_SHARE`] refuses the star. The
+/// sum `S_d = Σ (v − B_i)` over the present sites is then scaled by the MODEL's own green share, not a constant: the
+/// result is `S_d · S_ma / S_mg`, `S_mg` the model summed over the same present sites and `S_ma` over every pixel
+/// centre within `5F` (no sky in either). A star's green sum depends on where its centre falls on the checkerboard
+/// (±10 % per star at FWHM 1.25 px, ±3 % at 1.5, ±0.5 % at 1.8); the dependence is in `S_d` and `S_mg` alike and
+/// cancels, what remains is the real wings' excess over the model, which `c` is for. A model sum that is not finite
+/// or not positive, or whose green share `S_mg / S_ma` is outside [`MASKED_MODEL_SHARE`], refuses the star. Footprint,
+/// `12F` disc and `B_i` rules are unchanged. `None` is today's growth, bit for bit (the `#[cfg(test)]` `growth_curve`
+/// wraps it).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn growth_curve_in(
+    data: &[f32],
+    mask: Option<&[bool]>,
+    footprint: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    x: f64,
+    y: f64,
+    fwhm: f64,
+    b: f64,
+    masked: Option<&StarFit>,
     inside: &mut Vec<f64>,
 ) -> Option<f64> {
     let (r_ap, r_out) = (
@@ -996,6 +1162,9 @@ pub(crate) fn growth_curve(
     }
     let (r_ap2, r_out2) = (r_ap * r_ap, r_out * r_out);
     inside.clear();
+    let mut n_all = 0usize;
+    let point_model = masked.map(PointModel::new);
+    let (mut s_mg, mut s_ma) = (0.0f64, 0.0f64);
     let (y0, y1) = ((y - r_out).ceil() as usize, (y + r_out).floor() as usize);
     let (x0, x1) = ((x - r_out).ceil() as usize, (x + r_out).floor() as usize);
     for py in y0..=y1 {
@@ -1007,15 +1176,433 @@ pub(crate) fn growth_curve(
                 return None;
             }
             if d2 <= r_ap2 {
-                if !(data[i].is_finite() && mask.map_or(true, |m| m[i])) {
+                if let Some(model) = &point_model {
+                    n_all += 1;
+                    let m = model.at(px as f64, py as f64);
+                    s_ma += m;
+                    if !mask.map_or(true, |m| m[i]) {
+                        continue;
+                    }
+                    s_mg += m;
+                    if !data[i].is_finite() {
+                        return None;
+                    }
+                } else if !(data[i].is_finite() && mask.map_or(true, |m| m[i])) {
                     return None;
                 }
                 inside.push(data[i] as f64);
             }
         }
     }
-    Some(inside.iter().map(|v| v - b).sum())
+    let sum: f64 = inside.iter().map(|v| v - b).sum();
+    if point_model.is_none() {
+        return Some(sum);
+    }
+    let share = inside.len() as f64 / n_all as f64;
+    if !MASKED_GROWTH_SHARE.contains(&share) {
+        return None;
+    }
+    if !(s_mg.is_finite() && s_ma.is_finite() && s_mg > 0.0 && s_ma > 0.0)
+        || !MASKED_MODEL_SHARE.contains(&(s_mg / s_ma))
+    {
+        return None;
+    }
+    Some(sum * (s_ma / s_mg))
 }
+
+/// The squared radius a distance is compared with: `r²` for a radius that is not negative, else −1, which no squared
+/// distance (never negative) reaches, as no distance reaches a negative radius.
+fn sq(r: f64) -> f64 {
+    if r >= 0.0 {
+        r * r
+    } else {
+        -1.0
+    }
+}
+
+/// The share of pixel `(px, py)` inside the circle of radius `r` about `(x, y)`, `d2` the pixel centre's squared
+/// distance: 1 within `r − 0.75` and 0 beyond `r + 0.75` (a pixel's half-diagonal is 0.71), else the share of a 4 × 4
+/// sub-sample of the pixel (cell centres at ±0.125 and ±0.375) inside the circle. Squared distances throughout: no
+/// square root runs on the aperture pass's hot path.
+fn disc_share(px: f64, py: f64, d2: f64, x: f64, y: f64, r: f64) -> f64 {
+    if d2 <= sq(r - 0.75) {
+        return 1.0;
+    }
+    let far = r + 0.75;
+    if far <= 0.0 || d2 >= far * far {
+        return 0.0;
+    }
+    let r2 = r * r;
+    let mut inside = 0u32;
+    for i in 0..4 {
+        for j in 0..4 {
+            let sx = px - 0.375 + 0.25 * f64::from(i);
+            let sy = py - 0.375 + 0.25 * f64::from(j);
+            let (dx, dy) = (sx - x, sy - y);
+            if dx * dx + dy * dy <= r2 {
+                inside += 1;
+            }
+        }
+    }
+    f64::from(inside) / 16.0
+}
+
+/// The plain median of `v` (finite values; reorders it), by selection, not a full sort; NaN when empty.
+fn median_by_selection(v: &mut [f64]) -> f64 {
+    let n = v.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    let mid = n / 2;
+    let (lower, upper, _) = v.select_nth_unstable_by(mid, f64::total_cmp);
+    let hi = *upper;
+    if n % 2 == 1 {
+        hi
+    } else {
+        let lo = lower.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        0.5 * (lo + hi)
+    }
+}
+
+/// How many values on each side of the median [`quantum`] reads.
+const QUANTUM_HALF_WINDOW: usize = 50;
+
+/// The quantum of quantised data: the smallest positive difference between the values nearest the median (the 101
+/// values by rank), when every gap between the window's neighbouring values is a whole multiple of it (to 1e-3 of the
+/// quantum); `None` for data that is not quantised. The data are a camera's integers: 1 on a 16-bit camera, 4 or 16 on a
+/// 14- or 12-bit one scaled to 16 bits. Each gap is tested on its own, not each value from one origin, so a lattice
+/// coded in `f32` (a float file scaled to 16 bits; a ulp or two per value) does not drift out of the tolerance a few
+/// levels from the origin. The window is read instead of every value because the one pass over the annulus' values is
+/// the cost that counts (9 000 annuli a frame); it holds adjacent levels whenever the sky noise exceeds a quantum. A
+/// window with no positive gap (the median's level holds all 101) takes the quantum from the median level's own
+/// neighbours: the smaller of the gap up to the next level above and the gap down to the next level below, one linear
+/// pass over `v`, no copy and no sort; no neighbour at all (every value equal) is `None`. `v` is partitioned about its
+/// median (rank `n / 2` in place), as [`median_by_selection`] leaves it.
+#[cfg(test)]
+fn quantum(v: &mut [f64]) -> Option<f64> {
+    quantum_in(v, &mut Vec::new())
+}
+
+/// [`quantum`] with the window's buffer the caller's (cleared here), so a pass over thousands of annuli allocates it once.
+fn quantum_in(v: &mut [f64], window: &mut Vec<f64>) -> Option<f64> {
+    let n = v.len();
+    let mid = n / 2;
+    window.clear();
+    window.reserve(2 * QUANTUM_HALF_WINDOW + 1);
+    window.push(v[mid]);
+    let (lower, rest) = v.split_at_mut(mid);
+    let upper = &mut rest[1..];
+    if lower.len() > QUANTUM_HALF_WINDOW {
+        let k = lower.len() - QUANTUM_HALF_WINDOW;
+        lower.select_nth_unstable_by(k, f64::total_cmp);
+        window.extend_from_slice(&lower[k..]);
+    } else {
+        window.extend_from_slice(lower);
+    }
+    if upper.len() > QUANTUM_HALF_WINDOW {
+        upper.select_nth_unstable_by(QUANTUM_HALF_WINDOW, f64::total_cmp);
+        window.extend_from_slice(&upper[..QUANTUM_HALF_WINDOW]);
+    } else {
+        window.extend_from_slice(upper);
+    }
+    // A total order: equal values are bit-identical, so the unstable sort's result is the stable one's.
+    window.sort_unstable_by(f64::total_cmp);
+    let smallest_gap = window
+        .windows(2)
+        .map(|p| p[1] - p[0])
+        .filter(|&d| d > 0.0)
+        .fold(None, |best: Option<f64>, d| Some(best.map_or(d, |b| b.min(d))));
+    let q = match smallest_gap {
+        Some(q) => q,
+        None => {
+            let level = v[mid];
+            let (mut above, mut below) = (f64::INFINITY, f64::INFINITY);
+            for &x in v.iter() {
+                if x > level {
+                    above = above.min(x - level);
+                } else if x < level {
+                    below = below.min(level - x);
+                }
+            }
+            let q = above.min(below);
+            if !q.is_finite() {
+                return None;
+            }
+            q
+        }
+    };
+    let whole = |gap: f64| {
+        let r = gap / q;
+        (r - r.round()).abs() <= 1e-3
+    };
+    (q.is_finite() && q > 0.0 && window.windows(2).all(|p| whole(p[1] - p[0]))).then_some(q)
+}
+
+/// The median of `v` (reorders it), as a grouped median when the data are quantised: `m − q/2 + q·(n/2 − below)/equal`,
+/// `m` the median's quantum level, `below` the values under it and `equal` those on it, which reads a fractional sky
+/// level out of integer data (continuous in the underlying level); the plain median otherwise. `q` is
+/// [`quantum`]'s, from the data.
+#[cfg(test)]
+fn grouped_median(v: &mut [f64]) -> f64 {
+    grouped_median_in(v, &mut Vec::new())
+}
+
+/// [`grouped_median`] with [`quantum_in`]'s window buffer.
+fn grouped_median_in(v: &mut [f64], window: &mut Vec<f64>) -> f64 {
+    let m = median_by_selection(v);
+    if v.is_empty() {
+        return m;
+    }
+    let Some(q) = quantum_in(v, window) else {
+        return m;
+    };
+    // The median's level on the lattice of the data (the values are multiples of `q` about any one of them).
+    let origin = v[v.len() / 2];
+    let level = origin + ((m - origin) / q).round() * q;
+    let half = 0.5 * q;
+    let below = v.iter().filter(|&&x| x < level - half).count() as f64;
+    let equal = v.iter().filter(|&&x| (x - level).abs() < half).count() as f64;
+    if equal == 0.0 {
+        return m;
+    }
+    level - half + q * (v.len() as f64 / 2.0 - below) / equal
+}
+
+/// The buffers one [`aperture_sums_in`] call works in, kept across calls so a pass over thousands of positions allocates
+/// them once per worker.
+#[derive(Default)]
+pub(crate) struct ApertureScratch {
+    sky: [Vec<f64>; 4],
+    inner: Vec<(f64, f64, usize, f64, bool, f64)>,
+    dev: Vec<f64>,
+    window: Vec<f64>,
+}
+
+/// Plain aperture sums about one position on the plane the fits read (the working copy, `mask` the pixels that carry the
+/// plane's colour: a mosaic's green sites; `None` = mono), forced-list zero point (R-OSP-19, spec §5.2): no fit, no
+/// aperture correction.
+///
+/// - A pixel's share of a disc is [`disc_share`]'s: 1 / 0 away from the edge, a 4 × 4 sub-sample on it.
+/// - The sky is read from the annulus of `annulus_area` px starting at `annulus_start`, from its present pixels (finite,
+///   and on a site of `mask`) per phase (`(y & 1)·2 + (x & 1)` on a mosaic, one phase on mono): each phase's
+///   [`grouped_median`], the sky their mean, `sky_scatter` 1.4826 times the median of the pooled `|pixel − its phase's
+///   median|`.
+/// - Each sum is `Σ share·(v − its phase's sky)` over the present pixels of the disc, times `Σ share` over every pixel
+///   of the disc over `Σ share` over the present ones: the disc's area over its green area, 1 on a whole mono disc. The
+///   first is `radius`'s, then one per `extra_radii` entry.
+/// - `peak` is the highest present pixel within `peak_radius`, as stored (sky not subtracted).
+///
+/// `on_frame` is false, every number NaN, when the annulus or a disc leaves the plane, when a site pixel within the
+/// largest radius is not finite (the sum short of it would read low), or when no annulus pixel is present.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn aperture_sums(
+    working: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    at: (f64, f64),
+    radius: f64,
+    extra_radii: &[f64],
+    annulus_start: f64,
+    annulus_area: f64,
+    peak_radius: f64,
+) -> ListAperture {
+    aperture_sums_in(
+        &mut ApertureScratch::default(),
+        working,
+        mask,
+        w,
+        h,
+        at,
+        radius,
+        extra_radii,
+        annulus_start,
+        annulus_area,
+        peak_radius,
+    )
+}
+
+/// [`aperture_sums`] on the caller's buffers (every number the same, bit for bit).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn aperture_sums_in(
+    scratch: &mut ApertureScratch,
+    working: &[f32],
+    mask: Option<&[bool]>,
+    w: usize,
+    h: usize,
+    (x, y): (f64, f64),
+    radius: f64,
+    extra_radii: &[f64],
+    annulus_start: f64,
+    annulus_area: f64,
+    peak_radius: f64,
+) -> ListAperture {
+    let unusable = || ListAperture {
+        sum: f64::NAN,
+        extra_sums: vec![f64::NAN; extra_radii.len()],
+        sky: f64::NAN,
+        sky_scatter: f64::NAN,
+        peak: f64::NAN,
+        on_frame: false,
+    };
+    let r_out = (annulus_start * annulus_start + annulus_area / std::f64::consts::PI).sqrt();
+    let r_max = extra_radii.iter().copied().fold(radius, f64::max);
+    let reach = r_out.max(r_max + 0.75).max(peak_radius);
+    if !(x.is_finite() && y.is_finite() && reach.is_finite()) {
+        return unusable();
+    }
+    let (x0, x1) = ((x - reach).floor(), (x + reach).ceil());
+    let (y0, y1) = ((y - reach).floor(), (y + reach).ceil());
+    if x0 < 0.0 || y0 < 0.0 || x1 > (w - 1) as f64 || y1 > (h - 1) as f64 {
+        return unusable();
+    }
+    let mosaic = mask.is_some();
+    let phase_of = |px: usize, py: usize| if mosaic { (py & 1) * 2 + (px & 1) } else { 0 };
+    let ApertureScratch { sky, inner, dev, window } = scratch;
+    // About a quarter of the annulus' pixels per phase on a mosaic (the green sites), all of it on one phase of a mono
+    // plane; the vectors never grow by push.
+    let per_phase = (annulus_area / if mosaic { 4.0 } else { 1.0 }) as usize + 32;
+    for s in sky.iter_mut() {
+        s.clear();
+    }
+    for s in sky.iter_mut().take(if mosaic { 4 } else { 1 }) {
+        s.reserve(per_phase);
+    }
+    // (px, py, phase, value, on a site, squared distance) of every pixel a disc can touch.
+    let reach_px = r_max + 1.5;
+    inner.clear();
+    inner.reserve((std::f64::consts::PI * reach_px * reach_px) as usize + 16);
+    let (start2, out2, peak2) = (sq(annulus_start), sq(r_out), sq(peak_radius));
+    let near2 = sq(r_max + 0.75);
+    // A pixel with `d2` beyond every one of these three does nothing below; the row's span is cut to the pixels that can
+    // reach it (a pixel's own `d2` is still computed and tested as before, the cut only skips the ones that fail all).
+    let far2 = out2.max(peak2).max(near2);
+    let mut peak = f64::NAN;
+    for py in y0 as usize..=y1 as usize {
+        let dy = py as f64 - y;
+        let half = (far2 - dy * dy).max(0.0).sqrt() + 1.0;
+        let (sx0, sx1) = ((x - half).floor().max(x0) as usize, (x + half).ceil().min(x1) as usize);
+        for px in sx0..=sx1 {
+            let dx = px as f64 - x;
+            let d2 = dx * dx + dy * dy;
+            let i = py * w + px;
+            let v = f64::from(working[i]);
+            let site = mask.map_or(true, |m| m[i]);
+            if d2 >= start2 && d2 <= out2 && site && v.is_finite() {
+                sky[phase_of(px, py)].push(v);
+            }
+            if d2 <= peak2 && site && v.is_finite() && !(v <= peak) {
+                peak = v;
+            }
+            if d2 < near2 {
+                if site && !v.is_finite() {
+                    return unusable();
+                }
+                inner.push((px as f64, py as f64, phase_of(px, py), v, site, d2));
+            }
+        }
+    }
+    let mut med = [f64::NAN; 4];
+    dev.clear();
+    dev.reserve(sky.iter().map(Vec::len).sum());
+    for (p, s) in sky.iter_mut().enumerate() {
+        if s.is_empty() {
+            continue;
+        }
+        med[p] = grouped_median_in(s, window);
+        dev.extend(s.iter().map(|v| (v - med[p]).abs()));
+    }
+    if dev.is_empty() {
+        return unusable();
+    }
+    let sky_scatter = 1.4826 * median_by_selection(dev);
+    let mut used = [0.0f64; 4];
+    let mut n_used = 0;
+    for &m in med.iter().filter(|m| m.is_finite()) {
+        used[n_used] = m;
+        n_used += 1;
+    }
+    let sky_level = used[..n_used].iter().sum::<f64>() / n_used as f64;
+    let sum_at = |r: f64| {
+        let (mut sum, mut wg, mut wa) = (0.0, 0.0, 0.0);
+        for &(px, py, phase, v, site, d2) in inner.iter() {
+            let share = disc_share(px, py, d2, x, y, r);
+            if share == 0.0 {
+                continue;
+            }
+            wa += share;
+            if site && med[phase].is_finite() {
+                sum += share * (v - med[phase]);
+                wg += share;
+            }
+        }
+        if wg > 0.0 {
+            sum * wa / wg
+        } else {
+            f64::NAN
+        }
+    };
+    ListAperture {
+        sum: sum_at(radius),
+        extra_sums: {
+            let mut sums = Vec::with_capacity(extra_radii.len());
+            sums.extend(extra_radii.iter().map(|&r| sum_at(r)));
+            sums
+        },
+        sky: sky_level,
+        sky_scatter,
+        peak,
+        on_frame: true,
+    }
+}
+
+/// A fit's model as the fit evaluated it: the Moffat `A (1 + Q)^−β` at a pixel's centre, no sky (the Analysis-mode
+/// green-site fit is point-sampled, `fit_moffat_2d_fixed_beta_conditioned`). `fwhm_x` / `theta` are the major axis's;
+/// `u` runs along `theta`, as the solver's.
+struct PointModel {
+    x: f64,
+    y: f64,
+    amplitude: f64,
+    beta: f64,
+    cos_t: f64,
+    sin_t: f64,
+    inv_ax2: f64,
+    inv_ay2: f64,
+}
+
+impl PointModel {
+    fn new(f: &StarFit) -> PointModel {
+        let per_alpha = 2.0 * (2f64.powf(1.0 / f.beta) - 1.0).sqrt();
+        let (ax, ay) = (f.fwhm_x / per_alpha, f.fwhm_y / per_alpha);
+        PointModel {
+            x: f.x,
+            y: f.y,
+            amplitude: f.amplitude,
+            beta: f.beta,
+            cos_t: f.theta.cos(),
+            sin_t: f.theta.sin(),
+            inv_ax2: 1.0 / (ax * ax),
+            inv_ay2: 1.0 / (ay * ay),
+        }
+    }
+
+    fn at(&self, px: f64, py: f64) -> f64 {
+        let (dx, dy) = (px - self.x, py - self.y);
+        let u = dx * self.cos_t + dy * self.sin_t;
+        let v = -dx * self.sin_t + dy * self.cos_t;
+        let q = u * u * self.inv_ax2 + v * v * self.inv_ay2;
+        self.amplitude * (1.0 + q).powf(-self.beta)
+    }
+}
+
+/// The accepted green share of a star's own model within `5F` (`S_mg / S_ma`, a checkerboard's is 0.5 up to the star's
+/// phase): a share outside this range is a model the phase-matched growth does not trust.
+pub(crate) const MASKED_MODEL_SHARE: std::ops::RangeInclusive<f64> = 0.35..=0.65;
+
+/// The present share of a masked growth disc that is accepted (the green sites of a Bayer mosaic are half of any
+/// disc; a share outside this range is a mask the growth does not know how to scale).
+pub(crate) const MASKED_GROWTH_SHARE: std::ops::RangeInclusive<f64> = 0.45..=0.55;
 
 /// The clip screen's range on a path without a saturation verdict (F-5, owner ruling R6 / C6): F-3's
 /// `range = min(plane max, norm) − bg` ([`SaturationPlane::new`]) from the fitted plane itself, in the plane's own
@@ -1060,7 +1647,7 @@ pub(crate) fn unverdicted_clip_range(
 
 /// The plane's aperture correction (F-5, ruling R-OSP-7; rim and screen by owner ruling R6, 2026-10-11; the rim read
 /// once per star from Task 10b, ruling B2): `c = median(growth / model)` over the [`CORRECTION_STARS`] brightest
-/// qualifying fits by [`model_flux_in_fwtm`] (ties by seed index), the growth the [`growth_curve`] flux at `5F` against
+/// qualifying fits by [`model_flux_in_fwtm`] (ties by seed index), the growth the [`growth_curve_in`] flux at `5F` against
 /// the fit's stored B_i ([`StarFit::sky_ring`], [`ring_skies`]), `F` = `ring_fwhm`, the ring width the B_i were read at
 /// (the plane's frame FWHM over the fits neither saturated nor extended, or the caller's
 /// [`super::FitStarsOptions::ring_fwhm`]). A qualifying fit is accepted (`fits` = the kept fits after the duplicate
@@ -1068,7 +1655,7 @@ pub(crate) fn unverdicted_clip_range(
 /// back, below), has a finite positive model flux, passes the clip screen (its fitted amplitude not above the range, F-3's amplitude
 /// clause: `saturation`'s [`SaturationPlane::range`] on the measure path, else [`unverdicted_clip_range`] under the
 /// caller's `full_scale`), has no other seed of `seeds` within [`CORRECTION_ISOLATION_PER_FIELD_FWHM`]` · field_fwhm`
-/// of its fitted centre, and a [`growth_curve`] (its B_i present, its `12F` disc inside the plane and the caller's
+/// of its fitted centre, and a [`growth_curve_in`] (its B_i present, its `12F` disc inside the plane and the caller's
 /// `footprint`, no absent pixel within `5F`). Returns `(c, n, se, screens)`: `c` is `None` with no fit at all (`debug!`)
 /// or with fewer than [`CORRECTION_MIN_RATIOS`] ratios (one `warn!`: the model flux is used uncorrected, `c = 1`); both
 /// per-plane events count the clip-screened candidates (`skipped`) beside the two Plan B B4 screens (`point_source`,
@@ -1099,6 +1686,9 @@ pub(crate) fn unverdicted_clip_range(
 /// refits) takes nothing back. Where `population` is `Some` (probes) the population's (a) leaves extended seeds out by eligibility, so
 /// nothing is taken back there; the stacking Measure runs without a population ([`super::Mode::All`] and
 /// [`super::Mode::Brightest`]).
+///
+/// `masked` (OSC zero point, spec §5.1): every growth is [`growth_curve_in`]'s masked form (a Bayer mosaic read on its
+/// green sites); every candidate screen above is unchanged, and the caller reports the result, never applies it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aperture_correction(
     data: &[f32],
@@ -1116,6 +1706,7 @@ pub(crate) fn aperture_correction(
     population: Option<super::population::PopulationView<'_>>,
     siblings: Option<&[Seed]>,
     rescue_extended: bool,
+    masked: bool,
 ) -> (Option<f64>, usize, Option<f64>, ApertureScreens) {
     if fits.is_empty() {
         tracing::debug!(
@@ -1205,7 +1796,7 @@ pub(crate) fn aperture_correction(
                 if !isolated(seed, f) {
                     continue;
                 }
-                if let Some(growth) = growth_curve(
+                if let Some(growth) = growth_curve_in(
                     data,
                     mask,
                     footprint,
@@ -1215,6 +1806,7 @@ pub(crate) fn aperture_correction(
                     f.y,
                     f_ring,
                     f.sky_ring,
+                    masked.then_some(f),
                     &mut inside,
                 ) {
                     ratios.push(growth / model);
@@ -1229,15 +1821,27 @@ pub(crate) fn aperture_correction(
     let n = ratios.len();
     screens.ratios = taken;
     if n < CORRECTION_MIN_RATIOS {
-        tracing::warn!(
-            count = n,
-            skipped = screened,
-            point_source = screens.point_source,
-            below_snr = screens.below_snr,
-            rescued = screens.rescued,
-            fwhm_px = ring_fwhm,
-            "aperture correction: fewer than 5 isolated unsaturated stars; the star flux is the model's, uncorrected"
-        );
+        if masked {
+            tracing::warn!(
+                count = n,
+                skipped = screened,
+                point_source = screens.point_source,
+                below_snr = screens.below_snr,
+                rescued = screens.rescued,
+                fwhm_px = ring_fwhm,
+                "aperture correction on green sites: fewer than 5 isolated unsaturated stars; none reported, none applied"
+            );
+        } else {
+            tracing::warn!(
+                count = n,
+                skipped = screened,
+                point_source = screens.point_source,
+                below_snr = screens.below_snr,
+                rescued = screens.rescued,
+                fwhm_px = ring_fwhm,
+                "aperture correction: fewer than 5 isolated unsaturated stars; the star flux is the model's, uncorrected"
+            );
+        }
         return (None, n, None, screens);
     }
     let c = super::robust::median_f64(&mut ratios);
@@ -1246,17 +1850,31 @@ pub(crate) fn aperture_correction(
     let mut dev: Vec<f64> = ratios.iter().map(|r| (r - c).abs()).collect();
     let mad = super::robust::median_f64(&mut dev);
     let se = 1.2533 * 1.4826 * mad / (n as f64).sqrt();
-    tracing::debug!(
-        count = n,
-        skipped = screened,
-        point_source = screens.point_source,
-        below_snr = screens.below_snr,
-        rescued = screens.rescued,
-        aperture_correction = c,
-        aperture_se = se,
-        fwhm_px = ring_fwhm,
-        "aperture correction measured"
-    );
+    if masked {
+        tracing::debug!(
+            count = n,
+            skipped = screened,
+            point_source = screens.point_source,
+            below_snr = screens.below_snr,
+            rescued = screens.rescued,
+            reported_aperture_correction = c,
+            reported_aperture_se = se,
+            fwhm_px = ring_fwhm,
+            "aperture correction on green sites reported, not applied"
+        );
+    } else {
+        tracing::debug!(
+            count = n,
+            skipped = screened,
+            point_source = screens.point_source,
+            below_snr = screens.below_snr,
+            rescued = screens.rescued,
+            aperture_correction = c,
+            aperture_se = se,
+            fwhm_px = ring_fwhm,
+            "aperture correction measured"
+        );
+    }
     (Some(c), n, Some(se), screens)
 }
 
@@ -2489,6 +3107,297 @@ mod tests {
             at_one.is_finite() && (at_one / near_one - 1.0).abs() < 1e-5,
             "{at_one} vs {near_one}"
         );
+    }
+
+    /// A round, point-sampled Moffat fit for the masked growth's tests: centre `(x, y)`, peak `amp`, `fwhm`, `beta`.
+    fn round_fit(x: f64, y: f64, amp: f64, fwhm: f64, beta: f64) -> StarFit {
+        StarFit {
+            x,
+            y,
+            background: 0.0,
+            amplitude: amp,
+            fwhm_x: fwhm,
+            fwhm_y: fwhm,
+            fwtm_x: 0.0,
+            fwtm_y: 0.0,
+            theta: 0.0,
+            beta,
+            residual: 0.0,
+            signal: 0.0,
+            area: 0.0,
+            peak5: f64::NAN,
+            sky_ring: f64::NAN,
+            sky_ring_sigma: f64::NAN,
+            sky_ring_n: 0,
+            ap_sum: f64::NAN,
+            snr: f64::NAN,
+            hfr: f64::NAN,
+            flags: Default::default(),
+        }
+    }
+
+    /// `A (1 + r^2 / alpha^2)^-beta` of a round Moffat of this FWHM, evaluated independently of [`PointModel`].
+    fn round_moffat_at(f: &StarFit, px: f64, py: f64) -> f64 {
+        let alpha = f.fwhm_x / (2.0 * (2f64.powf(1.0 / f.beta) - 1.0).sqrt());
+        let r2 = (px - f.x).powi(2) + (py - f.y).powi(2);
+        f.amplitude * (1.0 + r2 / (alpha * alpha)).powf(-f.beta)
+    }
+
+    /// OSC zero point, spec §5.1 as amended by task 1b: the phase-matched masked growth is exact on the model's own
+    /// light. Data that IS the point-sampled model (no sky): `S_d · S_ma / S_mg` is the model summed over every pixel
+    /// centre within `5F`, at every sub-pixel phase of the checkerboard and every FWHM, to rounding.
+    #[test]
+    fn masked_growth_on_the_models_own_light_is_the_models_flux_on_every_phase() {
+        let (w, h) = (130usize, 130usize);
+        let mask: Vec<bool> = (0..w * h).map(|i| (i % w + i / w) % 2 == 0).collect();
+        let mut scratch = Vec::new();
+        for fwhm in [1.25, 1.4, 1.6, 2.0, 3.0] {
+            for j in 0..4 {
+                for i in 0..4 {
+                    let (x, y) = (
+                        65.0 + (i as f64 + 0.5) / 4.0,
+                        65.0 + (j as f64 + 0.5) / 4.0,
+                    );
+                    let fit = round_fit(x, y, 1.0, fwhm, 4.0);
+                    let data: Vec<f32> = (0..w * h)
+                        .map(|k| round_moffat_at(&fit, (k % w) as f64, (k / w) as f64) as f32)
+                        .collect();
+                    let g = growth_curve_in(
+                        &data,
+                        Some(&mask),
+                        None,
+                        w,
+                        h,
+                        x,
+                        y,
+                        fwhm,
+                        0.0,
+                        Some(&fit),
+                        &mut scratch,
+                    )
+                    .unwrap_or_else(|| panic!("FWHM {fwhm} phase ({i}, {j}): refused"));
+                    let r2 = (GROWTH_RADIUS_PER_FWHM * fwhm).powi(2);
+                    let all: f64 = (0..w * h)
+                        .filter(|k| {
+                            ((k % w) as f64 - x).powi(2) + ((k / w) as f64 - y).powi(2) <= r2
+                        })
+                        .map(|k| round_moffat_at(&fit, (k % w) as f64, (k / w) as f64))
+                        .sum();
+                    assert!(
+                        (g / all - 1.0).abs() < 1e-5,
+                        "FWHM {fwhm} phase ({i}, {j}): {g} vs the model's flux within 5F {all}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The unmasked form is the code that was: a pixel absent by the mask refuses the star (the mask is never read as
+    /// "skip"), the sum is the plain disc sum, and the masked form's own refusals leave it alone.
+    #[test]
+    fn growth_curve_unmasked_is_unchanged() {
+        let (w, h) = (120usize, 120usize);
+        let (x, y, fwhm, b) = (60.3, 59.6, 2.0, 5.0);
+        let data = moffat_field(
+            w,
+            h,
+            &[MoffatStar {
+                x,
+                y,
+                amp: 100.0,
+                alpha_x: 1.5,
+                alpha_y: 1.5,
+                theta: 0.0,
+            }],
+            4.0,
+            10.0,
+        );
+        let mut scratch = Vec::new();
+        let by_hand: f64 = {
+            let r = GROWTH_RADIUS_PER_FWHM * fwhm;
+            let mut sum = 0.0;
+            for py in 0..h {
+                for px in 0..w {
+                    if (px as f64 - x).powi(2) + (py as f64 - y).powi(2) <= r * r {
+                        sum += data[py * w + px] as f64 - b;
+                    }
+                }
+            }
+            sum
+        };
+        let plain = growth_curve_in(&data, None, None, w, h, x, y, fwhm, b, None, &mut scratch)
+            .unwrap();
+        assert_eq!(plain.to_bits(), by_hand.to_bits(), "the plain disc sum");
+        assert_eq!(
+            growth_curve(&data, None, None, w, h, x, y, fwhm, b, &mut scratch)
+                .unwrap()
+                .to_bits(),
+            plain.to_bits()
+        );
+        let mut all = vec![true; w * h];
+        all[60 * w + 60] = false;
+        assert_eq!(
+            growth_curve_in(&data, Some(&all), None, w, h, x, y, fwhm, b, None, &mut scratch),
+            None,
+            "unmasked: an absent pixel within 5F refuses the star"
+        );
+    }
+
+    /// The masked form's refusals: a mask that is not half the disc, no mask at all, a present pixel that is not
+    /// finite (while an absent one holding NaN is skipped), a missing B_i, and a model that cannot scale the sum (a
+    /// green share outside 0.35 to 0.65, no light, a NaN amplitude). The scale is the model's own green share, never a
+    /// constant and never the disc's count ratio.
+    #[test]
+    fn masked_growth_refuses_what_it_cannot_scale() {
+        let (w, h) = (120usize, 120usize);
+        let (x, y, fwhm) = (60.0, 60.0, 2.0);
+        let fit = round_fit(x, y, 7.0, 2.0, 4.0);
+        let mut data = vec![10.0f32; w * h];
+        let checker: Vec<bool> = (0..w * h).map(|i| (i % w + i / w) % 2 == 0).collect();
+        let mut scratch = Vec::new();
+        let mut go = |data: &[f32], mask: Option<&[bool]>, b: f64, model: &StarFit| {
+            growth_curve_in(data, mask, None, w, h, x, y, fwhm, b, Some(model), &mut scratch)
+        };
+        // Flat 10 over a half-present disc: the green sites' sum, 5 above a sky of 5 per site, scaled by the model's
+        // own all-sites over green-sites ratio within 5F, evaluated here independently.
+        let (mut n_green, mut s_mg, mut s_ma) = (0usize, 0.0f64, 0.0f64);
+        for py in 0..h {
+            for px in 0..w {
+                if (px as f64 - x).powi(2) + (py as f64 - y).powi(2) <= (5.0 * fwhm).powi(2) {
+                    let m = round_moffat_at(&fit, px as f64, py as f64);
+                    s_ma += m;
+                    if checker[py * w + px] {
+                        n_green += 1;
+                        s_mg += m;
+                    }
+                }
+            }
+        }
+        let g = go(&data, Some(&checker), 5.0, &fit).unwrap();
+        let want = 5.0 * n_green as f64 * s_ma / s_mg;
+        assert!((g / want - 1.0).abs() < 1e-9, "{g} vs {want}");
+        assert!(
+            (s_mg / s_ma - 0.5).abs() > 1e-4,
+            "premise: the model's green share is not the constant 0.5 ({})",
+            s_mg / s_ma
+        );
+        assert_eq!(go(&data, None, 5.0, &fit), None, "no mask: share 1.0");
+        assert_eq!(go(&data, Some(&vec![true; w * h]), 5.0, &fit), None, "all present");
+        let rows: Vec<bool> = (0..w * h).map(|i| (i / w) % 4 != 0).collect();
+        assert_eq!(go(&data, Some(&rows), 5.0, &fit), None, "three quarters present");
+        assert_eq!(go(&data, Some(&checker), f64::NAN, &fit), None, "no B_i");
+        // A model on one lattice alone (a centre pixel narrower than the sampling): green share far above 0.65.
+        assert_eq!(
+            go(&data, Some(&checker), 5.0, &round_fit(x, y, 7.0, 0.3, 4.0)),
+            None,
+            "a model almost wholly on the green sites"
+        );
+        assert_eq!(
+            go(&data, Some(&checker), 5.0, &round_fit(x + 1.0, y, 7.0, 0.3, 4.0)),
+            None,
+            "a model almost wholly on the absent sites"
+        );
+        assert_eq!(go(&data, Some(&checker), 5.0, &round_fit(x, y, 0.0, 2.0, 4.0)), None, "no light");
+        assert_eq!(go(&data, Some(&checker), 5.0, &round_fit(x, y, f64::NAN, 2.0, 4.0)), None, "NaN light");
+        let present = (60 * w + 60, 60 * w + 61);
+        let (on, off) = if checker[present.0] { present } else { (present.1, present.0) };
+        data[off] = f32::NAN;
+        assert!(go(&data, Some(&checker), 5.0, &fit).is_some(), "an absent NaN is skipped");
+        data[on] = f32::NAN;
+        assert_eq!(go(&data, Some(&checker), 5.0, &fit), None, "a present NaN refuses");
+    }
+
+    /// The parallel painting sets the bits the one-thread loop sets (the loop as it stood before the mask was built in
+    /// parallel), on the plane's edges, with a seed off the plane and one that is not finite.
+    #[test]
+    fn the_seed_mask_equals_the_serial_loop() {
+        let (w, h) = (700usize, 523usize);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1_000_000) as f64 / 1_000_000.0
+        };
+        let mut seeds: Vec<Seed> = (0..3000)
+            .map(|_| seed_at(next() * (w as f64 + 40.0) - 20.0, next() * (h as f64 + 40.0) - 20.0))
+            .collect();
+        seeds.push(seed_at(f64::NAN, 5.0));
+        seeds.push(seed_at(10.0, f64::INFINITY));
+        for r in [0.0f64, 2.5, 9.0] {
+            let mut want = vec![0u64; (w * h).div_ceil(64)];
+            let (r2, ri) = (r * r, r.ceil() as i64);
+            for s in seeds.iter().filter(|s| s.x.is_finite() && s.y.is_finite()) {
+                let x0 = (s.x.floor() as i64).saturating_sub(ri).max(0);
+                let x1 = (s.x.ceil() as i64).saturating_add(ri).min(w as i64 - 1);
+                let y0 = (s.y.floor() as i64).saturating_sub(ri).max(0);
+                let y1 = (s.y.ceil() as i64).saturating_add(ri).min(h as i64 - 1);
+                for py in y0..=y1 {
+                    let dy2 = (py as f64 - s.y).powi(2);
+                    for px in x0..=x1 {
+                        if (px as f64 - s.x).powi(2) + dy2 <= r2 {
+                            let i = py as usize * w + px as usize;
+                            want[i / 64] |= 1u64 << (i % 64);
+                        }
+                    }
+                }
+            }
+            let got = SeedMask::new(w, h, &seeds, r);
+            assert_eq!(got.bits.len(), want.len());
+            for (k, (g, wnt)) in got.bits.iter().zip(&want).enumerate() {
+                assert_eq!(g.load(std::sync::atomic::Ordering::Relaxed), *wnt, "r {r}, word {k}");
+            }
+        }
+    }
+
+    /// A star's ring read through a window mask of the seeds that can reach it is the ring read through the plane-wide
+    /// mask of every seed, bit for bit, wherever the star sits (the plane's corners and edges included).
+    #[test]
+    fn a_window_mask_reads_the_ring_the_plane_wide_mask_does() {
+        let (w, h) = (400usize, 330usize);
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1_000_000) as f64 / 1_000_000.0
+        };
+        let data: Vec<f32> = (0..w * h).map(|i| 1000.0 + (i % 251) as f32 + (next() * 40.0) as f32).collect();
+        let seeds: Vec<Seed> = (0..1500)
+            .map(|_| seed_at((next() * (w as f64 + 20.0) - 10.0).round() * 1.0, (next() * (h as f64 + 20.0) - 10.0) + 0.5))
+            .collect();
+        for fwhm in [2.2, 3.5] {
+            let r = GROWTH_RIM_SEED_MASK_PER_FWHM * fwhm;
+            let reach = GROWTH_RIM_OUTER_PER_FWHM * fwhm + r + 2.0;
+            let wide = SeedMask::new(w, h, &seeds, r);
+            let mut compared = 0;
+            for k in 0..120 {
+                let (x, y) = match k {
+                    0 => (0.0, 0.0),
+                    1 => (w as f64 - 1.0, h as f64 - 1.0),
+                    2 => (3.3, h as f64 / 2.0),
+                    _ => (next() * w as f64, next() * h as f64),
+                };
+                let want = ring_sky(&data, None, None, &wide, w, h, x, y, fwhm);
+                let window = ring_window(w, h, x, y, fwhm);
+                let got = window.and_then(|win| {
+                    let near = seeds.iter().filter(|s| (s.x - x).hypot(s.y - y) <= reach);
+                    let local = WindowMask::new(w, win, near, r);
+                    ring_sky_by(&data, None, None, &|i| local.covers(i), w, h, x, y, fwhm)
+                });
+                match (want, got) {
+                    (Some(a), Some(b)) => {
+                        assert_eq!(a.mean.to_bits(), b.mean.to_bits(), "star {k} at {x},{y}");
+                        assert_eq!(a.sigma.to_bits(), b.sigma.to_bits(), "star {k}");
+                        assert_eq!(a.n, b.n, "star {k}");
+                        compared += 1;
+                    }
+                    (None, None) => {}
+                    other => panic!("star {k} at {x},{y}: {other:?}"),
+                }
+            }
+            assert!(compared >= 60, "{compared} rings compared");
+        }
     }
 
     /// A pin (C0's qualifying rules; rim and edge by owner ruling R6; the rim read by `ring_sky` and handed in as B_i
@@ -4574,4 +5483,571 @@ mod b4_tests {
         );
         assert!(sample(&m[1]) > 16, "premise: plane 1 samples all its stars");
     }
+
+    // ---- Aperture sums (forced-list zero point, R-OSP-19) ----
+
+    /// A plane of `value` everywhere but a round star of `amp` and `alpha` (a β 2.5 Moffat, the pixel-integrated render)
+    /// cut at `reach` px about `(x, y)`, on `sky`.
+    fn star_plane(
+        w: usize,
+        h: usize,
+        (x, y): (f64, f64),
+        (amp, fwhm): (f64, f64),
+        sky: f32,
+    ) -> Vec<f32> {
+        use crate::test_support::{integrated_field, IntegratedProfile};
+        integrated_field(
+            w,
+            h,
+            &[(x, y, amp)],
+            IntegratedProfile::Moffat { fwhm, beta: 2.5 },
+            5,
+            sky,
+        )
+    }
+
+    /// A mosaic's green mask by hand: sites with `(x + y)` even (the two greens of any Bayer pattern lie on the
+    /// checkerboard).
+    fn checker(w: usize, h: usize) -> Vec<bool> {
+        (0..w * h).map(|i| (i % w + i / w) % 2 == 0).collect()
+    }
+
+    #[test]
+    fn the_sub_pixel_edge_is_continuous() {
+        // A disc of 1 on a plane of 0, reaching past r + 0.75 and short of the annulus: the sky is 0, so the sum is the
+        // sum of the shares, `pi r^2` at any sub-pixel position (4 x 4 sub-sampling is good to about 1.3e-3 at 8 px; a
+        // flat plane of 1 would sum to 0 after its sky).
+        let (w, h) = (120usize, 120usize);
+        let r = 8.0;
+        for k in 0..20 {
+            let (x, y) = (60.0 + 0.0537 * k as f64, 60.0 + 0.0911 * k as f64);
+            let mut p = vec![0.0f32; w * h];
+            for py in 0..h {
+                for px in 0..w {
+                    if (px as f64 - x).hypot(py as f64 - y) <= r + 1.0 {
+                        p[py * w + px] = 1.0;
+                    }
+                }
+            }
+            let a = aperture_sums(&p, None, w, h, (x, y), r, &[], 20.0, 2000.0, 3.0);
+            assert!(a.on_frame && a.sky == 0.0, "{a:?}");
+            let want = std::f64::consts::PI * r * r;
+            assert!(
+                (a.sum / want - 1.0).abs() < 5e-3,
+                "position {k}: {} against {want}",
+                a.sum
+            );
+        }
+    }
+
+    #[test]
+    fn an_aperture_off_the_frame_is_not_on_frame() {
+        let (w, h) = (200usize, 200usize);
+        let p = vec![1000.0f32; w * h];
+        // The annulus (out to about 31 px) leaves the plane.
+        let a = aperture_sums(&p, None, w, h, (20.0, 100.0), 8.0, &[6.0, 10.0], 20.0, 2000.0, 3.0);
+        assert!(!a.on_frame);
+        assert!(a.sum.is_nan() && a.sky.is_nan() && a.sky_scatter.is_nan() && a.peak.is_nan());
+        assert_eq!(a.extra_sums.len(), 2);
+        assert!(a.extra_sums.iter().all(|v| v.is_nan()));
+        let ok = aperture_sums(&p, None, w, h, (100.0, 100.0), 8.0, &[6.0, 10.0], 20.0, 2000.0, 3.0);
+        assert!(ok.on_frame && ok.sum.abs() < 1e-9 && (ok.sky - 1000.0).abs() < 1e-9);
+        assert_eq!(ok.peak, 1000.0);
+        let nan = aperture_sums(&p, None, w, h, (f64::NAN, 100.0), 8.0, &[], 20.0, 2000.0, 3.0);
+        assert!(!nan.on_frame);
+    }
+
+    #[test]
+    fn a_non_finite_pixel_in_the_disc_makes_the_aperture_unusable() {
+        let (w, h) = (200usize, 200usize);
+        let mut p = star_plane(w, h, (100.0, 100.0), (3000.0, 3.0), 1000.0);
+        let ok = aperture_sums(&p, None, w, h, (100.0, 100.0), 12.0, &[18.0], 22.0, 2000.0, 4.5);
+        assert!(ok.on_frame && ok.sum.is_finite());
+        p[103 * w + 98] = f32::NAN;
+        let bad = aperture_sums(&p, None, w, h, (100.0, 100.0), 12.0, &[18.0], 22.0, 2000.0, 4.5);
+        assert!(!bad.on_frame && bad.sum.is_nan());
+        // A pixel in the annulus is left out of the sky, not a reason to refuse; so is a non-site pixel of a mosaic.
+        let mut q = star_plane(w, h, (100.0, 100.0), (3000.0, 3.0), 1000.0);
+        q[100 * w + 125] = f32::NAN;
+        let annulus = aperture_sums(&q, None, w, h, (100.0, 100.0), 12.0, &[18.0], 22.0, 2000.0, 4.5);
+        assert!(annulus.on_frame && (annulus.sum / ok.sum - 1.0).abs() < 1e-3);
+        let mask = checker(w, h);
+        let mut m = star_plane(w, h, (100.0, 100.0), (3000.0, 3.0), 1000.0);
+        m[100 * w + 101] = f32::NAN; // (101 + 100) odd: not a site
+        let off_site = aperture_sums(&m, Some(&mask), w, h, (100.0, 100.0), 12.0, &[], 22.0, 2000.0, 4.5);
+        assert!(off_site.on_frame);
+    }
+
+    #[test]
+    fn a_mosaic_stars_sum_is_twice_its_green_sum_inside_the_disc() {
+        let (w, h) = (200usize, 200usize);
+        let (x, y, r) = (100.3, 99.7, 12.0);
+        let p = star_plane(w, h, (x, y), (3000.0, 3.0), 1000.0);
+        let mask = checker(w, h);
+        let mono = aperture_sums(&p, None, w, h, (x, y), r, &[], 22.0, 2000.0, 4.5);
+        let mosaic = aperture_sums(&p, Some(&mask), w, h, (x, y), r, &[], 22.0, 2000.0, 4.5);
+        assert!(
+            (mosaic.sum / mono.sum - 1.0).abs() < 5e-3,
+            "mosaic {} mono {}",
+            mosaic.sum,
+            mono.sum
+        );
+        // The green sites alone, a whole-pixel disc, less the sky: about half of the whole, and the sum is twice it.
+        let mut green_only = 0.0;
+        for py in 0..h {
+            for px in 0..w {
+                if mask[py * w + px] && (px as f64 - x).hypot(py as f64 - y) <= r {
+                    green_only += f64::from(p[py * w + px]) - mosaic.sky;
+                }
+            }
+        }
+        assert!(
+            (mosaic.sum / (2.0 * green_only) - 1.0).abs() < 0.03,
+            "sum {} against twice the green sum {}",
+            mosaic.sum,
+            2.0 * green_only
+        );
+    }
+
+    #[test]
+    fn each_green_phase_is_less_its_own_sky() {
+        let (w, h) = (200usize, 200usize);
+        let mut base = star_plane(w, h, (100.0, 100.0), (3000.0, 3.0), 1000.0);
+        add_noise(&mut base, 4.0, 3);
+        let mask = checker(w, h);
+        // The two greens of an RGGB frame sit on even rows (x even + y even) and odd rows; +3 ADU on the odd-row greens.
+        let mut shifted = base.clone();
+        for py in (1..h).step_by(2) {
+            for px in 0..w {
+                if mask[py * w + px] {
+                    shifted[py * w + px] += 3.0;
+                }
+            }
+        }
+        let a = aperture_sums(&base, Some(&mask), w, h, (100.0, 100.0), 12.0, &[], 22.0, 2000.0, 4.5);
+        let b = aperture_sums(&shifted, Some(&mask), w, h, (100.0, 100.0), 12.0, &[], 22.0, 2000.0, 4.5);
+        assert!(
+            (b.sum / a.sum - 1.0).abs() < 5e-3,
+            "{} against {}",
+            b.sum,
+            a.sum
+        );
+        assert!((b.sky - a.sky - 1.5).abs() < 0.05, "the sky is the phases' mean");
+    }
+
+    #[test]
+    fn the_grouped_median_follows_a_fractional_level() {
+        // Integer data about 100.3: a deterministic uniform spread of 10 levels, rounded.
+        let n = 4000usize;
+        let mut ints: Vec<f64> = (0..n)
+            .map(|i| (100.3 + ((i as f64 + 0.5) / n as f64 - 0.5) * 10.0).round())
+            .collect();
+        let m = grouped_median(&mut ints);
+        assert!((m - 100.3).abs() < 0.05, "integer data: {m}");
+        // Steps of 16 about 1604.8: the quantum is read from the data, not taken to be 1.
+        let mut steps: Vec<f64> = (0..n)
+            .map(|i| {
+                let v = 1604.8 + ((i as f64 + 0.5) / n as f64 - 0.5) * 100.0;
+                16.0 * (v / 16.0).round()
+            })
+            .collect();
+        let m = grouped_median(&mut steps);
+        assert!((m - 1604.8).abs() < 0.8, "steps of 16: {m}");
+        // Data that are not quantised: the plain median.
+        let mut cont: Vec<f64> = (0..n).map(|i| 50.0 + (i as f64 * 0.7311).sin()).collect();
+        let mut again = cont.clone();
+        assert_eq!(grouped_median(&mut cont), median_by_selection(&mut again));
+        // A single level, and a short sample.
+        assert_eq!(grouped_median(&mut [7.0; 5]), 7.0);
+        assert!(grouped_median(&mut []).is_nan());
+        assert_eq!(grouped_median(&mut [3.0]), 3.0);
+    }
+
+    /// Noise of about `sigma` from twelve uniforms (a deterministic stand-in for a Gaussian), from `rng`.
+    fn gauss(rng: &mut crate::geometry::ransac::SplitMix64, sigma: f64) -> f64 {
+        sigma * ((0..12).map(|_| rng.next_f64()).sum::<f64>() - 6.0)
+    }
+
+    /// A camera's plane: integer levels `round(sky + noise + stars)` times `scale` (1 on 16 bits, 4 on 14, 16 on 12), a
+    /// round Gaussian star of FWHM 3 at each of `stars`.
+    fn integer_plane(
+        w: usize,
+        h: usize,
+        sky: f64,
+        sigma: f64,
+        scale: f64,
+        stars: &[(f64, f64, f64)],
+        seed: u64,
+    ) -> Vec<f32> {
+        let mut rng = crate::geometry::ransac::SplitMix64(seed);
+        let s2 = 2.0 * (3.0f64 / 2.3548).powi(2);
+        (0..w * h)
+            .map(|i| {
+                let (px, py) = ((i % w) as f64, (i / w) as f64);
+                let star: f64 = stars
+                    .iter()
+                    .map(|&(x, y, a)| a * (-((px - x).powi(2) + (py - y).powi(2)) / s2).exp())
+                    .sum();
+                ((sky + gauss(&mut rng, sigma) + star).round() * scale) as f32
+            })
+            .collect()
+    }
+
+    /// Two apertures as bits, NaN equal to NaN.
+    fn aperture_bits(a: &ListAperture) -> Vec<u64> {
+        let mut v = vec![a.sum.to_bits(), a.sky.to_bits(), a.sky_scatter.to_bits(), a.peak.to_bits()];
+        v.extend(a.extra_sums.iter().map(|x| x.to_bits()));
+        v.push(u64::from(a.on_frame));
+        v
+    }
+
+    /// The cost fix moves no bit: squared distances in place of `hypot`, the O(n) gap search in place of the copy and
+    /// sort, pre-sized vectors. The aperture pass is compared with the first round's own arithmetic ([`aperture_sums_r0`])
+    /// on the same pixels, mono and mosaic, 16-, 14- and 12-bit data (quantum 1, 4, 16), a noise under one quantum (the
+    /// window holds one level: the quantum's fallback runs), centres on whole and half pixels and a fractional ones,
+    /// several radii, a pixel that is not finite on a site and off it, and a disc at the frame's edge.
+    #[test]
+    fn the_cost_fix_moves_no_bit_of_the_aperture_pass() {
+        let (w, h) = (130usize, 130usize);
+        let stars = [(64.3, 63.8, 3000.0), (40.5, 90.0, 1500.0)];
+        let mask = checker(w, h);
+        let centres = [
+            (64.3, 63.8),
+            (64.0, 64.0),
+            (64.5, 64.5),
+            (40.5, 90.0),
+            (60.77, 70.13),
+            (36.0, 36.0),
+            (35.2, 94.9),
+            (20.0, 20.0),
+            (3.0, 60.0),
+            (95.0, 40.0),
+        ];
+        let setups: [(f64, f64, &[f64], f64, f64, f64); 4] = [
+            (12.0, 22.0, &[9.0, 18.0], 2000.0, 4.5, 1.0),
+            (3.2, 6.0, &[2.0, 4.5], 400.0, 2.5, 0.0),
+            (9.0, 15.0, &[6.0], 900.0, 4.5, 3.0),
+            (0.6, 3.0, &[], 120.0, 0.0, 2.0),
+        ];
+        let mut compared = 0;
+        for (scale, sigma, sky) in [
+            (1.0, 25.0, 1000.3),
+            (1.0, 1.5, 1000.3),
+            (1.0, 0.3, 700.0),
+            (4.0, 40.0, 1000.3),
+            (4.0, 2.0, 1000.3),
+            (16.0, 60.0, 2000.0),
+            (16.0, 3.0, 2000.0),
+        ] {
+            let plane = integer_plane(w, h, sky, sigma, scale, &stars, 17 + sigma as u64);
+            for with_mask in [false, true] {
+                let m = with_mask.then_some(mask.as_slice());
+                for &(radius, start, extra, area, peak_r, _) in &setups {
+                    for &c in &centres {
+                        let new = aperture_sums(&plane, m, w, h, c, radius, extra, start, area, peak_r);
+                        let old = aperture_sums_r0(&plane, m, w, h, c, radius, extra, start, area, peak_r);
+                        assert_eq!(
+                            aperture_bits(&new),
+                            aperture_bits(&old),
+                            "scale {scale} sigma {sigma} mask {with_mask} centre {c:?} radius {radius}: {new:?} against {old:?}"
+                        );
+                        compared += usize::from(new.on_frame);
+                    }
+                }
+            }
+        }
+        assert!(compared > 400, "the comparison ran on {compared} usable apertures");
+        // A pixel that is not finite: on a green site inside the disc the aperture is refused; off a site it is not,
+        // and in the annulus it is left out of the sky.
+        let mut plane = integer_plane(w, h, 1000.3, 25.0, 1.0, &stars, 3);
+        let (cx, cy) = (64usize, 64usize);
+        for (px, py) in [(cx + 3, cy + 1), (cx + 3, cy), (cx + 20, cy + 5)] {
+            let was = plane[py * w + px];
+            plane[py * w + px] = f32::NAN;
+            for with_mask in [false, true] {
+                let m = with_mask.then_some(mask.as_slice());
+                let new = aperture_sums(&plane, m, w, h, (64.3, 63.8), 12.0, &[9.0], 22.0, 2000.0, 4.5);
+                let old = aperture_sums_r0(&plane, m, w, h, (64.3, 63.8), 12.0, &[9.0], 22.0, 2000.0, 4.5);
+                assert_eq!(aperture_bits(&new), aperture_bits(&old), "nan at {px},{py} mask {with_mask}");
+            }
+            plane[py * w + px] = was;
+        }
+    }
+
+    /// The quantum's two paths and the plain median, against the first round's quantum on the same values: a wide spread
+    /// (the window holds neighbouring levels: the window path), one level over 101 values (the O(n) neighbour search),
+    /// one level and nothing else, float data.
+    #[test]
+    fn the_quantum_reads_its_window_and_its_fallback_as_the_first_round_did() {
+        for q in [1.0, 4.0, 16.0] {
+            // 4 000 values over 400 levels of `q`: about ten to a level, so the 101 nearest the median span a dozen.
+            let n = 4000usize;
+            let levels = |i: usize| q * (1500.0 + (i * 400 / n) as f64);
+            let mut v: Vec<f64> = (0..n).map(levels).collect();
+            let m = grouped_median(&mut v);
+            assert!((m - (q * 1700.0 - 0.5 * q + 0.5 * q)).abs() <= q, "q {q}: {m}");
+            let mut a: Vec<f64> = (0..n).map(levels).collect();
+            let mut b = a.clone();
+            assert_eq!(quantum(&mut a), Some(q), "q {q}: the window holds adjacent levels");
+            assert_eq!(quantum(&mut a), quantum_r0(&mut b));
+            assert_eq!(grouped_median(&mut a).to_bits(), grouped_median_r0(&mut b).to_bits(), "q {q}");
+            // A gap inside the window: no value on every seventh level near the median (the window's smallest gap is
+            // still the quantum, the others are whole multiples of it).
+            let mut gapped: Vec<f64> = (0..n)
+                .map(|i| 1500 + (i * 400 / n))
+                .filter(|l| l % 7 != 0)
+                .flat_map(|l| std::iter::repeat(q * l as f64).take(10))
+                .collect();
+            let mut gapped_r0 = gapped.clone();
+            assert_eq!(quantum(&mut gapped), Some(q), "q {q}: a missing level inside the window");
+            assert_eq!(quantum(&mut gapped), quantum_r0(&mut gapped_r0));
+            assert_eq!(
+                grouped_median(&mut gapped).to_bits(),
+                grouped_median_r0(&mut gapped_r0).to_bits()
+            );
+            // One level holds the whole window (the noise is under a quantum): the neighbours give the quantum.
+            let mut flat: Vec<f64> = std::iter::repeat(q * 100.0).take(1900).collect();
+            flat.extend(std::iter::repeat(q * 99.0).take(50));
+            flat.extend(std::iter::repeat(q * 101.0).take(50));
+            let mut flat_r0 = flat.clone();
+            assert_eq!(quantum(&mut flat), Some(q), "q {q}: the fallback");
+            assert_eq!(quantum(&mut flat), quantum_r0(&mut flat_r0));
+            let m = grouped_median(&mut flat);
+            assert!((m - 100.0 * q).abs() < 1e-9 * q, "q {q}: balanced shoulders put the median on the level: {m}");
+            assert_eq!(m.to_bits(), grouped_median_r0(&mut flat_r0).to_bits());
+            // One shoulder only: the level above.
+            let mut one: Vec<f64> = std::iter::repeat(q * 100.0).take(1950).collect();
+            one.extend(std::iter::repeat(q * 101.0).take(50));
+            let mut one_r0 = one.clone();
+            assert_eq!(quantum(&mut one), Some(q));
+            let m = grouped_median(&mut one);
+            assert!((m - q * (99.5 + 1000.0 / 1950.0)).abs() < 1e-9 * q, "q {q}: {m}");
+            assert_eq!(m.to_bits(), grouped_median_r0(&mut one_r0).to_bits());
+        }
+        // A flat annulus: no neighbour at all, nothing to group, the plain median.
+        let mut flat = vec![123.0; 700];
+        assert_eq!(quantum(&mut flat), None);
+        assert_eq!(grouped_median(&mut flat), 123.0);
+        // Float data: no whole multiples, the plain median.
+        let float: Vec<f64> = (0..4000).map(|i| 5000.0 + 30.0 * (i as f64 * 0.7311).sin()).collect();
+        let (mut a, mut b) = (float.clone(), float);
+        assert_eq!(quantum(&mut a), None);
+        assert_eq!(grouped_median(&mut a), median_by_selection(&mut b));
+        // Fewer values than the window.
+        let mut few = vec![5.0, 6.0, 6.0, 7.0, 6.0, 5.0, 9.0];
+        let mut few_r0 = few.clone();
+        assert_eq!(quantum(&mut few), quantum_r0(&mut few_r0));
+    }
+
+    /// A lattice coded in `f32` is still quantised: a 12-bit camera's float file (`k` of 4095, scaled by the reader to
+    /// 65535: a quantum of 16.0037 ADU, each level rounded to the f32 grid, an ulp or two of 2.4e-4 at 3 000 ADU) has
+    /// every gap a whole multiple of the quantum, however far the levels run from the window's lowest (a window of 101 values over as many levels, as on a bright, noisy sky). The first round
+    /// measured each value from that lowest one, so the rounding accumulated past its 1e-3 some levels out and the
+    /// sky fell back to the plain median.
+    #[test]
+    fn an_f32_coded_lattice_is_still_quantised() {
+        let step = 65535.0 / 4095.0;
+        let levels: Vec<f64> = (180..300u32).map(|k| f64::from((f64::from(k) * step) as f32)).collect();
+        let gaps: Vec<f64> = levels.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!(
+            gaps.iter().any(|g| (g - gaps[0]).abs() > 1e-6),
+            "premise: the levels are not evenly spaced to the bit"
+        );
+        let values = || -> Vec<f64> { levels.iter().flat_map(|&l| std::iter::repeat(l).take(1)).collect() };
+        let q = quantum(&mut values()).expect("quantised");
+        assert!((q - step).abs() < 1e-3, "{q}");
+        assert!(quantum_r0(&mut values()).is_none(), "the first round's origin test lost it");
+        let m = grouped_median(&mut values());
+        assert!((m - levels[levels.len() / 2]).abs() < step, "{m}");
+    }
+
+    // ---- The aperture pass as the first round wrote it (hypot, a full copy and sort in the quantum's fallback), kept
+    // as the bit reference of the cost fix. ----
+
+    fn disc_share_r0(px: f64, py: f64, d: f64, x: f64, y: f64, r: f64) -> f64 {
+        if d <= r - 0.75 {
+            return 1.0;
+        }
+        if d >= r + 0.75 {
+            return 0.0;
+        }
+        let mut inside = 0u32;
+        for i in 0..4 {
+            for j in 0..4 {
+                let sx = px - 0.375 + 0.25 * f64::from(i);
+                let sy = py - 0.375 + 0.25 * f64::from(j);
+                if (sx - x).hypot(sy - y) <= r {
+                    inside += 1;
+                }
+            }
+        }
+        f64::from(inside) / 16.0
+    }
+
+    fn quantum_r0(v: &mut [f64]) -> Option<f64> {
+        let n = v.len();
+        let mid = n / 2;
+        let mut window: Vec<f64> = Vec::with_capacity(2 * QUANTUM_HALF_WINDOW + 1);
+        window.push(v[mid]);
+        let (lower, rest) = v.split_at_mut(mid);
+        let upper = &mut rest[1..];
+        if lower.len() > QUANTUM_HALF_WINDOW {
+            let k = lower.len() - QUANTUM_HALF_WINDOW;
+            lower.select_nth_unstable_by(k, f64::total_cmp);
+            window.extend_from_slice(&lower[k..]);
+        } else {
+            window.extend_from_slice(lower);
+        }
+        if upper.len() > QUANTUM_HALF_WINDOW {
+            upper.select_nth_unstable_by(QUANTUM_HALF_WINDOW, f64::total_cmp);
+            window.extend_from_slice(&upper[..QUANTUM_HALF_WINDOW]);
+        } else {
+            window.extend_from_slice(upper);
+        }
+        let smallest_gap = |w: &mut Vec<f64>| {
+            w.sort_by(f64::total_cmp);
+            w.windows(2)
+                .map(|p| p[1] - p[0])
+                .filter(|&d| d > 0.0)
+                .fold(None, |best: Option<f64>, d| Some(best.map_or(d, |b| b.min(d))))
+        };
+        let q = match smallest_gap(&mut window) {
+            Some(q) => q,
+            None => {
+                let mut all: Vec<f64> = v.to_vec();
+                smallest_gap(&mut all)?
+            }
+        };
+        let origin = window[0];
+        let whole = |x: f64| {
+            let r = (x - origin) / q;
+            (r - r.round()).abs() <= 1e-3
+        };
+        (q.is_finite() && q > 0.0 && window.iter().all(|&x| whole(x))).then_some(q)
+    }
+
+
+    fn grouped_median_r0(v: &mut [f64]) -> f64 {
+        let m = median_by_selection(v);
+        if v.is_empty() {
+            return m;
+        }
+        let Some(q) = quantum_r0(v) else {
+            return m;
+        };
+        // The median's level on the lattice of the data (the values are multiples of `q` about any one of them).
+        let origin = v[v.len() / 2];
+        let level = origin + ((m - origin) / q).round() * q;
+        let half = 0.5 * q;
+        let below = v.iter().filter(|&&x| x < level - half).count() as f64;
+        let equal = v.iter().filter(|&&x| (x - level).abs() < half).count() as f64;
+        if equal == 0.0 {
+            return m;
+        }
+        level - half + q * (v.len() as f64 / 2.0 - below) / equal
+    }
+
+
+    fn aperture_sums_r0(
+        working: &[f32],
+        mask: Option<&[bool]>,
+        w: usize,
+        h: usize,
+        (x, y): (f64, f64),
+        radius: f64,
+        extra_radii: &[f64],
+        annulus_start: f64,
+        annulus_area: f64,
+        peak_radius: f64,
+    ) -> ListAperture {
+        let unusable = || ListAperture {
+            sum: f64::NAN,
+            extra_sums: vec![f64::NAN; extra_radii.len()],
+            sky: f64::NAN,
+            sky_scatter: f64::NAN,
+            peak: f64::NAN,
+            on_frame: false,
+        };
+        let r_out = (annulus_start * annulus_start + annulus_area / std::f64::consts::PI).sqrt();
+        let r_max = extra_radii.iter().copied().fold(radius, f64::max);
+        let reach = r_out.max(r_max + 0.75).max(peak_radius);
+        if !(x.is_finite() && y.is_finite() && reach.is_finite()) {
+            return unusable();
+        }
+        let (x0, x1) = ((x - reach).floor(), (x + reach).ceil());
+        let (y0, y1) = ((y - reach).floor(), (y + reach).ceil());
+        if x0 < 0.0 || y0 < 0.0 || x1 > (w - 1) as f64 || y1 > (h - 1) as f64 {
+            return unusable();
+        }
+        let mosaic = mask.is_some();
+        let phase_of = |px: usize, py: usize| if mosaic { (py & 1) * 2 + (px & 1) } else { 0 };
+        let mut sky: [Vec<f64>; 4] = Default::default();
+        // (px, py, phase, value, on a site, distance) of every pixel a disc can touch.
+        let mut inner: Vec<(f64, f64, usize, f64, bool, f64)> = Vec::new();
+        let mut peak = f64::NAN;
+        for py in y0 as usize..=y1 as usize {
+            for px in x0 as usize..=x1 as usize {
+                let d = (px as f64 - x).hypot(py as f64 - y);
+                let i = py * w + px;
+                let v = f64::from(working[i]);
+                let site = mask.map_or(true, |m| m[i]);
+                if d >= annulus_start && d <= r_out && site && v.is_finite() {
+                    sky[phase_of(px, py)].push(v);
+                }
+                if d <= peak_radius && site && v.is_finite() && !(v <= peak) {
+                    peak = v;
+                }
+                if d < r_max + 0.75 {
+                    if site && !v.is_finite() {
+                        return unusable();
+                    }
+                    inner.push((px as f64, py as f64, phase_of(px, py), v, site, d));
+                }
+            }
+        }
+        let mut med = [f64::NAN; 4];
+        let mut dev: Vec<f64> = Vec::new();
+        for (p, s) in sky.iter_mut().enumerate() {
+            if s.is_empty() {
+                continue;
+            }
+            med[p] = grouped_median_r0(s);
+            dev.extend(s.iter().map(|v| (v - med[p]).abs()));
+        }
+        if dev.is_empty() {
+            return unusable();
+        }
+        let sky_scatter = 1.4826 * median_by_selection(&mut dev);
+        let used: Vec<f64> = med.iter().copied().filter(|m| m.is_finite()).collect();
+        let sky_level = used.iter().sum::<f64>() / used.len() as f64;
+        let sum_at = |r: f64| {
+            let (mut sum, mut wg, mut wa) = (0.0, 0.0, 0.0);
+            for &(px, py, phase, v, site, d) in &inner {
+                let share = disc_share_r0(px, py, d, x, y, r);
+                if share == 0.0 {
+                    continue;
+                }
+                wa += share;
+                if site && med[phase].is_finite() {
+                    sum += share * (v - med[phase]);
+                    wg += share;
+                }
+            }
+            if wg > 0.0 {
+                sum * wa / wg
+            } else {
+                f64::NAN
+            }
+        };
+        ListAperture {
+            sum: sum_at(radius),
+            extra_sums: extra_radii.iter().map(|&r| sum_at(r)).collect(),
+            sky: sky_level,
+            sky_scatter,
+            peak,
+            on_frame: true,
+        }
+    }
+
+
 }
