@@ -46,6 +46,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 mod fits_header_reader;
+// The old rules, reachable from `examples/header_rules_diff.rs` (re-exported as `astroimage::old_header_rules`).
+#[cfg(feature = "test-support")]
+pub mod diff_shim;
 
 pub(crate) use fits_header_reader::FitsHeader;
 

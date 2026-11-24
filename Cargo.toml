@@ -94,3 +94,7 @@ strip = true
 [[example]]
 name = "bg_bench"
 required-features = ["debug-pipeline"]
+
+[[example]]
+name = "header_rules_diff"
+required-features = ["test-support"]
